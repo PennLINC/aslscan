@@ -1,0 +1,10 @@
+{
+  "Units": "label indices",
+  "SourceQuantity": "seg_label",
+  "Source": "hrgt_icbm_2009a_nls_3t",
+  "LabelMap": {
+    "1": "grey_matter",
+    "2": "white_matter",
+    "3": "csf"
+  }
+}

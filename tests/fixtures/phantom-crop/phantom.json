@@ -1,0 +1,26 @@
+{
+  "LambdaBloodBrain": 0.9,
+  "T1ArterialBlood": 1.65,
+  "MagneticFieldStrength": 3,
+  "Source": "hrgt_icbm_2009a_nls_3t",
+  "Converter": "hrgt_to_bids.py",
+  "Crop": [
+    [
+      88,
+      112
+    ],
+    [
+      104,
+      128
+    ],
+    [
+      90,
+      96
+    ]
+  ],
+  "VoxelSize": [
+    1.0,
+    1.0,
+    1.0
+  ]
+}

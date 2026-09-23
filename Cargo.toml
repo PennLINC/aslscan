@@ -1,0 +1,28 @@
+[package]
+name = "aslscan"
+version = "0.0.0"
+edition = "2021"
+description = "ASL digital reference object simulator on the mrsim-acq acquisition stage"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+default = []
+# BIDS JSON/TSV/TOML in, NIfTI in and out (via mrsim-acq/io).
+io = ["dep:serde", "dep:serde_json", "dep:toml", "mrsim-acq/io"]
+# The binary. Implies io.
+cli = ["dep:clap", "io"]
+# Forwarded to the acquisition stage.
+kspace = ["mrsim-acq/kspace"]
+par = ["mrsim-acq/par"]
+
+[dependencies]
+mrsim-acq = { path = "../mrsim-acq" }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+toml = { version = "0.8", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+
+[[bin]]
+name = "aslscan"
+required-features = ["cli"]

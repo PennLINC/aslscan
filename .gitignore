@@ -1,0 +1,6 @@
+target/
+Cargo.lock
+# Full converted phantoms and run outputs; the test crop under tests/fixtures/ is committed.
+work/
+__pycache__/
+*.pyc
