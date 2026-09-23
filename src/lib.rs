@@ -29,3 +29,6 @@ pub mod resample;
 /// BIDS ASL sidecar + aslcontext + TOML overlay -> `Protocol` (feature `io`).
 #[cfg(feature = "io")]
 pub mod protocol;
+/// BIDS-derivatives phantom maps -> `Phantom`, T2' derivation, class/voxel resolution (feature `io`).
+#[cfg(feature = "io")]
+pub mod phantom;
