@@ -76,7 +76,10 @@ pub enum RowOverride {
     FlipLabelSign,
     /// `control` and `label` rows swap their blood inputs.
     SwapControlLabel,
-    /// The blood input lands in tissue compartment 0 instead of its own compartment.
+    /// The blood input of `label` rows lands in tissue compartment 0 instead of its own
+    /// compartment. Label rows only, on purpose: a mis-wiring applied to every row alike is
+    /// invisible to the linearity identity, because `I_L` and `I_B` then carry the same
+    /// mis-wired term and still subtract to it. Only a row-dependent wiring error breaks it.
     BloodIntoTissue0,
 }
 
@@ -167,9 +170,9 @@ pub fn simulate_with(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseMode
                 t2v.push(T2Volume::Uniform(t2_ms[i]));
                 tiv.push(T2Volume::Uniform(t2p_ms[i]));
             }
-            for i in 0..k {
+            for &tp in t2p_ms.iter().take(k) {
                 t2v.push(T2Volume::Uniform(t2_blood_ms));
-                tiv.push(T2Volume::Uniform(t2p_ms[i]));
+                tiv.push(T2Volume::Uniform(tp));
             }
             (t2v, tiv)
         }
@@ -225,7 +228,7 @@ pub fn simulate_with(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseMode
                 }
             }
             if want_gt {
-                let sl = r.mean_slice(z, |i| dm(i));
+                let sl = r.mean_slice(z, dm);
                 gt[z * dnx * dny..(z + 1) * dnx * dny].copy_from_slice(&sl);
             }
         }
@@ -252,7 +255,7 @@ pub fn simulate_with(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseMode
                     images[c][vox * n + v] = t[c][vox];
                 }
             }
-            let target = if ov == RowOverride::BloodIntoTissue0 { 0 } else { k + c };
+            let target = if ov == RowOverride::BloodIntoTissue0 && row.kind == RowKind::Label { 0 } else { k + c };
             for vox in 0..nvox_sim {
                 images[target][vox * n + v] += blood[c][vox];
             }
@@ -269,7 +272,7 @@ pub fn simulate_with(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseMode
     drop(images);
 
     // ---- the separate M0 scan ----
-    let m0_seed = (p.m0_type == M0Type::Separate).then(|| p.seed ^ M0_SEED_SALT);
+    let m0_seed = (p.m0_type == M0Type::Separate).then_some(p.seed ^ M0_SEED_SALT);
     let m0 = match m0_seed {
         Some(seed) => {
             let tr = p.m0_repetition_time_s.ok_or("M0Type Separate without an M0 repetition time")?;

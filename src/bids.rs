@@ -131,10 +131,20 @@ mod writer {
             "Name": "aslscan simulation",
             "BIDSVersion": "1.10.0",
             "DatasetType": "raw",
+            "Authors": ["aslscan"],
             "GeneratedBy": [{ "Name": "aslscan", "Version": env!("CARGO_PKG_VERSION"),
                               "Description": "Simulated ASL on the mrsim-acq acquisition stage" }],
         }))?;
-        std::fs::write(root.join(".bidsignore"), "**/ground-truth/\n").map_err(|e| e.to_string())?;
+        std::fs::write(root.join("README"), format!(
+            "Simulated ASL dataset written by aslscan {}.\n\nThe protocol is the input BIDS ASL sidecar; \
+             every value the simulator resolved beyond it is recorded under \"AslscanSimulation\" in the \
+             *_asl.json sidecars. Ground-truth maps on the acquisition grid are under perf/ground-truth/ \
+             (listed in .bidsignore).\n", env!("CARGO_PKG_VERSION")))
+            .map_err(|e| e.to_string())?;
+        // `**/ground-truth` without a trailing slash is the form bids-validator 3.0.2 honours for
+        // the directory; the `/`-suffixed and `/**` forms left NOT_INCLUDED errors behind.
+        std::fs::write(root.join(".bidsignore"), "**/ground-truth\n**/ground-truth/**\n")
+            .map_err(|e| e.to_string())?;
 
         // The complex pair through the shared writer, then the sidecars rewritten in ASL terms.
         let info = SidecarInfo {
@@ -148,13 +158,16 @@ mod writer {
         };
         write_complex_4d(&prefix_s, "asl", out.acq_grid.dims, out.n_volumes, &out.mag, &out.phase, &out.acq_grid, &info)
             .map_err(|e| e.to_string())?;
-        // The shared writer's part sidecars are DWI-flavoured stubs; the ASL sidecar is the
-        // inheritance-level `_asl.json`, and the phase part needs only its Units.
-        let _ = std::fs::remove_file(format!("{prefix_s}_part-mag_asl.json"));
-        write_json(&PathBuf::from(format!("{prefix_s}_part-phase_asl.json")), &json!({ "Units": "rad" }))?;
+        // The shared writer's part sidecars are DWI-flavoured stubs. Each part gets the complete
+        // ASL sidecar (the phase part with its Units). There is deliberately NO inheritance-level
+        // `_asl.json`: with `part-` entities there is no `_asl.nii.gz`, and bids-validator 3
+        // flags such a file as SIDECAR_WITHOUT_DATAFILE; it also checks required keys per part
+        // file without merging a less specific sidecar in, so each part must be complete.
         let mut side: Map<String, Value> = p.input_sidecar.as_object().cloned().unwrap_or_default();
         side.insert("AslscanSimulation".to_string(), simulation_block(p, out));
-        write_json(&PathBuf::from(format!("{prefix_s}_asl.json")), &Value::Object(side))?;
+        write_json(&PathBuf::from(format!("{prefix_s}_part-mag_asl.json")), &Value::Object(side.clone()))?;
+        side.insert("Units".to_string(), json!("rad"));
+        write_json(&PathBuf::from(format!("{prefix_s}_part-phase_asl.json")), &Value::Object(side))?;
         std::fs::write(format!("{prefix_s}_aslcontext.tsv"), aslcontext_tsv(&p.rows)).map_err(|e| e.to_string())?;
 
         // The separate M0 scan.

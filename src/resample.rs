@@ -198,12 +198,12 @@ impl Resampler {
 /// the linear part must be zero to `1e-9`, or the box average would silently rotate the object.
 pub fn axis_aligned_voxels(g: &Grid) -> Result<[f64; 3], String> {
     let m = &g.voxel_to_world;
-    for r in 0..3 {
-        for c in 0..3 {
-            if r != c && m[r][c].abs() > 1e-9 {
+    for (r, row) in m.iter().enumerate().take(3) {
+        for (c, &v) in row.iter().enumerate().take(3) {
+            if r != c && v.abs() > 1e-9 {
                 return Err(format!(
-                    "phantom affine is not axis-aligned: entry [{r}][{c}] = {}; the box resampler \
-                     is defined on axis-aligned grids only", m[r][c]));
+                    "phantom affine is not axis-aligned: entry [{r}][{c}] = {v}; the box resampler \
+                     is defined on axis-aligned grids only"));
             }
         }
     }

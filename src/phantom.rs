@@ -199,6 +199,9 @@ pub fn load(dir: &Path) -> Result<Phantom, String> {
     Ok(Phantom { grid, perfusion, att, t1, t2, t2star, m0, dseg, fieldmap, labels, params })
 }
 
+/// `(label, voxel, map name)` of the first voxel that breaks per-label constancy.
+type ConstancyFailure = (i32, usize, &'static str);
+
 /// One voxel of the T2' derivation table (spec P0 change 6), in milliseconds. Inputs in seconds
 /// and already validated positive in the foreground.
 fn t2prime_ms_of(t2_s: f32, t2star_s: f32) -> f32 {
@@ -233,7 +236,7 @@ impl Phantom {
 
     /// The constancy test: is `T2` and the derived `T2'` bitwise constant within every
     /// foreground label? Returns the offending `(label, voxel, map)` otherwise.
-    fn constancy(&self) -> Result<(Vec<f32>, Vec<f32>), (i32, usize, &'static str)> {
+    fn constancy(&self) -> Result<(Vec<f32>, Vec<f32>), ConstancyFailure> {
         let t2p = self.t2prime_ms();
         let mut t2_ms = Vec::with_capacity(self.labels.len());
         let mut t2p_ms = Vec::with_capacity(self.labels.len());
