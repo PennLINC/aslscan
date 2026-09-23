@@ -1,0 +1,5 @@
+seed = 20260923
+[acquisition]
+oversample = 2
+[m0]
+repetition_time = 8.0

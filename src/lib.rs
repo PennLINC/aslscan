@@ -26,6 +26,8 @@ pub mod kinetic;
 pub mod mrsignal;
 /// Box-overlap averaging between the phantom, acquisition and simulation grids.
 pub mod resample;
+/// The volume list: `Row` and `RowKind`, pure std.
+pub mod rows;
 /// BIDS ASL sidecar + aslcontext + TOML overlay -> `Protocol` (feature `io`).
 #[cfg(feature = "io")]
 pub mod protocol;
@@ -35,3 +37,5 @@ pub mod phantom;
 /// Row semantics, class split, the one acquisition call, the separate M0 (feature `io`).
 #[cfg(feature = "io")]
 pub mod series;
+/// BIDS output naming, aslcontext, sidecars, ground truth (writer behind `io`).
+pub mod bids;
