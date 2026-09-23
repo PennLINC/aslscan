@@ -19,3 +19,6 @@
 //! ## Build shape
 //! The default build is pure std: `kinetic`, `mrsignal`, `resample` and the `bids` naming code
 //! test offline. `io` adds the loaders, the series driver and NIfTI/JSON/TOML; `cli` the binary.
+
+/// The Buxton general kinetic model, per voxel, as simasl computes it.
+pub mod kinetic;
