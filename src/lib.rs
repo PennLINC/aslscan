@@ -22,3 +22,5 @@
 
 /// The Buxton general kinetic model, per voxel, as simasl computes it.
 pub mod kinetic;
+/// Post-excitation magnetization (spin echo only in P1); no transverse relaxation here.
+pub mod mrsignal;
