@@ -175,6 +175,23 @@ impl Resampler {
     pub fn z_slab(&self, z: usize) -> &[(usize, f64)] {
         &self.z.per_target[z]
     }
+
+    /// Volume-weighted mean of a source field into target slice `z` only, the field given as a
+    /// closure over the flat source index so a slice-dependent quantity (kinetics at that
+    /// slice's timing) need not be materialised as a whole phantom volume. Returns the
+    /// `dst_dims[0] * dst_dims[1]` target slice, layout `x + nx*y`.
+    pub fn mean_slice(&self, z: usize, src: impl Fn(usize) -> f64) -> Vec<f32> {
+        let [nx, ny, _] = self.dst_dims;
+        let mut out = vec![0.0f32; nx * ny];
+        for y in 0..ny {
+            for x in 0..nx {
+                let mut acc = 0.0f64;
+                self.for_each_overlap(x, y, z, |i, w| acc += w * src(i));
+                out[x + nx * y] = acc as f32;
+            }
+        }
+        out
+    }
 }
 
 /// The phantom grid's voxel sizes, requiring an axis-aligned affine: every off-diagonal entry of
