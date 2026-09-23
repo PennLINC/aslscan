@@ -26,3 +26,6 @@ pub mod kinetic;
 pub mod mrsignal;
 /// Box-overlap averaging between the phantom, acquisition and simulation grids.
 pub mod resample;
+/// BIDS ASL sidecar + aslcontext + TOML overlay -> `Protocol` (feature `io`).
+#[cfg(feature = "io")]
+pub mod protocol;
