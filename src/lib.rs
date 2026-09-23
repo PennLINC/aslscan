@@ -24,3 +24,5 @@
 pub mod kinetic;
 /// Post-excitation magnetization (spin echo only in P1); no transverse relaxation here.
 pub mod mrsignal;
+/// Box-overlap averaging between the phantom, acquisition and simulation grids.
+pub mod resample;
