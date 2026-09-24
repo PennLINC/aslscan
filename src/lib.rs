@@ -22,8 +22,10 @@
 
 /// The Buxton general kinetic model, per voxel, as simasl computes it.
 pub mod kinetic;
-/// Post-excitation magnetization (spin echo only in P1); no transverse relaxation here.
+/// Post-excitation magnetization (spin echo and inversion recovery); no transverse relaxation here.
 pub mod mrsignal;
+/// The background-suppression timeline: tissue `Mz` at readout and the blood label factor.
+pub mod longitudinal;
 /// Box-overlap averaging between the phantom, acquisition and simulation grids.
 pub mod resample;
 /// The volume list: `Row` and `RowKind`, pure std.
