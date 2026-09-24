@@ -68,6 +68,11 @@ def main():
     crop = parse_crop(a.crop)
     affine = img.affine.copy()
     if crop:
+        # Explicit bounds only: a negative start would be normalised by NumPy for the slice but
+        # not for the affine shift below, misregistering the crop by a whole axis.
+        for ax, (lo, hi) in enumerate(crop):
+            if not (0 <= lo < hi <= data.shape[ax]):
+                sys.exit(f"crop axis {ax}: {lo}:{hi} is outside 0..{data.shape[ax]}")
         (x0, x1), (y0, y1), (z0, z1) = crop
         data = data[x0:x1, y0:y1, z0:z1]
         # the new voxel (0,0,0) is the old (x0,y0,z0): shift the origin by the linear part

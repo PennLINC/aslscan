@@ -15,6 +15,9 @@ cli = ["dep:clap", "io"]
 # Forwarded to the acquisition stage.
 kspace = ["mrsim-acq/kspace"]
 par = ["mrsim-acq/par"]
+# Exposes series::simulate_with and its RowOverride for the integration tests' negative
+# controls. Never enable it in a build that writes datasets anyone will use.
+test-hooks = []
 
 [dependencies]
 mrsim-acq = { path = "../mrsim-acq" }

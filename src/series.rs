@@ -102,12 +102,20 @@ fn blood_sign(kind: RowKind, ov: RowOverride) -> f64 {
 }
 
 pub fn simulate(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel) -> Result<SeriesOutput, String> {
-    simulate_with(p, ph, mode, phase, RowOverride::None)
+    simulate_impl(p, ph, mode, phase, RowOverride::None)
 }
 
-/// [`simulate`] with a [`RowOverride`]; the override exists for the linearity test's negative
-/// controls and must be `None` in every real run.
+/// [`simulate`] with a [`RowOverride`]. Only for the linearity test's negative controls, so it
+/// exists only under `cfg(test)` or the `test-hooks` feature (which `tests/end_to_end.rs` needs);
+/// a production build has no way to produce a deliberately wrong dataset through it.
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn simulate_with(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, ov: RowOverride)
+    -> Result<SeriesOutput, String>
+{
+    simulate_impl(p, ph, mode, phase, ov)
+}
+
+fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, ov: RowOverride)
     -> Result<SeriesOutput, String>
 {
     if p.background_suppression {
@@ -149,7 +157,7 @@ pub fn simulate_with(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseMode
 
     // ---- relaxation and compartment layout ----
     let (relax, mode_used) = ph.relaxation(mode)?;
-    let t2_blood_ms = (p.t2_blood_s.0 * 1000.0) as f32;
+    let t2_blood_ms = p.t2_blood_ms();
     // Label masks: compartment i is label i (class) or everything foreground (voxel).
     let masks: Vec<Vec<bool>> = match &relax {
         Relaxation::Class { .. } => ph.labels.iter().map(|(l, _)| ph.dseg.iter().map(|d| d == l).collect()).collect(),
@@ -372,13 +380,16 @@ mod tests {
         assert_eq!(b.mode, T2Mode::Voxel);
         assert_eq!(a.n_compartments, 6);
         assert_eq!(b.n_compartments, 2);
+        // Per-voxel relative agreement, with an absolute floor of 1e-6 of the peak for the
+        // near-zero voxels (ringing outside the object) where a relative bound is meaningless.
         let scale = max_abs(&a.mag) as f64;
         assert!(scale > 0.0);
         let mut worst = 0.0f64;
         for (x, y) in a.mag.iter().zip(&b.mag) {
-            worst = worst.max((*x as f64 - *y as f64).abs() / scale);
+            let (x, y) = (*x as f64, *y as f64);
+            worst = worst.max((x - y).abs() / (1e-5 * x.abs().max(y.abs()) + 1e-6 * scale));
         }
-        assert!(worst < 1e-5, "class vs voxel on a homogeneous grid: max rel {worst:e}");
+        assert!(worst <= 1.0, "class vs voxel on a homogeneous grid: worst residual {worst:.2}x tolerance");
     }
 
     #[test]

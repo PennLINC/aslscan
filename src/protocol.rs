@@ -222,22 +222,42 @@ fn opt_bool(v: &Value, key: &str) -> Result<bool, String> {
     }
 }
 
-/// A number, or an array of numbers.
-fn num_or_array(v: &Value, key: &str) -> Result<Vec<f64>, String> {
-    match field(v, key)? {
-        Value::Number(n) => Ok(vec![n.as_f64().unwrap()]),
-        Value::Array(a) => a
-            .iter()
-            .map(|x| x.as_f64().ok_or_else(|| format!("asl.json: {key} array holds a non-number")))
-            .collect(),
-        _ => Err(format!("asl.json: {key} must be a number or an array of numbers")),
+/// A number, or a non-empty array of finite numbers. The flag says which it was: a one-element
+/// array is still an array and is held to the per-volume length rule.
+fn num_or_array(v: &Value, key: &str) -> Result<(Vec<f64>, bool), String> {
+    let (vals, is_array) = match field(v, key)? {
+        Value::Number(n) => (vec![n.as_f64().unwrap()], false),
+        Value::Array(a) => (
+            a.iter()
+                .map(|x| x.as_f64().ok_or_else(|| format!("asl.json: {key} array holds a non-number")))
+                .collect::<Result<Vec<f64>, String>>()?,
+            true,
+        ),
+        _ => return Err(format!("asl.json: {key} must be a number or an array of numbers")),
+    };
+    if vals.is_empty() {
+        return Err(format!("asl.json: {key} is an empty array"));
     }
+    if let Some(bad) = vals.iter().find(|x| !x.is_finite()) {
+        return Err(format!("asl.json: {key} holds a non-finite value {bad}"));
+    }
+    Ok((vals, is_array))
+}
+
+fn require_finite_positive(v: f64, what: &str) -> Result<f64, String> {
+    if v.is_finite() && v > 0.0 { Ok(v) } else { Err(format!("{what} must be a positive finite number, got {v}")) }
+}
+
+fn require_finite_nonneg(v: f64, what: &str) -> Result<f64, String> {
+    if v.is_finite() && v >= 0.0 { Ok(v) } else { Err(format!("{what} must be a non-negative finite number, got {v}")) }
 }
 
 /// Expand a scalar-or-array timing field to one value per row. BIDS: the array form has one
 /// entry per volume in acquisition order, m0scan rows included and set to zero.
-fn per_row(vals: Vec<f64>, key: &str, rows: &[RowKind], zero_for_m0: bool) -> Result<Vec<f64>, String> {
-    if vals.len() == 1 {
+fn per_row((vals, is_array): (Vec<f64>, bool), key: &str, rows: &[RowKind], zero_for_m0: bool)
+    -> Result<Vec<f64>, String>
+{
+    if !is_array {
         return Ok(rows.iter().map(|k| if zero_for_m0 && *k == RowKind::M0scan { 0.0 } else { vals[0] }).collect());
     }
     if vals.len() != rows.len() {
@@ -344,6 +364,23 @@ fn overlay_acq(o: Option<&AcqOverlay>) -> Result<OverlayAcq, String> {
             return Err("overlay: acquisition.matrix entries must be positive".to_string());
         }
     }
+    if a.n_coils == 0 {
+        return Err("overlay: acquisition.n_coils must be at least 1".to_string());
+    }
+    require_finite_positive(a.t_inhom_ms, "overlay acquisition.t_inhom")?;
+    require_finite_positive(a.eddy_tau_ms, "overlay acquisition.eddy_tau")?;
+    require_finite_positive(a.signal_scale, "overlay acquisition.signal_scale")?;
+    require_finite_nonneg(a.noise_variance, "overlay acquisition.noise_variance")?;
+    require_finite_nonneg(a.spike_amplitude, "overlay acquisition.spike_amplitude")?;
+    if !(a.partial_fourier.is_finite() && a.partial_fourier > 0.0 && a.partial_fourier <= 1.0) {
+        return Err(format!("overlay: acquisition.partial_fourier must be in (0, 1], got {}", a.partial_fourier));
+    }
+    for (name, v) in [("ghost_offset", a.ghost_offset), ("eddy_strength", a.eddy_strength),
+                      ("eddy_quad", a.eddy_quad), ("eddy_phase", a.eddy_phase)] {
+        if !v.is_finite() {
+            return Err(format!("overlay: acquisition.{name} is not finite"));
+        }
+    }
     Ok(a)
 }
 
@@ -393,6 +430,23 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
             "asl.json: MRAcquisitionType {mr_type:?}: P1 simulates 2D EPI only; 3D readouts arrive with P5"));
     }
 
+    // Things P1 does not model must not be silently simulated as if absent.
+    if opt_bool(sidecar, "LookLocker")? {
+        return Err("asl.json: LookLocker is true; Look-Locker readouts arrive with P6".to_string());
+    }
+    if opt_bool(sidecar, "VascularCrushing")? {
+        return Err("asl.json: VascularCrushing is true; vascular crushing arrives with P4".to_string());
+    }
+    // Required by BIDS, and read rather than defaulted: an absent field would be written back
+    // absent and the dataset would not validate.
+    let background_suppression = match field(sidecar, "BackgroundSuppression")? {
+        Value::Bool(b) => *b,
+        _ => return Err("asl.json: BackgroundSuppression must be a boolean".to_string()),
+    };
+    if m0_type == M0Type::Estimate {
+        num(sidecar, "M0Estimate").map_err(|_| "asl.json: M0Type \"Estimate\" requires a numeric M0Estimate".to_string())?;
+    }
+
     // Timing per row. PLD is per volume with zeros on m0scan rows.
     let pld = per_row(num_or_array(sidecar, "PostLabelingDelay")?, "PostLabelingDelay", &kinds, true)?;
     let tau: Vec<f64> = match label_type {
@@ -404,8 +458,15 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                 return Err("asl.json: PASL requires BolusCutOffFlag true; without a bolus cutoff the \
                             kinetic model has no bolus duration".to_string());
             }
-            let cut = num_or_array(sidecar, "BolusCutOffDelayTime")?;
-            if cut.is_empty() || cut.iter().any(|v| *v < 0.0) || cut.windows(2).any(|w| w[1] < w[0]) {
+            string(sidecar, "BolusCutOffTechnique")
+                .map_err(|_| "asl.json: BolusCutOffFlag true requires BolusCutOffTechnique".to_string())?;
+            let (cut, _) = num_or_array(sidecar, "BolusCutOffDelayTime")?;
+            if cut.len() > 2 {
+                return Err(format!(
+                    "asl.json: BolusCutOffDelayTime has {} entries; a number, or the first and last pulse \
+                     times for Q2TIPS, are supported", cut.len()));
+            }
+            if cut.iter().any(|v| *v < 0.0) || cut.windows(2).any(|w| w[1] < w[0]) {
                 return Err("asl.json: BolusCutOffDelayTime must be non-negative and non-decreasing".to_string());
             }
             // The bolus duration is the first cutoff time (Q2TIPS gives first and last).
@@ -415,6 +476,11 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
     let tr = per_row(num_or_array(sidecar, "RepetitionTimePreparation")?, "RepetitionTimePreparation", &kinds, false)?;
     let mut rows = Vec::with_capacity(n);
     for i in 0..n {
+        require_finite_positive(tr[i], &format!("asl.json: RepetitionTimePreparation for row {i}"))?;
+        if kinds[i] != RowKind::M0scan {
+            require_finite_nonneg(pld[i], &format!("asl.json: PostLabelingDelay for row {i}"))?;
+            require_finite_positive(tau[i], &format!("asl.json: bolus duration for row {i}"))?;
+        }
         let t = match (kinds[i], label_type) {
             (RowKind::M0scan, _) => 0.0,
             (_, LabelType::Pasl) => {
@@ -431,9 +497,9 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
     }
 
     // Readout geometry and timing.
-    let timing = num_or_array(sidecar, "SliceTiming")?;
-    if timing.is_empty() {
-        return Err("asl.json: SliceTiming is empty".to_string());
+    let (timing, _) = num_or_array(sidecar, "SliceTiming")?;
+    for t in &timing {
+        require_finite_nonneg(*t, "asl.json: SliceTiming entry")?;
     }
     let reversed = match sidecar.get("SliceEncodingDirection").and_then(Value::as_str) {
         None | Some("k") => false,
@@ -453,14 +519,18 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
         Some(v) => return Err(format!("asl.json: MultibandAccelerationFactor {v} is not a positive integer")),
     };
     if mb > 1 {
-        // mb slices share each excitation, so there are n/mb distinct timings.
-        let mut distinct: Vec<u64> = timing.iter().map(|t| t.to_bits()).collect();
-        distinct.sort_unstable();
-        distinct.dedup();
-        if distinct.len() * mb != timing.len() {
-            return Err(format!(
-                "asl.json: MultibandAccelerationFactor {mb} with {} slices implies {} distinct slice times, \
-                 SliceTiming has {}", timing.len(), timing.len() / mb, distinct.len()));
+        // mb slices share each excitation, so every distinct timing must occur exactly mb times.
+        let mut sorted: Vec<u64> = timing.iter().map(|t| t.to_bits()).collect();
+        sorted.sort_unstable();
+        let mut i = 0;
+        while i < sorted.len() {
+            let j = sorted[i..].iter().take_while(|b| **b == sorted[i]).count();
+            if j != mb {
+                return Err(format!(
+                    "asl.json: MultibandAccelerationFactor {mb} but slice time {} is shared by {j} slices",
+                    f64::from_bits(sorted[i])));
+            }
+            i += j;
         }
     }
 
@@ -474,15 +544,15 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                  (j or j-) only"))
         }
     };
-    let te = num_or_array(sidecar, "EchoTime")?;
+    let (te, _) = num_or_array(sidecar, "EchoTime")?;
     if te.iter().any(|v| *v != te[0]) {
         return Err(format!(
             "asl.json: EchoTime array has unequal entries {te:?}; multi-TE ASL arrives with P6"));
     }
-    let echo_time_s = te[0];
-    let total_readout_time_s = num(sidecar, "TotalReadoutTime")?;
-    let field_strength = num(sidecar, "MagneticFieldStrength")?;
-    let vs = num_or_array(sidecar, "AcquisitionVoxelSize")?;
+    let echo_time_s = require_finite_positive(te[0], "asl.json: EchoTime")?;
+    let total_readout_time_s = require_finite_positive(num(sidecar, "TotalReadoutTime")?, "asl.json: TotalReadoutTime")?;
+    let field_strength = require_finite_positive(num(sidecar, "MagneticFieldStrength")?, "asl.json: MagneticFieldStrength")?;
+    let (vs, _) = num_or_array(sidecar, "AcquisitionVoxelSize")?;
     if vs.len() != 3 || vs.iter().any(|v| *v <= 0.0) {
         return Err("asl.json: AcquisitionVoxelSize must be three positive numbers".to_string());
     }
@@ -492,7 +562,6 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
         Some(v) if v >= 1.0 && v.fract() == 0.0 => v as usize,
         Some(v) => return Err(format!("asl.json: ParallelReductionFactorInPlane {v} is not a positive integer")),
     };
-    let background_suppression = opt_bool(sidecar, "BackgroundSuppression")?;
 
     // Phantom consistency.
     if let Some(pf) = phantom.and_then(|p| p.field_strength) {
@@ -505,6 +574,14 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
 
     // Kinetic constants: overlay > sidecar (alpha only) > phantom > default.
     let ko = overlay.and_then(|o| o.kinetic.as_ref());
+    if let Some(k) = ko {
+        for (name, v) in [("label_efficiency", k.label_efficiency), ("lambda_blood_brain", k.lambda_blood_brain),
+                          ("t1_arterial_blood", k.t1_arterial_blood)] {
+            if let Some(v) = v {
+                require_finite_nonneg(v, &format!("overlay kinetic.{name}"))?;
+            }
+        }
+    }
     let alpha = if let Some(v) = ko.and_then(|k| k.label_efficiency) {
         (v, Source::Overlay)
     } else if let Some(v) = opt_num(sidecar, "LabelingEfficiency")? {
@@ -544,13 +621,16 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
     };
     let so = overlay.and_then(|o| o.signal.as_ref());
     let t2_blood_s = if let Some(v) = so.and_then(|s| s.t2_blood) {
-        (v, Source::Overlay)
+        (require_finite_positive(v, "overlay signal.t2_blood")?, Source::Overlay)
     } else {
         (by_field("t2_blood", 0.165, 0.290)?, Source::Default)
     };
     let contrast = parse_contrast(so.and_then(|s| s.acq_contrast.as_deref()).unwrap_or("se"))?;
 
     let m0_repetition_time_s = overlay.and_then(|o| o.m0.as_ref()).and_then(|m| m.repetition_time);
+    if let Some(v) = m0_repetition_time_s {
+        require_finite_positive(v, "overlay m0.repetition_time")?;
+    }
     if m0_type == M0Type::Separate && m0_repetition_time_s.is_none() {
         return Err("M0Type is \"Separate\" but the overlay has no [m0] repetition_time; the ASL sidecar's \
                     RepetitionTimePreparation describes the ASL series, not the M0 scan".to_string());
@@ -589,6 +669,19 @@ impl Protocol {
     /// The kinetic constants for `row`.
     pub fn kinetic(&self, row: &Row) -> Kinetic {
         Kinetic { label_type: self.label_type, tau: row.tau, alpha: self.alpha.0, lambda: self.lambda.0, t1b: self.t1b.0 }
+    }
+
+    /// Blood T2 in milliseconds for the acquisition stage. One of the two conversion sites in this
+    /// module (with [`Protocol::acquisition`]); nothing downstream converts again.
+    pub fn t2_blood_ms(&self) -> f32 {
+        (self.t2_blood_s.0 * 1000.0) as f32
+    }
+
+    /// `TotalAcquiredPairs` as BIDS defines it: control-label pairs, or the count of
+    /// pre-subtracted `deltam` volumes when there are no pairs.
+    pub fn total_acquired_pairs(&self) -> usize {
+        let labels = self.rows.iter().filter(|r| r.kind == RowKind::Label).count();
+        if labels > 0 { labels } else { self.rows.iter().filter(|r| r.kind == RowKind::Deltam).count() }
     }
 
     /// The acquisition stage's parameters for an acquired matrix `[nx, ny]`, in milliseconds,
@@ -676,6 +769,7 @@ mod tests {
         let mut s = base();
         s["ArterialSpinLabelingType"] = json!("PASL");
         s["BolusCutOffFlag"] = json!(true);
+        s["BolusCutOffTechnique"] = json!("Q2TIPS");
         s["BolusCutOffDelayTime"] = json!(0.7);
         s.as_object_mut().unwrap().remove("LabelingDuration");
         let p = parse(&s, CTX, Some(&m0_overlay()), None).unwrap();
@@ -723,6 +817,65 @@ mod tests {
         let p = parse(&s, ctx, None, None).unwrap();
         assert_eq!(p.rows[0].t, 0.0);
         assert!((p.rows[1].t - 3.3).abs() < 1e-12);
+        // a ONE-element array is an array, held to the per-volume length rule
+        s["PostLabelingDelay"] = json!([1.5]);
+        let e = parse(&s, ctx, None, None).unwrap_err();
+        assert!(e.contains("1 entries") && e.contains("5 rows"), "{e}");
+        s["PostLabelingDelay"] = json!([]);
+        assert!(parse(&s, ctx, None, None).unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn invalid_values_are_rejected_before_simulation() {
+        let mut s = base();
+        s["RepetitionTimePreparation"] = json!(-4.0);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("RepetitionTimePreparation"));
+        let mut s = base();
+        s["PostLabelingDelay"] = json!(-0.5);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("PostLabelingDelay"));
+        let mut s = base();
+        s["TotalReadoutTime"] = json!(-0.016);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("TotalReadoutTime"));
+        let mut s = base();
+        s["EchoTime"] = json!([]);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("empty"));
+        let mut s = base();
+        s["LookLocker"] = json!(true);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("P6"));
+        let mut s = base();
+        s["VascularCrushing"] = json!(true);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("P4"));
+        let mut s = base();
+        s.as_object_mut().unwrap().remove("BackgroundSuppression");
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("BackgroundSuppression"));
+        let mut s = base();
+        s["M0Type"] = json!("Estimate");
+        assert!(parse(&s, CTX, None, None).unwrap_err().contains("M0Estimate"));
+        s["M0Estimate"] = json!(100.0);
+        assert!(parse(&s, CTX, None, None).is_ok());
+        // PASL: technique required, at most two cutoff times
+        let mut s = base();
+        s["ArterialSpinLabelingType"] = json!("PASL");
+        s["BolusCutOffFlag"] = json!(true);
+        s["BolusCutOffDelayTime"] = json!(0.7);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("BolusCutOffTechnique"));
+        s["BolusCutOffTechnique"] = json!("Q2TIPS");
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).is_ok());
+        s["BolusCutOffDelayTime"] = json!([0.7, 1.0, 1.6]);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("3 entries"));
+        // multiband: every excitation must hold exactly mb slices
+        let mut s = base();
+        s["MultibandAccelerationFactor"] = json!(2);
+        s["SliceTiming"] = json!([0.0, 0.0, 0.0, 0.05]);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("shared by 3"));
+        // overlay ranges
+        let ov = overlay("[acquisition]\npartial_fourier = 1.5\n[m0]\nrepetition_time = 8.0\n");
+        assert!(parse(&base(), CTX, Some(&ov), None).unwrap_err().contains("partial_fourier"));
+        let ov = overlay("[signal]\nt2_blood = -0.1\n[m0]\nrepetition_time = 8.0\n");
+        assert!(parse(&base(), CTX, Some(&ov), None).unwrap_err().contains("t2_blood"));
+        let ov = overlay("[m0]\nrepetition_time = 0.0\n");
+        assert!(parse(&base(), CTX, Some(&ov), None).unwrap_err().contains("m0.repetition_time"));
+        assert_eq!(parse(&base(), CTX, Some(&m0_overlay()), None).unwrap().total_acquired_pairs(), 2);
     }
 
     #[test]

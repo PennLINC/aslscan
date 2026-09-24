@@ -164,7 +164,29 @@ mod writer {
         // flags such a file as SIDECAR_WITHOUT_DATAFILE; it also checks required keys per part
         // file without merging a less specific sidecar in, so each part must be complete.
         let mut side: Map<String, Value> = p.input_sidecar.as_object().cloned().unwrap_or_default();
-        side.insert("AslscanSimulation".to_string(), simulation_block(p, out));
+        // Standard keys describe what was SIMULATED, not what the input said: an overlay may
+        // have overridden the sidecar's LabelingEfficiency, and PartialFourier or the
+        // acceleration factor come from the overlay/protocol, not the input. The originals are
+        // kept under AslscanSimulation.InputValuesReplaced so nothing is lost.
+        let effective: [(&str, Value); 5] = [
+            ("LabelingEfficiency", json!(p.alpha.0)),
+            ("PartialFourier", json!(out.acquisition.partial_fourier)),
+            ("ParallelReductionFactorInPlane", json!(out.acquisition.accel)),
+            ("MultibandAccelerationFactor", json!(p.mb)),
+            ("TotalAcquiredPairs", json!(p.total_acquired_pairs())),
+        ];
+        let mut replaced = Map::new();
+        for (k, v) in effective {
+            if let Some(old) = side.get(k) {
+                if *old != v {
+                    replaced.insert(k.to_string(), old.clone());
+                }
+            }
+            side.insert(k.to_string(), v);
+        }
+        let mut sim = simulation_block(p, out);
+        sim["InputValuesReplaced"] = Value::Object(replaced);
+        side.insert("AslscanSimulation".to_string(), sim);
         write_json(&PathBuf::from(format!("{prefix_s}_part-mag_asl.json")), &Value::Object(side.clone()))?;
         side.insert("Units".to_string(), json!("rad"));
         write_json(&PathBuf::from(format!("{prefix_s}_part-phase_asl.json")), &Value::Object(side))?;
@@ -177,11 +199,16 @@ mod writer {
                 .map_err(|e| e.to_string())?;
             let mut m0side = Map::new();
             for k in ["Manufacturer", "MagneticFieldStrength", "MRAcquisitionType", "PhaseEncodingDirection",
-                      "TotalReadoutTime", "EchoTime", "SliceTiming", "AcquisitionVoxelSize", "FlipAngle"] {
+                      "TotalReadoutTime", "EchoTime", "SliceTiming", "SliceEncodingDirection",
+                      "AcquisitionVoxelSize", "FlipAngle"] {
                 if let Some(v) = p.input_sidecar.get(k) {
                     m0side.insert(k.to_string(), v.clone());
                 }
             }
+            // The M0 scan shares the ASL readout, so its effective readout values are the same.
+            m0side.insert("PartialFourier".to_string(), json!(out.acquisition.partial_fourier));
+            m0side.insert("ParallelReductionFactorInPlane".to_string(), json!(out.acquisition.accel));
+            m0side.insert("MultibandAccelerationFactor".to_string(), json!(p.mb));
             m0side.insert("RepetitionTimePreparation".to_string(), json!(p.m0_repetition_time_s));
             m0side.insert("IntendedFor".to_string(), json!([
                 format!("bids::{}", names.rel("_part-mag_asl.nii.gz")),
@@ -213,7 +240,10 @@ mod writer {
             "Description": "+delta_m at each label/deltam row's own timing, box-averaged; zero for other rows",
             "Resampling": mean,
         }))?;
-        let dseg: Vec<i16> = gt.dseg.iter().map(|l| *l as i16).collect();
+        // `phantom::load` already bounds labels to 0..=32767, so this cannot truncate; the
+        // conversion is checked anyway rather than cast.
+        let dseg: Vec<i16> = gt.dseg.iter().map(|l| i16::try_from(*l).map_err(|_| format!("dseg label {l} does not fit int16")))
+            .collect::<Result<_, _>>()?;
         write_3d_i16(&PathBuf::from(format!("{gt_prefix}_desc-dseg_gt.nii.gz")), out.acq_grid.dims, &dseg, &out.acq_grid)
             .map_err(|e| e.to_string())?;
         write_json(&PathBuf::from(format!("{gt_prefix}_desc-dseg_gt.json")), &json!({

@@ -1,6 +1,7 @@
-//! End-to-end properties on the checked-in crop (feature `io`): the blood-compartment linearity
-//! identity with its negative controls, and the noise-variance ratio of control minus label.
-#![cfg(feature = "io")]
+//! End-to-end properties on the checked-in crop (features `io` + `test-hooks`): the
+//! blood-compartment linearity identity with its negative controls, and the noise-variance
+//! ratio of control minus label.
+#![cfg(all(feature = "io", feature = "test-hooks"))]
 
 use std::path::Path;
 

@@ -125,7 +125,17 @@ pub fn load(dir: &Path) -> Result<Phantom, String> {
     let mut it = vols.into_iter();
     let (perfusion, att, t1, t2, t2star, m0) =
         (it.next().unwrap(), it.next().unwrap(), it.next().unwrap(), it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
-    let dseg: Vec<i32> = it.next().unwrap().iter().map(|v| v.round() as i32).collect();
+    // Labels must be integral and must fit the int16 the ground-truth writer uses; a fractional
+    // value is a resampled or corrupt segmentation, not a label.
+    let dseg_f = it.next().unwrap();
+    let mut dseg: Vec<i32> = Vec::with_capacity(dseg_f.len());
+    for (i, &v) in dseg_f.iter().enumerate() {
+        let r = v.round();
+        if (v - r).abs() > 1e-6 || !(0.0..=32767.0).contains(&r) {
+            return Err(format!("phantom: dseg voxel {i} is {v}; labels must be integers in 0..=32767"));
+        }
+        dseg.push(r as i32);
+    }
 
     // Label names from dseg.json, if present.
     let dseg_side = read_json(&dir.join("dseg.json"))?;
@@ -133,9 +143,6 @@ pub fn load(dir: &Path) -> Result<Phantom, String> {
     let mut present: Vec<i32> = dseg.iter().copied().filter(|l| *l > 0).collect();
     present.sort_unstable();
     present.dedup();
-    if dseg.iter().any(|l| *l < 0) {
-        return Err("phantom: dseg holds a negative label".to_string());
-    }
     let labels: Vec<(i32, String)> = present
         .iter()
         .map(|l| {
@@ -177,6 +184,11 @@ pub fn load(dir: &Path) -> Result<Phantom, String> {
         let (data, g) = mrsim_acq::io::load_volume(&fm_path).map_err(|e| format!("phantom: fieldmap: {e}"))?;
         if g.dims != grid.dims || !same_affine(&g.voxel_to_world, &grid.voxel_to_world) {
             return Err("phantom: fieldmap is not on the phantom grid".to_string());
+        }
+        // A NaN here would poison the Fourier sum of every voxel in its slice, zero
+        // magnetization or not, through the phase rotor.
+        if let Some(i) = data.iter().position(|v| !v.is_finite()) {
+            return Err(format!("phantom: fieldmap voxel {i} is not finite"));
         }
         Some(data)
     } else {
