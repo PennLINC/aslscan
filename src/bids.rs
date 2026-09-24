@@ -209,13 +209,19 @@ mod writer {
             .map_err(|e| e.to_string())?;
 
         // The complex pair through the shared writer, then the sidecars rewritten in ASL terms.
+        // The NIfTI time step is one number; with per-row repetition times (an included M0 row,
+        // say) it is the first ASL row's, and the sidecar's RepetitionTimePreparation array is
+        // the authority.
+        let nifti_tr = p.rows.iter().find(|r| r.kind != crate::rows::RowKind::M0scan).or(p.rows.first()).map(|r| r.tr);
         let info = SidecarInfo {
+            manufacturer: "aslscan".to_string(),
             phase_encoding_direction: p.phase_encoding_direction.clone(),
             total_readout_time: p.total_readout_time_s,
             echo_time: p.echo_time_s,
             partial_fourier: out.acquisition.partial_fourier,
             accel: out.acquisition.accel,
             mb: p.mb,
+            repetition_time_s: nifti_tr,
             b0_field_source: None,
         };
         write_complex_4d(&prefix_s, "asl", out.acq_grid.dims, out.n_volumes, &out.mag, &out.phase, &out.acq_grid, &info)
@@ -272,9 +278,14 @@ mod writer {
             write_3d(&PathBuf::from(format!("{prefix_s}_m0scan.nii.gz")), out.acq_grid.dims, mag, &out.acq_grid)
                 .map_err(|e| e.to_string())?;
             let mut m0side = Map::new();
-            for k in ["Manufacturer", "MagneticFieldStrength", "MRAcquisitionType", "PhaseEncodingDirection",
-                      "TotalReadoutTime", "EchoTime", "SliceTiming", "SliceEncodingDirection",
-                      "AcquisitionVoxelSize", "FlipAngle"] {
+            // The readout and the hardware are the ASL series'; BIDS recommends the hardware keys
+            // on every sidecar, so they are carried over when the input has them.
+            for k in ["Manufacturer", "ManufacturersModelName", "DeviceSerialNumber", "StationName",
+                      "SoftwareVersions", "MagneticFieldStrength", "ReceiveCoilName", "ReceiveCoilActiveElements",
+                      "GradientSetType", "MRTransmitCoilSequence", "MatrixCoilMode", "CoilCombinationMethod",
+                      "InstitutionName", "InstitutionAddress", "InstitutionalDepartmentName",
+                      "MRAcquisitionType", "PhaseEncodingDirection", "TotalReadoutTime", "EchoTime",
+                      "SliceTiming", "SliceEncodingDirection", "AcquisitionVoxelSize", "FlipAngle"] {
                 if let Some(v) = p.input_sidecar.get(k) {
                     m0side.insert(k.to_string(), v.clone());
                 }
