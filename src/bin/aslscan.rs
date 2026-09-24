@@ -80,6 +80,18 @@ fn run() -> Result<(), String> {
     );
     println!("phantom: {:?} voxels, labels {:?}, fieldmap {}", ph.grid.dims,
              ph.labels.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(), ph.fieldmap.is_some());
+    println!(
+        "contrast {}{}; background suppression {}; motion {}",
+        p.contrast.as_str(),
+        p.ir.as_ref().map_or(String::new(), |s| format!(
+            " (TI {} s, flip {} deg, inversion {} deg)",
+            s.params.inversion_time, s.params.excitation_flip_deg, s.params.inversion_flip_deg)),
+        p.suppression.as_ref().map_or("off".to_string(), |s| format!(
+            "{} pulse(s) on row 0 at efficiency {}{}", s.per_row[0].len(), s.epsilon.0,
+            if s.presaturation.0 { " with presaturation" } else { "" })),
+        p.motion.as_ref().map_or("off".to_string(), |m| format!(
+            "{}{}", m.mode_name, if m.within.is_some() { " + within-volume events" } else { "" })),
+    );
 
     let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
     let t1 = Instant::now();

@@ -78,13 +78,58 @@ mod writer {
         json!({ "Value": v.0, "Source": v.1.as_str() })
     }
 
+    /// The per-row label factors as one number when they agree, else the array.
+    fn label_factor_value(f: &[f64]) -> Value {
+        match f.first() {
+            Some(x) if f.iter().all(|y| y == x) => json!(x),
+            _ => json!(f),
+        }
+    }
+
     /// Everything the simulator resolved, for the output sidecar.
     fn simulation_block(p: &Protocol, out: &SeriesOutput) -> Value {
         let a = &out.acquisition;
+        let suppression = match (&p.suppression, &out.label_factors) {
+            (Some(s), Some(f)) => json!({
+                "Model": "global-bolus",
+                "ModelNote": "every pulse inverts the whole labeled bolus wherever it is; an upper bound on \
+                              the retained label (P3 addendum, part A)",
+                "InversionEfficiency": resolved(s.epsilon),
+                "Presaturation": { "Value": s.presaturation.0, "Source": s.presaturation.1.as_str() },
+                "LabelFactor": label_factor_value(f),
+                "FirstPldPulseTimesAppliedToAll": s.first_pld_applied_to_all,
+                "PulseTimesPerRow": s.per_row,
+                "TissueModel": "signed longitudinal timeline per acquired slice; m0scan rows unsuppressed",
+            }),
+            _ => Value::Null,
+        };
+        let ir = p.ir.as_ref().map_or(Value::Null, |s| json!({
+            "InversionTime": { "Value": s.params.inversion_time, "Source": s.inversion_time.as_str() },
+            "ExcitationFlipAngle": { "Value": s.params.excitation_flip_deg, "Source": s.excitation_flip.as_str() },
+            "InversionFlipAngle": { "Value": s.params.inversion_flip_deg, "Source": s.inversion_flip.as_str() },
+            "BloodModel": "sin(FlipAngle) * delta_m; the preparation does not invert the label (simasl)",
+        }));
+        let motion = p.motion.as_ref().map_or(Value::Null, |m| json!({
+            "Mode": m.mode_name,
+            "Seed": out.motion_seed,
+            "SeedSalt": format!("{:#x}", crate::series::MOTION_SEED_SALT),
+            "RotationOrder": "Rz Ry Rx, degrees, about the field-of-view centre",
+            "WithinVolume": m.within.as_ref().map(|w| json!({
+                "DropoutRate": w.dropout_rate, "Severity": w.severity,
+                "JumpMm": w.jump_mm, "JumpDeg": w.jump_deg, "Events": out.events.len(),
+            })),
+            "GroundTruth": ["desc-motion_gt.tsv (rotations in radians)", "desc-motionEvents_gt.tsv",
+                            "desc-deltam_gt (moved)", "desc-deltamStatic_gt (unmoved)"],
+            "Approximations": [
+                "finished simulation-grid images are resampled, so slice timing travels with the anatomy",
+                "per-voxel T2/T2' maps (voxel mode) and the fieldmap stay in scanner space",
+            ],
+        }));
         json!({
             "Simulator": { "Name": "aslscan", "Version": env!("CARGO_PKG_VERSION") },
             "Seed": out.seeds.0,
             "M0ScanSeed": out.seeds.1,
+            "M0ScanContrast": "se",
             "T2Mode": out.mode.as_str(),
             "Labels": out.labels.iter().map(|(l, n)| json!({ "Label": l, "Name": n })).collect::<Vec<_>>(),
             "Compartments": out.n_compartments,
@@ -94,9 +139,14 @@ mod writer {
                 "LambdaBloodBrain": resolved(p.lambda),
                 "T1ArterialBlood": resolved(p.t1b),
                 "T2Blood": resolved(p.t2_blood_s),
-                "AcqContrast": "se",
+                "AcqContrast": p.contrast.as_str(),
                 "M0RepetitionTime": p.m0_repetition_time_s,
             },
+            "BackgroundSuppressionLabelFactor": out.label_factors.as_deref().map(label_factor_value),
+            "BackgroundSuppressionModel": p.suppression.as_ref().map(|_| "global-bolus"),
+            "BackgroundSuppression": suppression,
+            "InversionRecovery": ir,
+            "Motion": motion,
             "Grid": {
                 "AcquisitionMatrix": out.acq_grid.dims,
                 "SimulationMatrix": out.sim_grid.dims,
@@ -168,13 +218,19 @@ mod writer {
         // have overridden the sidecar's LabelingEfficiency, and PartialFourier or the
         // acceleration factor come from the overlay/protocol, not the input. The originals are
         // kept under AslscanSimulation.InputValuesReplaced so nothing is lost.
-        let effective: [(&str, Value); 5] = [
+        let mut effective: Vec<(&str, Value)> = vec![
             ("LabelingEfficiency", json!(p.alpha.0)),
             ("PartialFourier", json!(out.acquisition.partial_fourier)),
             ("ParallelReductionFactorInPlane", json!(out.acquisition.accel)),
             ("MultibandAccelerationFactor", json!(p.mb)),
             ("TotalAcquiredPairs", json!(p.total_acquired_pairs())),
         ];
+        if let Some(ir) = &p.ir {
+            // Standard fields; a simasl-legal negative excitation angle is written as its
+            // positive equivalent (BIDS: 0..360), the signed value staying in the block above.
+            effective.push(("InversionTime", json!(ir.params.inversion_time)));
+            effective.push(("FlipAngle", json!(ir.params.excitation_flip_deg.rem_euclid(360.0))));
+        }
         let mut replaced = Map::new();
         for (k, v) in effective {
             if let Some(old) = side.get(k) {
@@ -214,7 +270,10 @@ mod writer {
                 format!("bids::{}", names.rel("_part-mag_asl.nii.gz")),
                 format!("bids::{}", names.rel("_part-phase_asl.nii.gz")),
             ]));
-            m0side.insert("AslscanSimulation".to_string(), json!({ "Seed": out.seeds.1, "Magnitude": true }));
+            m0side.insert("AslscanSimulation".to_string(), json!({
+                "Seed": out.seeds.1, "Magnitude": true, "Contrast": "se",
+                "Note": "a plain spin-echo readout at its own repetition time: no suppression, no inversion, no motion",
+            }));
             write_json(&PathBuf::from(format!("{prefix_s}_m0scan.json")), &Value::Object(m0side))?;
         }
 
@@ -235,11 +294,43 @@ mod writer {
         wgt("M0map", &gt.m0, "arbitrary", mean)?;
         write_4d(&PathBuf::from(format!("{gt_prefix}_desc-deltam_gt.nii.gz")), out.acq_grid.dims, out.n_volumes, &gt.delta_m, &out.acq_grid)
             .map_err(|e| e.to_string())?;
+        let moved = out.ground_truth.delta_m_static.is_some();
         write_json(&PathBuf::from(format!("{gt_prefix}_desc-deltam_gt.json")), &json!({
             "Units": "arbitrary (same as M0map)",
-            "Description": "+delta_m at each label/deltam row's own timing, box-averaged; zero for other rows",
+            "Description": if moved {
+                "+delta_m at each label/deltam row's own timing, moved by the row's pose on the simulation grid \
+                 and box-averaged (no shot events, no suppression factor); zero for other rows"
+            } else {
+                "+delta_m at each label/deltam row's own timing, box-averaged; zero for other rows"
+            },
             "Resampling": mean,
+            "Moved": moved,
         }))?;
+        if let Some(gts) = &gt.delta_m_static {
+            write_4d(&PathBuf::from(format!("{gt_prefix}_desc-deltamStatic_gt.nii.gz")), out.acq_grid.dims, out.n_volumes, gts, &out.acq_grid)
+                .map_err(|e| e.to_string())?;
+            write_json(&PathBuf::from(format!("{gt_prefix}_desc-deltamStatic_gt.json")), &json!({
+                "Units": "arbitrary (same as M0map)",
+                "Description": "+delta_m at each label/deltam row's own timing, unmoved, box-averaged; zero for other rows",
+                "Resampling": mean,
+            }))?;
+        }
+        if p.motion.is_some() {
+            let mut tsv = String::from("volume\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+            for (v, q) in out.poses.iter().enumerate() {
+                let r = q.rot_deg.map(f64::to_radians);
+                tsv.push_str(&format!("{v}\t{}\t{}\t{}\t{}\t{}\t{}\n", q.trans_mm[0], q.trans_mm[1], q.trans_mm[2], r[0], r[1], r[2]));
+            }
+            std::fs::write(format!("{gt_prefix}_desc-motion_gt.tsv"), tsv).map_err(|e| e.to_string())?;
+            let mut ev = String::from("volume\tshot\tslices\tattenuation\tjump_x\tjump_y\tjump_z\tjump_rx\tjump_ry\tjump_rz\n");
+            for (e, d) in out.events.iter().zip(&out.dropped) {
+                let slices = d.slices.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
+                ev.push_str(&format!("{}\t{}\t{slices}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", e.volume, e.shot, d.attenuation,
+                                     e.jump_mm[0], e.jump_mm[1], e.jump_mm[2],
+                                     e.jump_deg[0].to_radians(), e.jump_deg[1].to_radians(), e.jump_deg[2].to_radians()));
+            }
+            std::fs::write(format!("{gt_prefix}_desc-motionEvents_gt.tsv"), ev).map_err(|e| e.to_string())?;
+        }
         // `phantom::load` already bounds labels to 0..=32767, so this cannot truncate; the
         // conversion is checked anyway rather than cast.
         let dseg: Vec<i16> = gt.dseg.iter().map(|l| i16::try_from(*l).map_err(|_| format!("dseg label {l} does not fit int16")))
