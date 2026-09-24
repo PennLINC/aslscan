@@ -234,7 +234,12 @@ mod writer {
         let mut replaced = Map::new();
         for (k, v) in effective {
             if let Some(old) = side.get(k) {
-                if *old != v {
+                // numbers compare as numbers: an input `90` is not replaced by `90.0`
+                let same = match (old.as_f64(), v.as_f64()) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => *old == v,
+                };
+                if !same {
                     replaced.insert(k.to_string(), old.clone());
                 }
             }
