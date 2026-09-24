@@ -318,14 +318,15 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
             })
             .clone()
     };
-    // ---- suppressed tissue per slice, keyed on the complete resolved preparation ----
-    let mut slice_cache: HashMap<(u64, u64, usize), Vec<Vec<f32>>> = HashMap::new();
+    // ---- suppressed tissue per slice, keyed on the complete resolved preparation AND the
+    // slice: simultaneously excited (multiband) slices share a readout time but not anatomy ----
+    let mut slice_cache: HashMap<(u64, u64, usize, usize), Vec<Vec<f32>>> = HashMap::new();
     let mut tissue_slice_for = |row: usize, z: usize| -> Vec<Vec<f32>> {
         let r = &p.rows[row];
         let s = suppression[row].as_ref().expect("suppressed rows only");
         let t_read = r.t + p.slice_offsets[z];
         slice_cache
-            .entry((r.tr.to_bits(), t_read.to_bits(), pulse_set[row]))
+            .entry((r.tr.to_bits(), t_read.to_bits(), pulse_set[row], z))
             .or_insert_with(|| {
                 masks
                     .iter()
@@ -685,30 +686,53 @@ mod tests {
         v
     }
 
-    #[test]
-    fn suppression_scales_the_tissue_by_the_timeline() {
-        // Homogeneous grid (acq == phantom, o = 1), no distortion, no noise: the acquired GM
-        // interior should follow tissue_mz / tissue_se at each slice's readout to a few percent
-        // (the readout's per-line relaxation blurs a little, and the crop's GM is thin).
+    /// Homogeneous grid (acq == phantom, o = 1), no distortion, no noise: the acquired GM
+    /// interior should follow tissue_mz / tissue_se at each slice's readout to a few percent
+    /// (the readout's per-line relaxation blurs a little, and the crop's GM is thin).
+    /// `multiband`: 3 shots of 2 slices, so slices z and z + 3 share a readout time but must
+    /// keep their own anatomy (the per-slice cache is keyed on the slice as well).
+    fn check_suppression_ratio(multiband: bool) {
         let ph = phantom();
         let ov = "[acquisition]\noversample = 1\n[background_suppression]\ninversion_efficiency = 1.0\n";
-        let on = protocol_from(&suppressed(&[2.0, 3.2]), "control", ov);
-        let off = protocol([1.0, 1.0, 1.0], 6, "control", "[acquisition]\noversample = 1\n");
+        let (mut s_on, mut s_off) = (suppressed(&[2.0, 3.2]), sidecar([1.0, 1.0, 1.0], 6));
+        if multiband {
+            for s in [&mut s_on, &mut s_off] {
+                s["MultibandAccelerationFactor"] = json!(2);
+                s["SliceTiming"] = json!([0.0, 0.04, 0.08, 0.0, 0.04, 0.08]);
+            }
+        }
+        let on = protocol_from(&s_on, "control", ov);
+        let off = protocol_from(&s_off, "control", "[acquisition]\noversample = 1\n");
         let a = simulate(&on, &ph, T2Mode::Class, &no_phase()).unwrap();
         let b = simulate(&off, &ph, T2Mode::Class, &no_phase()).unwrap();
         assert_eq!(a.label_factors.as_deref(), Some(&[1.0][..]));
         let s = on.suppression.as_ref().unwrap().for_row(0);
         let gm = interior(&a, 1);
         assert!(gm.len() >= 4, "too few interior GM voxels: {}", gm.len());
+        let mut slices_seen = std::collections::HashSet::new();
         let mut worst = 0.0f64;
         for (vox, z) in gm {
+            slices_seen.insert(z);
             let t_read = 3.6 + on.slice_offsets[z];
             let want = tissue_mz(1.0, 1.33, 4.0, t_read, &s) / tissue_se(1.0, 1.33, 4.0);
             let got = a.mag[vox] as f64 / b.mag[vox] as f64;
             worst = worst.max((got - want).abs() / want.abs());
         }
-        println!("suppressed / unsuppressed GM ratio: worst relative deviation {worst:.3e}");
+        println!("suppressed / unsuppressed GM ratio (multiband {multiband}): worst relative deviation {worst:.3e} over slices {slices_seen:?}");
         assert!(worst < 0.05, "{worst}");
+        if multiband {
+            assert!(slices_seen.iter().any(|z| *z >= 3), "the check must reach a slice that shares its readout time");
+        }
+    }
+
+    #[test]
+    fn suppression_scales_the_tissue_by_the_timeline() {
+        check_suppression_ratio(false);
+    }
+
+    #[test]
+    fn suppression_keeps_each_multiband_slices_own_anatomy() {
+        check_suppression_ratio(true);
     }
 
     #[test]
