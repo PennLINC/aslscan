@@ -78,6 +78,18 @@ mod writer {
         json!({ "Value": v.0, "Source": v.1.as_str() })
     }
 
+    /// JSON equality with numbers compared as numbers (an input `90` is not replaced by `90.0`),
+    /// elementwise through arrays.
+    fn same_number(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_number(p, q)),
+            _ => match (a.as_f64(), b.as_f64()) {
+                (Some(p), Some(q)) => p == q,
+                _ => a == b,
+            },
+        }
+    }
+
     /// The per-row label factors as one number when they agree, else the array.
     fn label_factor_value(f: &[f64]) -> Value {
         match f.first() {
@@ -231,15 +243,16 @@ mod writer {
             effective.push(("InversionTime", json!(ir.params.inversion_time)));
             effective.push(("FlipAngle", json!(ir.params.excitation_flip_deg.rem_euclid(360.0))));
         }
+        if let Some(s) = &p.suppression {
+            // BIDS carries the first PLD's pulse times; an overlay override must be what is
+            // published, with the input kept under InputValuesReplaced.
+            effective.push(("BackgroundSuppressionNumberPulses", json!(s.first_pld_pulses.len())));
+            effective.push(("BackgroundSuppressionPulseTime", json!(s.first_pld_pulses)));
+        }
         let mut replaced = Map::new();
         for (k, v) in effective {
             if let Some(old) = side.get(k) {
-                // numbers compare as numbers: an input `90` is not replaced by `90.0`
-                let same = match (old.as_f64(), v.as_f64()) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => *old == v,
-                };
-                if !same {
+                if !same_number(old, &v) {
                     replaced.insert(k.to_string(), old.clone());
                 }
             }
@@ -275,9 +288,19 @@ mod writer {
                 format!("bids::{}", names.rel("_part-mag_asl.nii.gz")),
                 format!("bids::{}", names.rel("_part-phase_asl.nii.gz")),
             ]));
+            // The M0 scan is simulated with the 90-degree spin-echo equation whatever the ASL
+            // series' excitation angle; its FlipAngle says so, the input kept as replaced.
+            let mut m0_replaced = Map::new();
+            if let Some(old) = m0side.get("FlipAngle") {
+                if !same_number(old, &json!(90.0)) {
+                    m0_replaced.insert("FlipAngle".to_string(), old.clone());
+                }
+            }
+            m0side.insert("FlipAngle".to_string(), json!(90.0));
             m0side.insert("AslscanSimulation".to_string(), json!({
                 "Seed": out.seeds.1, "Magnitude": true, "Contrast": "se",
                 "Note": "a plain spin-echo readout at its own repetition time: no suppression, no inversion, no motion",
+                "InputValuesReplaced": m0_replaced,
             }));
             write_json(&PathBuf::from(format!("{prefix_s}_m0scan.json")), &Value::Object(m0side))?;
         }

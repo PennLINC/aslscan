@@ -228,6 +228,9 @@ pub struct SuppressionSpec {
     pub presaturation: (bool, Source),
     /// Seconds from labeling start, per row in series order.
     pub per_row: Vec<Vec<f64>>,
+    /// The first (lowest) PLD's pulse times: what BIDS' `BackgroundSuppressionPulseTime`
+    /// carries, so the effective standard field is written from here.
+    pub first_pld_pulses: Vec<f64>,
     /// A multi-PLD series without `pulse_times_per_pld`: BIDS defines only the first PLD's
     /// times, and they were applied to every row.
     pub first_pld_applied_to_all: bool,
@@ -537,6 +540,35 @@ fn multiband_schedule(offsets: &[f64], mb: usize) -> Result<bool, String> {
     }
 }
 
+/// `mrsim_acq::motion::load_motion_tsv` maps a missing or unparseable cell to 0 and accepts a
+/// non-finite number, so a truncated row or a NaN would silently change the trajectory. Check
+/// the six columns of every row first; `n/a` is the documented sentinel for 0.
+fn check_motion_tsv(path: &str) -> Result<(), String> {
+    const COLS: [&str; 6] = ["trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z"];
+    let text = std::fs::read_to_string(path).map_err(|e| format!("overlay motion.trajectory {path}: {e}"))?;
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let header: Vec<&str> = lines.next().ok_or_else(|| format!("overlay motion.trajectory {path}: empty TSV"))?.split('\t').collect();
+    let idx = COLS
+        .iter()
+        .map(|c| header.iter().position(|h| h.trim() == *c).ok_or_else(|| format!("overlay motion.trajectory {path}: column {c:?} missing")))
+        .collect::<Result<Vec<usize>, String>>()?;
+    for (i, line) in lines.enumerate() {
+        let cells: Vec<&str> = line.split('\t').collect();
+        for (&c, name) in idx.iter().zip(COLS) {
+            let cell = cells.get(c).map(|s| s.trim())
+                .ok_or_else(|| format!("overlay motion.trajectory {path} row {i}: column {name} is missing"))?;
+            if cell == "n/a" {
+                continue;
+            }
+            match cell.parse::<f64>() {
+                Ok(v) if v.is_finite() => {}
+                _ => return Err(format!("overlay motion.trajectory {path} row {i}: {name} = {cell:?} is not a finite number or n/a")),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn vec3_amplitude(v: Option<[f64; 3]>, what: &str) -> Result<[f64; 3], String> {
     let v = v.unwrap_or([0.0; 3]);
     for x in v {
@@ -552,6 +584,14 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, mb: usize) -> Result<Opti
         Some(v) => {
             if let Some(bad) = v.iter().find(|&&i| i >= n) {
                 return Err(format!("overlay: motion.volumes index {bad} is outside the {n} volumes"));
+            }
+            // mrsim-acq's linear mode divides the amplitude by the list length but steps once
+            // per distinct volume, and random mode redraws a duplicate: reject repeats.
+            let mut seen = vec![false; n];
+            for &i in v {
+                if std::mem::replace(&mut seen[i], true) {
+                    return Err(format!("overlay: motion.volumes lists volume {i} more than once"));
+                }
             }
             v.clone()
         }
@@ -579,6 +619,7 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, mb: usize) -> Result<Opti
         "trajectory" => {
             let path = m.trajectory.as_ref()
                 .ok_or("overlay: motion.mode \"trajectory\" needs motion.trajectory, a TSV path")?;
+            check_motion_tsv(path)?;
             let poses = load_motion_tsv(Path::new(path)).map_err(|e| format!("overlay motion.trajectory {path}: {e}"))?;
             if poses.len() != n {
                 return Err(format!(
@@ -747,7 +788,8 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
     // recovery interval (P3 addendum, timing constraints; true for P1 protocols as well).
     let max_offset = slice_offsets.iter().cloned().fold(0.0, f64::max);
     for (i, r) in rows.iter().enumerate() {
-        if r.kind != RowKind::M0scan && r.t + max_offset > r.tr {
+        // m0scan rows have t = 0: their readout starts at the excitation and spans the offsets
+        if r.t + max_offset > r.tr {
             return Err(format!(
                 "asl.json: row {i} reads its last slice at {} s (signal time {} s + slice offset {} s), after \
                  its RepetitionTimePreparation {} s", r.t + max_offset, r.t, max_offset, r.tr));
@@ -871,19 +913,27 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
     // Inversion recovery (P3 addendum, part B): InversionTime and FlipAngle are standard BIDS
     // fields, so they are inputs with the usual precedence; the inversion angle is overlay-only.
     let side_ti = opt_num(sidecar, "InversionTime")?;
-    let side_fa = opt_num(sidecar, "FlipAngle")?;
+    // BIDS puts FlipAngle in [0, 360]; simasl's signed [-180, 180] is the internal convention,
+    // so 330 becomes -30 (the writer does the reverse).
+    let side_fa = match opt_num(sidecar, "FlipAngle")? {
+        Some(v) => {
+            if !(v.is_finite() && (0.0..=360.0).contains(&v)) {
+                return Err(format!("asl.json: FlipAngle must be in [0, 360] degrees, got {v}"));
+            }
+            Some(if v > 180.0 { v - 360.0 } else { v })
+        }
+        None => None,
+    };
     let ir = match contrast {
         Contrast::SpinEcho => {
-            if let Some(fa) = side_fa {
-                if (fa - 90.0).abs() > 1e-9 {
-                    return Err(format!(
-                        "asl.json: FlipAngle {fa} with acq_contrast \"se\": the spin-echo signal equation assumes \
-                         a 90-degree excitation; an inversion-recovery readout takes acq_contrast = \"ir\""));
+            for (what, fa) in [("asl.json: FlipAngle", side_fa), ("overlay: signal.excitation_flip_angle", so.and_then(|s| s.excitation_flip_angle))] {
+                if let Some(fa) = fa {
+                    if (fa - 90.0).abs() > 1e-9 {
+                        return Err(format!(
+                            "{what} {fa} with acq_contrast \"se\": the spin-echo signal equation assumes a 90-degree \
+                             excitation; an inversion-recovery readout takes acq_contrast = \"ir\""));
+                    }
                 }
-            }
-            if so.and_then(|s| s.excitation_flip_angle).is_some() {
-                return Err("overlay: signal.excitation_flip_angle is undefined for acq_contrast \"se\" (the \
-                            spin-echo equation assumes 90 degrees)".to_string());
             }
             if side_ti.is_some() || so.and_then(|s| s.inversion_time).is_some() {
                 return Err("InversionTime with acq_contrast \"se\": no inversion is simulated, and echoing the \
@@ -980,6 +1030,10 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
         let mut distinct: Vec<u64> = (0..n).filter(|&i| kinds[i] != RowKind::M0scan).map(|i| pld[i].to_bits()).collect();
         distinct.sort_by(|a, b| f64::from_bits(*a).partial_cmp(&f64::from_bits(*b)).unwrap());
         distinct.dedup();
+        let first_pld_pulses = match bo.and_then(|b| b.pulse_times_per_pld.as_ref()) {
+            Some(sets) => sets.first().cloned().unwrap_or_default(),
+            None => times.clone(),
+        };
         let (per_row, first_pld_applied_to_all): (Vec<Vec<f64>>, bool) = match bo.and_then(|b| b.pulse_times_per_pld.as_ref()) {
             Some(sets) => {
                 if sets.len() != distinct.len() {
@@ -1023,7 +1077,7 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                 }
             }
         }
-        Some(SuppressionSpec { epsilon, presaturation, per_row, first_pld_applied_to_all })
+        Some(SuppressionSpec { epsilon, presaturation, per_row, first_pld_pulses, first_pld_applied_to_all })
     } else {
         None
     };
@@ -1033,6 +1087,11 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
     let m0_repetition_time_s = overlay.and_then(|o| o.m0.as_ref()).and_then(|m| m.repetition_time);
     if let Some(v) = m0_repetition_time_s {
         require_finite_positive(v, "overlay m0.repetition_time")?;
+        if max_offset > v {
+            return Err(format!(
+                "overlay m0.repetition_time {v} s is shorter than the last slice offset {max_offset} s of the \
+                 readout the M0 scan shares"));
+        }
     }
     if m0_type == M0Type::Separate && m0_repetition_time_s.is_none() {
         return Err("M0Type is \"Separate\" but the overlay has no [m0] repetition_time; the ASL sidecar's \
@@ -1534,6 +1593,11 @@ mod tests {
         let p = parse(&s, CTX, Some(&ov), None).unwrap();
         assert_eq!(p.suppression.as_ref().unwrap().per_row[3], vec![2.0, 3.4]);
         assert!(!p.suppression.as_ref().unwrap().first_pld_applied_to_all);
+        assert_eq!(p.suppression.as_ref().unwrap().first_pld_pulses, vec![2.0, 3.2]);
+        // the override's first set is what the standard field will publish
+        let ov = overlay("[background_suppression]\npulse_times_per_pld = [[2.1], [2.0, 3.4]]\n[m0]\nrepetition_time = 8.0\n");
+        let p = parse(&s, CTX, Some(&ov), None).unwrap();
+        assert_eq!(p.suppression.as_ref().unwrap().first_pld_pulses, vec![2.1]);
     }
 
     #[test]
@@ -1544,6 +1608,18 @@ mod tests {
         assert!(e.contains("3.7") && e.contains("3.65"), "{e}");
         s["RepetitionTimePreparation"] = json!(3.7);
         assert!(parse(&s, CTX, Some(&m0_overlay()), None).is_ok());
+        // an included m0scan row reads from t = 0 and must still hold the slice offsets...
+        let mut s = base();
+        s["M0Type"] = json!("Included");
+        s["RepetitionTimePreparation"] = json!([0.05, 4.0, 4.0]);
+        s["PostLabelingDelay"] = json!([0.0, 1.8, 1.8]);
+        s["LabelingDuration"] = json!([0.0, 1.8, 1.8]);
+        let e = parse(&s, "volume_type\nm0scan\ncontrol\nlabel\n", None, None).unwrap_err();
+        assert!(e.contains("row 0") && e.contains("0.05"), "{e}");
+        // ...and so must the separate M0 scan's repetition time
+        let ov = overlay("[m0]\nrepetition_time = 0.05\n");
+        let e = parse(&base(), CTX, Some(&ov), None).unwrap_err();
+        assert!(e.contains("m0.repetition_time") && e.contains("0.1"), "{e}");
     }
 
     #[test]
@@ -1559,6 +1635,13 @@ mod tests {
         assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("InversionTime"));
         let ov = overlay("[signal]\nexcitation_flip_angle = 60\n[m0]\nrepetition_time = 8.0\n");
         assert!(parse(&base(), CTX, Some(&ov), None).unwrap_err().contains("excitation_flip_angle"));
+        // ...but an overlay that states the modeled 90 degrees is fine
+        let ov = overlay("[signal]\nexcitation_flip_angle = 90\n[m0]\nrepetition_time = 8.0\n");
+        assert!(parse(&base(), CTX, Some(&ov), None).is_ok());
+        // BIDS range on the sidecar angle, normalised to simasl's signed convention
+        let mut s = base();
+        s["FlipAngle"] = json!(400);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("[0, 360]"));
         let ov = overlay("[signal]\ninversion_flip_angle = 120\n[m0]\nrepetition_time = 8.0\n");
         assert!(parse(&base(), CTX, Some(&ov), None).unwrap_err().contains("inversion_flip_angle"));
         // ir: defaults, then sidecar, then overlay
@@ -1577,6 +1660,11 @@ mod tests {
         let spec = parse(&s, CTX, Some(&ir("inversion_time = 0.8\nexcitation_flip_angle = -30\ninversion_flip_angle = 150\n")), None).unwrap().ir.unwrap();
         assert_eq!(spec.params, IrParams { inversion_time: 0.8, excitation_flip_deg: -30.0, inversion_flip_deg: 150.0 });
         assert_eq!((spec.inversion_time, spec.excitation_flip, spec.inversion_flip), (Source::Overlay, Source::Overlay, Source::Overlay));
+        // a sidecar FlipAngle of 330 (what the writer emits for -30) reads back as -30
+        s["FlipAngle"] = json!(330);
+        let spec = parse(&s, CTX, Some(&ir("")), None).unwrap().ir.unwrap();
+        assert_eq!(spec.params.excitation_flip_deg, -30.0);
+        assert_eq!(spec.excitation_flip, Source::Sidecar);
         // ranges and simasl's TR >= TE + TI
         assert!(parse(&base(), CTX, Some(&ir("excitation_flip_angle = 200\n")), None).unwrap_err().contains("[-180, 180]"));
         assert!(parse(&base(), CTX, Some(&ir("inversion_time = -0.1\n")), None).unwrap_err().contains("inversion time"));
@@ -1625,6 +1713,7 @@ mod tests {
         assert!(matches!(&p.motion.as_ref().unwrap().mode, MotionMode::Linear { volumes, .. } if volumes.len() == 4));
         assert!(parse(&base(), CTX, Some(&mo("mode = \"random\"\n")), None).unwrap_err().contains("moves nothing"));
         assert!(parse(&base(), CTX, Some(&mo("mode = \"random\"\ntrans_mm = [1.0, 0.0, 0.0]\nvolumes = [4]\n")), None).unwrap_err().contains("index 4"));
+        assert!(parse(&base(), CTX, Some(&mo("mode = \"linear\"\ntrans_mm = [1.0, 0.0, 0.0]\nvolumes = [1, 1]\n")), None).unwrap_err().contains("more than once"));
         assert!(parse(&base(), CTX, Some(&mo("mode = \"wobble\"\n")), None).unwrap_err().contains("wobble"));
         assert!(parse(&base(), CTX, Some(&mo("mode = \"trajectory\"\n")), None).unwrap_err().contains("motion.trajectory"));
         // trajectory: four rows for four volumes, radians in the file
@@ -1645,6 +1734,19 @@ mod tests {
         let e = parse(&base(), "volume_type\ncontrol\nlabel\n", Some(&mo(&format!("mode = \"trajectory\"\ntrajectory = \"{path}\"\n"))), None).unwrap_err();
         assert!(e.contains("4 rows") && e.contains("2 volumes"), "{e}");
         assert!(parse(&base(), CTX, Some(&mo(&format!("mode = \"random\"\ntrans_mm = [1, 0, 0]\ntrajectory = \"{path}\"\n"))), None).unwrap_err().contains("only read"));
+        // corrupt rows are refused before mrsim-acq's lenient loader sees them: a truncated
+        // row, a NaN, a word; `n/a` is the documented zero
+        let traj = |body: &str| {
+            std::fs::write(&tsv, format!("trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n{body}")).unwrap();
+            parse(&base(), CTX, Some(&mo(&format!("mode = \"trajectory\"\ntrajectory = \"{path}\"\n"))), None)
+        };
+        let ok = "0\t0\t0\t0\t0\t0\n";
+        let e = traj(&format!("{ok}{ok}{ok}1\t0\t0\n")).unwrap_err();
+        assert!(e.contains("row 3") && e.contains("rot_x") && e.contains("missing"), "{e}");
+        let e = traj(&format!("{ok}{ok}{ok}0\tNaN\t0\t0\t0\t0\n")).unwrap_err();
+        assert!(e.contains("row 3") && e.contains("trans_y"), "{e}");
+        assert!(traj(&format!("{ok}{ok}{ok}0\t0\tabc\t0\t0\t0\n")).unwrap_err().contains("trans_z"));
+        assert!(traj(&format!("{ok}{ok}{ok}n/a\tn/a\tn/a\tn/a\tn/a\tn/a\n")).is_ok());
         // within-volume events need multiband
         let wv = "[motion.within_volume]\ndropout_rate = 0.2\nseverity = 0.5\n";
         assert!(parse(&base(), CTX, Some(&mo(wv)), None).unwrap_err().contains("MultibandAccelerationFactor"));

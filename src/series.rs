@@ -763,14 +763,41 @@ mod tests {
         let scale = max_abs(&a.mag) as f64;
         let worst = a.mag.iter().zip(&b.mag).fold(0.0f64, |m, (x, y)| m.max((*x as f64 - *y as f64).abs() / scale));
         assert!(worst < 1e-6, "IR(fa 90, fa_inv 0) must equal spin echo: {worst:e}");
-        // and a 30-degree excitation scales the whole image by sin(30) = 1/2
-        let ir30 = protocol([3.0, 3.0, 3.0], 2, "control,label",
-                            "[acquisition]\nsignal_scale = 1.0\n[signal]\nacq_contrast = \"ir\"\nexcitation_flip_angle = 30.0\ninversion_flip_angle = 0.0\n");
-        let c = simulate(&ir30, &ph, T2Mode::Auto, &no_phase()).unwrap();
-        let worst = a.mag.iter().zip(&c.mag).fold(0.0f64, |m, (x, y)| m.max((0.5 * *x as f64 - *y as f64).abs() / scale));
-        // sin(30) scales tissue by 1/2 but the IR denominator 1 - cos(30) E differs from the
-        // spin echo's, so only the label/deltam blood term is exactly half; check loosely
-        assert!(worst < 0.5, "{worst}");
+        // a 30-degree excitation scales the blood by sin(30) = 1/2 exactly: the deltam row has
+        // no tissue, so its image is half the spin-echo deltam image
+        let se_d = protocol([3.0, 3.0, 3.0], 2, "deltam", "[acquisition]\nsignal_scale = 1.0\n");
+        let ir30_d = protocol([3.0, 3.0, 3.0], 2, "deltam",
+                              "[acquisition]\nsignal_scale = 1.0\n[signal]\nacq_contrast = \"ir\"\nexcitation_flip_angle = 30.0\ninversion_flip_angle = 180.0\n");
+        let d = simulate(&se_d, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        let e = simulate(&ir30_d, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        let dscale = max_abs(&d.mag) as f64;
+        let worst = d.mag.iter().zip(&e.mag).fold(0.0f64, |m, (x, y)| m.max((0.5 * *x as f64 - *y as f64).abs() / dscale));
+        assert!(worst < 1e-6, "deltam under fa 30 must be half the spin-echo deltam: {worst:e}");
+    }
+
+    #[test]
+    fn ir_with_a_real_inversion_follows_the_closed_form_in_gm() {
+        // TI 1 s, 180-degree inversion, 90-degree excitation on the homogeneous grid: the GM
+        // interior control ratio IR / SE is tissue_ir / tissue_se (0.11 here, so a bypass to
+        // sin(fa) * tissue_se, ratio 1, cannot pass).
+        let ph = phantom();
+        let se = protocol([1.0, 1.0, 1.0], 6, "control", "[acquisition]\noversample = 1\n");
+        let ir = protocol([1.0, 1.0, 1.0], 6, "control",
+                          "[acquisition]\noversample = 1\n[signal]\nacq_contrast = \"ir\"\ninversion_time = 1.0\n");
+        let a = simulate(&se, &ph, T2Mode::Class, &no_phase()).unwrap();
+        let b = simulate(&ir, &ph, T2Mode::Class, &no_phase()).unwrap();
+        let q = ir.ir.as_ref().unwrap().params;
+        let want = tissue_ir(1.0, 1.33, 4.0, &q) / tissue_se(1.0, 1.33, 4.0);
+        assert!(want > 0.05 && want < 0.2, "closed form {want}");
+        let gm = interior(&a, 1);
+        assert!(gm.len() >= 4);
+        let mut worst = 0.0f64;
+        for (vox, _) in gm {
+            let got = b.mag[vox] as f64 / a.mag[vox] as f64;
+            worst = worst.max((got - want).abs() / want);
+        }
+        println!("IR / SE GM ratio: worst relative deviation {worst:.3e} from the closed form {want:.4}");
+        assert!(worst < 0.05, "{worst}");
     }
 
     fn write_trajectory(rows: &[[f64; 6]]) -> (std::path::PathBuf, String) {
