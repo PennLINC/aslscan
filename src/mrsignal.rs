@@ -142,7 +142,7 @@ mod tests {
     /// saturation recovery only at `fa = 90`.
     #[test]
     fn ir_without_inversion_keeps_its_denominator() {
-        let (m0, t1, tr) = (74.622, 1.33, 1.33);
+        let (m0, t1, tr) = (74.622f64, 1.33f64, 1.33f64);
         let e = (-tr / t1).exp();
         let p = IrParams { inversion_time: 0.5, excitation_flip_deg: 60.0, inversion_flip_deg: 0.0 };
         let got = tissue_ir(m0, t1, tr, &p);
