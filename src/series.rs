@@ -2,11 +2,22 @@
 //! `simulate_acquisition_oversampled` call for the whole series (plus one for a separate M0
 //! scan), and the ground truth on the acquisition grid.
 //!
-//! Row semantics (spec): tissue compartments `0..K` carry the spin-echo steady state at the row's
-//! repetition time for `control`, `label` and `m0scan` rows and zero for `deltam`; blood
-//! compartments `K..2K` carry `-delta_m` for `label`, `+delta_m` for `deltam`, zero otherwise.
-//! `K` is the number of foreground labels in `class` mode and 1 in `voxel` mode. Everything is
-//! evaluated per phantom voxel and only magnetization is averaged onto the simulation grid.
+//! Row semantics (spec): tissue compartments `0..K` carry the post-excitation steady state at
+//! the row's repetition time for `control`, `label` and `m0scan` rows and zero for `deltam`;
+//! blood compartments `K..2K` carry `-delta_m` for `label`, `+delta_m` for `deltam`, zero
+//! otherwise. `K` is the number of foreground labels in `class` mode and 1 in `voxel` mode.
+//! Everything is evaluated per phantom voxel and only magnetization is averaged onto the
+//! simulation grid.
+//!
+//! P3 (addendum): under background suppression the tissue of `control`/`label` rows is the
+//! signed `longitudinal::tissue_mz` at each acquired slice's readout time and the blood carries
+//! the row's label factor; under inversion recovery the tissue is `mrsignal::tissue_ir` and the
+//! blood `blood_ir`; `m0scan` rows and the separate M0 scan always take the spin-echo steady
+//! state at their own TR (a plain readout, recorded in the sidecar). Motion is applied to the
+//! assembled simulation-grid compartments before the one call: per-volume poses through
+//! `mrsim_acq::motion::apply_motion`, then multiband shot events through
+//! `apply_multiband_motion`. The moved `delta_m` ground truth is the simulation-grid `delta_m`
+//! moved by the same poses (events excluded) and block-averaged to the acquisition grid.
 //!
 //! One call per series is a hard rule (spec P0 change 5a): every random stream in the
 //! acquisition stage is keyed on the volume index within a call, so calling once per volume
@@ -17,24 +28,36 @@ use std::collections::HashMap;
 use mrsim_acq::grid::Grid;
 use mrsim_acq::io::hires_grid;
 use mrsim_acq::kspace::{simulate_acquisition_oversampled, Acquisition, T2Volume};
+use mrsim_acq::motion::{
+    apply_motion, apply_multiband_motion, resolve_poses, slice_schedule, DropoutLaw, DroppedShot, MotionEvent, Pose,
+};
 use mrsim_acq::phase::PhaseModel;
 
 use crate::kinetic::delta_m;
-use crate::mrsignal::{blood_se, tissue_se};
+use crate::longitudinal::{label_factor, tissue_mz};
+use crate::mrsignal::{blood_ir, blood_se, tissue_ir, tissue_se, Contrast};
 use crate::phantom::{Phantom, Relaxation, T2Mode};
-use crate::protocol::{M0Type, Protocol, Row, RowKind};
+use crate::protocol::{M0Type, Protocol, Row, RowKind, WithinVolume};
 use crate::resample::{acquisition_grid, axis_aligned_voxels, Resampler};
+use crate::rng::SplitMix64;
 
 /// The seed the separate M0 scan's call uses, derived from the series seed so the two calls
 /// draw different noise (they would otherwise both be "volume 0").
 pub const M0_SEED_SALT: u64 = 0x4D30_5343_414E;
 
+/// The seed the motion draws use ("MOTION"), so that turning motion on leaves the acquisition
+/// noise realization unchanged.
+pub const MOTION_SEED_SALT: u64 = 0x4D4F_5449_4F4E;
+
 /// Ground-truth maps on the acquisition grid (`resample` rules per map, see the spec).
 #[derive(Debug, Clone)]
 pub struct GroundTruth {
     /// `+delta_m` for `label` and `deltam` rows at their own timing, zero for other rows.
-    /// Voxel-major interleaved like the data: `vox * n_volumes + v`.
+    /// Voxel-major interleaved like the data: `vox * n_volumes + v`. With motion on this is
+    /// the MOVED truth (same per-volume poses as the data, no shot events, no suppression
+    /// factor); `delta_m_static` then keeps the unmoved one.
     pub delta_m: Vec<f32>,
+    pub delta_m_static: Option<Vec<f32>>,
     pub perfusion: Vec<f32>,
     /// Masked mean over perfused voxels only (the CSF sentinel must not leak).
     pub att: Vec<f32>,
@@ -65,6 +88,13 @@ pub struct SeriesOutput {
     pub seeds: (u64, Option<u64>),
     pub acquisition: Acquisition,
     pub ground_truth: GroundTruth,
+    /// Per row, the background-suppression blood factor (`None` without suppression).
+    pub label_factors: Option<Vec<f64>>,
+    /// The per-volume poses applied (identity everywhere without motion).
+    pub poses: Vec<Pose>,
+    pub motion_seed: Option<u64>,
+    pub events: Vec<MotionEvent>,
+    pub dropped: Vec<DroppedShot>,
 }
 
 /// Test hook: alter the row semantics to prove the linearity test is not slack.
@@ -115,14 +145,54 @@ pub fn simulate_with(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseMode
     simulate_impl(p, ph, mode, phase, ov)
 }
 
+/// Draw the within-volume shot events: each (volume, shot) has an event with probability
+/// `dropout_rate`, its jumps uniform in `[-amp, amp]` per axis. Deterministic in the draw order.
+fn draw_events(w: Option<&WithinVolume>, n_volumes: usize, n_shots: usize, seed: u64) -> Vec<MotionEvent> {
+    let Some(w) = w else { return Vec::new() };
+    let mut rng = SplitMix64(seed ^ 0x5348_4F54_5321);
+    let mut events = Vec::new();
+    for volume in 0..n_volumes {
+        for shot in 0..n_shots {
+            if rng.unit() < w.dropout_rate {
+                let jump_mm = [rng.signed(w.jump_mm[0]), rng.signed(w.jump_mm[1]), rng.signed(w.jump_mm[2])];
+                let jump_deg = [rng.signed(w.jump_deg[0]), rng.signed(w.jump_deg[1]), rng.signed(w.jump_deg[2])];
+                events.push(MotionEvent { volume, shot, severity: w.severity as f32, jump_mm, jump_deg });
+            }
+        }
+    }
+    events
+}
+
+/// Block-average a voxel-major interleaved simulation-grid image (`o x o` in-plane oversampling,
+/// same slices) onto the acquisition grid: the box mean of equal-volume cells.
+fn block_mean_inplane(src: &[f32], sim_dims: [usize; 3], o: usize, n: usize) -> Vec<f32> {
+    let [snx, sny, nz] = sim_dims;
+    let (nx, ny) = (snx / o, sny / o);
+    let mut out = vec![0.0f32; nx * ny * nz * n];
+    let inv = 1.0 / (o * o) as f64;
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let dst = x + nx * (y + ny * z);
+                for v in 0..n {
+                    let mut acc = 0.0f64;
+                    for j in 0..o {
+                        for i in 0..o {
+                            let s = (x * o + i) + snx * ((y * o + j) + sny * z);
+                            acc += src[s * n + v] as f64;
+                        }
+                    }
+                    out[dst * n + v] = (acc * inv) as f32;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, ov: RowOverride)
     -> Result<SeriesOutput, String>
 {
-    if p.background_suppression {
-        return Err("asl.json: BackgroundSuppression is true; P1 does not model background suppression \
-                    (it arrives with P3), and simulating without it would write a sidecar the data \
-                    contradicts".to_string());
-    }
     if let (Some(pf), fs) = (ph.params.and_then(|q| q.field_strength), p.field_strength) {
         if (pf - fs).abs() > 1e-9 {
             return Err(format!("phantom MagneticFieldStrength {pf} disagrees with the protocol's {fs}"));
@@ -191,13 +261,53 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
         }
     };
 
-    // ---- tissue signal per distinct repetition time, per compartment, on the sim grid ----
-    let mut tissue_cache: HashMap<u64, Vec<Vec<f32>>> = HashMap::new();
-    let mut tissue_for = |tr: f64| -> Vec<Vec<f32>> {
+    // ---- the signal equations in use ----
+    let ir = p.ir.as_ref().map(|s| s.params);
+    let tissue_steady = |m0: f64, t1: f64, tr: f64, se: bool| -> f64 {
+        match (p.contrast, ir, se) {
+            (Contrast::InversionRecovery, Some(q), false) => tissue_ir(m0, t1, tr, &q),
+            _ => tissue_se(m0, t1, tr),
+        }
+    };
+    let blood_signal = |x: f64| -> f64 {
+        match (p.contrast, ir) {
+            (Contrast::InversionRecovery, Some(q)) => blood_ir(x, &q),
+            _ => blood_se(x),
+        }
+    };
+    // Per-row suppression: the pulse set (deduplicated so the tissue cache can key on it) and
+    // the blood factor. Rows without events take the P1 steady-state path.
+    let n = p.rows.len();
+    let (suppression, pulse_set): (Vec<Option<crate::longitudinal::Suppression>>, Vec<usize>) = match &p.suppression {
+        None => (vec![None; n], vec![0; n]),
+        Some(spec) => {
+            let mut sets: Vec<Vec<f64>> = Vec::new();
+            let mut ids = Vec::with_capacity(n);
+            let mut sup = Vec::with_capacity(n);
+            for i in 0..n {
+                let s = spec.for_row(i);
+                let id = match sets.iter().position(|x| *x == s.pulse_times) {
+                    Some(j) => j,
+                    None => {
+                        sets.push(s.pulse_times.clone());
+                        sets.len() - 1
+                    }
+                };
+                ids.push(id);
+                sup.push(if s.has_events() && p.rows[i].kind != RowKind::M0scan { Some(s) } else { None });
+            }
+            (sup, ids)
+        }
+    };
+    let label_factors = p.suppression.as_ref().map(|spec| (0..n).map(|i| label_factor(&spec.for_row(i))).collect::<Vec<f64>>());
+
+    // ---- tissue signal per distinct (TR, equation), per compartment, on the sim grid ----
+    let mut tissue_cache: HashMap<(u64, bool), Vec<Vec<f32>>> = HashMap::new();
+    let mut tissue_for = |tr: f64, se: bool| -> Vec<Vec<f32>> {
         tissue_cache
-            .entry(tr.to_bits())
+            .entry((tr.to_bits(), se))
             .or_insert_with(|| {
-                let sig: Vec<f64> = (0..ph.nvox()).map(|i| tissue_se(ph.m0[i] as f64, ph.t1[i] as f64, tr)).collect();
+                let sig: Vec<f64> = (0..ph.nvox()).map(|i| tissue_steady(ph.m0[i] as f64, ph.t1[i] as f64, tr, se)).collect();
                 masks
                     .iter()
                     .map(|m| {
@@ -208,9 +318,26 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
             })
             .clone()
     };
+    // ---- suppressed tissue per slice, keyed on the complete resolved preparation ----
+    let mut slice_cache: HashMap<(u64, u64, usize), Vec<Vec<f32>>> = HashMap::new();
+    let mut tissue_slice_for = |row: usize, z: usize| -> Vec<Vec<f32>> {
+        let r = &p.rows[row];
+        let s = suppression[row].as_ref().expect("suppressed rows only");
+        let t_read = r.t + p.slice_offsets[z];
+        slice_cache
+            .entry((r.tr.to_bits(), t_read.to_bits(), pulse_set[row]))
+            .or_insert_with(|| {
+                masks
+                    .iter()
+                    .map(|m| {
+                        r_sim.mean_slice(z, |i| if m[i] { tissue_mz(ph.m0[i] as f64, ph.t1[i] as f64, r.tr, t_read, s) } else { 0.0 })
+                    })
+                    .collect()
+            })
+            .clone()
+    };
 
     // ---- per-row blood images with per-slice timing ----
-    let n = p.rows.len();
     let blood_for = |row: &Row, r: &Resampler, sign: f64, want_gt: bool| -> (Vec<Vec<f32>>, Vec<f32>) {
         let [dnx, dny, dnz] = r.dst_dims;
         let mut comps = vec![vec![0.0f32; dnx * dny * dnz]; k];
@@ -231,7 +358,7 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
             };
             for (c, m) in masks.iter().enumerate() {
                 if sign != 0.0 {
-                    let sl = r.mean_slice(z, |i| if m[i] { blood_se(sign * dm(i)) } else { 0.0 });
+                    let sl = r.mean_slice(z, |i| if m[i] { blood_signal(sign * dm(i)) } else { 0.0 });
                     comps[c][z * dnx * dny..(z + 1) * dnx * dny].copy_from_slice(&sl);
                 }
             }
@@ -244,17 +371,40 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
     };
 
     // ---- assemble the 4D compartments, voxel-major interleaved ----
+    let motion_on = p.motion.is_some();
     let mut images: Vec<Vec<f32>> = vec![vec![0.0f32; nvox_sim * n]; ncomp];
-    let mut gt_delta_m = vec![0.0f32; nvox_acq * n];
+    let mut gt_static = vec![0.0f32; nvox_acq * n];
+    let mut gt_sim = if motion_on { vec![0.0f32; nvox_sim * n] } else { Vec::new() };
+    let slab = snx * sny;
     for (v, row) in p.rows.iter().enumerate() {
-        let tissue = if row.kind == RowKind::Deltam { None } else { Some(tissue_for(row.tr)) };
-        let sign = blood_sign(row.kind, ov);
-        let (blood, _) = blood_for(row, &r_sim, sign, false);
+        let se = row.kind == RowKind::M0scan;
+        let tissue = match (row.kind, &suppression[v]) {
+            (RowKind::Deltam, _) => None,
+            (_, Some(_)) => {
+                let mut comps = vec![vec![0.0f32; nvox_sim]; k];
+                for z in 0..nz {
+                    let sl = tissue_slice_for(v, z);
+                    for c in 0..k {
+                        comps[c][z * slab..(z + 1) * slab].copy_from_slice(&sl[c]);
+                    }
+                }
+                Some(comps)
+            }
+            (_, None) => Some(tissue_for(row.tr, se)),
+        };
+        let factor = label_factors.as_ref().map_or(1.0, |f| f[v]);
+        let sign = blood_sign(row.kind, ov) * factor;
         let wants_gt = matches!(row.kind, RowKind::Label | RowKind::Deltam);
+        let (blood, gt_s) = blood_for(row, &r_sim, sign, wants_gt && motion_on);
         if wants_gt {
             let (_, gt) = blood_for(row, &r_acq, 0.0, true);
             for vox in 0..nvox_acq {
-                gt_delta_m[vox * n + v] = gt[vox];
+                gt_static[vox * n + v] = gt[vox];
+            }
+            if motion_on {
+                for vox in 0..nvox_sim {
+                    gt_sim[vox * n + v] = gt_s[vox];
+                }
             }
         }
         for c in 0..k {
@@ -270,6 +420,29 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
         }
     }
 
+    // ---- motion: per-volume poses, then multiband shot events ----
+    let motion_seed = p.motion.as_ref().map(|_| p.seed ^ MOTION_SEED_SALT);
+    let mut poses = vec![Pose::IDENTITY; n];
+    let mut events = Vec::new();
+    let mut dropped = Vec::new();
+    let mut gt_moved: Option<Vec<f32>> = None;
+    if let (Some(m), Some(seed)) = (&p.motion, motion_seed) {
+        let v2w = sim_grid.voxel_to_world;
+        poses = resolve_poses(&m.mode, n, seed);
+        apply_motion(&mut images, sim_grid.dims, n, v2w, &poses);
+        let mut gt_arr = [std::mem::take(&mut gt_sim)];
+        apply_motion(&mut gt_arr, sim_grid.dims, n, v2w, &poses);
+        let [moved] = gt_arr;
+        gt_moved = Some(block_mean_inplane(&moved, sim_grid.dims, o, n));
+        let n_shots = slice_schedule(nz, p.mb, p.mb_interleaved).len();
+        events = draw_events(m.within.as_ref(), n, n_shots, seed);
+        if !events.is_empty() {
+            dropped = apply_multiband_motion(
+                &mut images, sim_grid.dims, n, v2w, p.mb, p.mb_interleaved, &DropoutLaw::Uniform, &events,
+            );
+        }
+    }
+
     // ---- the one call ----
     let eddy_drive = vec![None; n];
     let prep_drive = vec![None; n];
@@ -279,12 +452,12 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
     );
     drop(images);
 
-    // ---- the separate M0 scan ----
+    // ---- the separate M0 scan: a plain spin-echo readout at its own TR ----
     let m0_seed = (p.m0_type == M0Type::Separate).then_some(p.seed ^ M0_SEED_SALT);
     let m0 = match m0_seed {
         Some(seed) => {
             let tr = p.m0_repetition_time_s.ok_or("M0Type Separate without an M0 repetition time")?;
-            let tissue = tissue_for(tr);
+            let tissue = tissue_for(tr, true);
             let mut imgs: Vec<Vec<f32>> = vec![vec![0.0f32; nvox_sim]; ncomp];
             for c in 0..k {
                 imgs[c].copy_from_slice(&tissue[c]);
@@ -299,8 +472,13 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
 
     // ---- ground truth on the acquisition grid ----
     let perfused: Vec<bool> = ph.perfusion.iter().map(|f| *f > 0.0).collect();
+    let (delta_m_gt, delta_m_static) = match gt_moved {
+        Some(moved) => (moved, Some(gt_static)),
+        None => (gt_static, None),
+    };
     let ground_truth = GroundTruth {
-        delta_m: gt_delta_m,
+        delta_m: delta_m_gt,
+        delta_m_static,
         perfusion: r_acq.mean(&ph.perfusion),
         att: r_acq.masked_mean(&ph.att, &perfused),
         t1: r_acq.mean(&ph.t1),
@@ -314,7 +492,8 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
     Ok(SeriesOutput {
         acq_grid, sim_grid, n_volumes: n, mag, phase: phase_out, m0, mode: mode_used,
         labels: ph.labels.clone(), n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(),
-        seeds: (p.seed, m0_seed), acquisition: acq, ground_truth,
+        seeds: (p.seed, m0_seed), acquisition: acq, ground_truth, label_factors, poses, motion_seed,
+        events, dropped,
     })
 }
 
@@ -328,25 +507,32 @@ mod tests {
     use super::*;
     use crate::phantom::load;
     use crate::protocol::{parse, Overlay};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     fn phantom() -> Phantom {
         load(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/phantom-crop"))).unwrap()
     }
 
-    /// A PCASL protocol on the crop: `voxel` mm, slice timing for the resulting slice count.
-    fn protocol(voxel: [f64; 3], nz: usize, rows: &str, overlay: &str) -> Protocol {
+    /// A PCASL sidecar on the crop: `voxel` mm, slice timing for the resulting slice count.
+    fn sidecar(voxel: [f64; 3], nz: usize) -> Value {
         let timing: Vec<f64> = (0..nz).map(|z| 0.04 * z as f64).collect();
-        let s = json!({
+        json!({
             "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
             "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
             "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": voxel,
             "MRAcquisitionType": "2D", "SliceTiming": timing, "PhaseEncodingDirection": "j-",
             "TotalReadoutTime": 0.012
-        });
+        })
+    }
+
+    fn protocol_from(s: &Value, rows: &str, overlay: &str) -> Protocol {
         let ov: Overlay = toml::from_str(overlay).unwrap();
         let ctx = format!("volume_type\n{}\n", rows.split(',').collect::<Vec<_>>().join("\n"));
-        parse(&s, &ctx, Some(&ov), phantom().params.as_ref()).unwrap()
+        parse(s, &ctx, Some(&ov), phantom().params.as_ref()).unwrap()
+    }
+
+    fn protocol(voxel: [f64; 3], nz: usize, rows: &str, overlay: &str) -> Protocol {
+        protocol_from(&sidecar(voxel, nz), rows, overlay)
     }
 
     fn no_phase() -> PhaseModel {
@@ -358,11 +544,8 @@ mod tests {
     }
 
     #[test]
-    fn series_rejects_background_suppression_and_field_mismatch() {
+    fn series_rejects_a_field_mismatch() {
         let ph = phantom();
-        let mut p = protocol([3.0, 3.0, 3.0], 2, "control,label", "");
-        p.background_suppression = true;
-        assert!(simulate(&p, &ph, T2Mode::Auto, &no_phase()).unwrap_err().contains("P3"));
         let mut p = protocol([3.0, 3.0, 3.0], 2, "control,label", "");
         p.field_strength = 1.5;
         assert!(simulate(&p, &ph, T2Mode::Auto, &no_phase()).unwrap_err().contains("MagneticFieldStrength"));
@@ -390,6 +573,8 @@ mod tests {
             worst = worst.max((x - y).abs() / (1e-5 * x.abs().max(y.abs()) + 1e-6 * scale));
         }
         assert!(worst <= 1.0, "class vs voxel on a homogeneous grid: worst residual {worst:.2}x tolerance");
+        assert!(a.label_factors.is_none() && a.motion_seed.is_none() && a.ground_truth.delta_m_static.is_none());
+        assert!(a.poses.iter().all(|q| *q == Pose::IDENTITY));
     }
 
     #[test]
@@ -466,5 +651,200 @@ mod tests {
             }
         }
         assert_eq!(b.seeds, (0, Some(M0_SEED_SALT)));
+    }
+
+    // ------------------------------------------------------------------ P3
+
+    /// base timing: tau 1.8, PLD 1.8 (t = 3.6), TR 4.0.
+    fn suppressed(pulses: &[f64]) -> Value {
+        let mut s = sidecar([1.0, 1.0, 1.0], 6);
+        s["BackgroundSuppression"] = json!(true);
+        s["BackgroundSuppressionNumberPulses"] = json!(pulses.len());
+        s["BackgroundSuppressionPulseTime"] = json!(pulses);
+        s
+    }
+
+    /// Voxels of `label` whose in-plane 3x3 neighbourhood is all that label, on the
+    /// acquisition grid, as (vox, z) pairs.
+    fn interior(out: &SeriesOutput, label: i32) -> Vec<(usize, usize)> {
+        let [nx, ny, nz] = out.acq_grid.dims;
+        let d = &out.ground_truth.dseg;
+        let mut v = Vec::new();
+        for z in 0..nz {
+            for y in 1..ny - 1 {
+                for x in 1..nx - 1 {
+                    let all = (-1i32..=1).all(|dy| (-1i32..=1).all(|dx| {
+                        d[(x as i32 + dx) as usize + nx * ((y as i32 + dy) as usize + ny * z)] == label
+                    }));
+                    if all {
+                        v.push((x + nx * (y + ny * z), z));
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn suppression_scales_the_tissue_by_the_timeline() {
+        // Homogeneous grid (acq == phantom, o = 1), no distortion, no noise: the acquired GM
+        // interior should follow tissue_mz / tissue_se at each slice's readout to a few percent
+        // (the readout's per-line relaxation blurs a little, and the crop's GM is thin).
+        let ph = phantom();
+        let ov = "[acquisition]\noversample = 1\n[background_suppression]\ninversion_efficiency = 1.0\n";
+        let on = protocol_from(&suppressed(&[2.0, 3.2]), "control", ov);
+        let off = protocol([1.0, 1.0, 1.0], 6, "control", "[acquisition]\noversample = 1\n");
+        let a = simulate(&on, &ph, T2Mode::Class, &no_phase()).unwrap();
+        let b = simulate(&off, &ph, T2Mode::Class, &no_phase()).unwrap();
+        assert_eq!(a.label_factors.as_deref(), Some(&[1.0][..]));
+        let s = on.suppression.as_ref().unwrap().for_row(0);
+        let gm = interior(&a, 1);
+        assert!(gm.len() >= 4, "too few interior GM voxels: {}", gm.len());
+        let mut worst = 0.0f64;
+        for (vox, z) in gm {
+            let t_read = 3.6 + on.slice_offsets[z];
+            let want = tissue_mz(1.0, 1.33, 4.0, t_read, &s) / tissue_se(1.0, 1.33, 4.0);
+            let got = a.mag[vox] as f64 / b.mag[vox] as f64;
+            worst = worst.max((got - want).abs() / want.abs());
+        }
+        println!("suppressed / unsuppressed GM ratio: worst relative deviation {worst:.3e}");
+        assert!(worst < 0.05, "{worst}");
+    }
+
+    #[test]
+    fn an_odd_pulse_count_flips_control_minus_label() {
+        let ph = phantom();
+        let mut s = suppressed(&[2.0]);
+        s["AcquisitionVoxelSize"] = json!([3.0, 3.0, 3.0]);
+        s["SliceTiming"] = json!([0.0, 0.04]);
+        let p = protocol_from(&s, "control,label", "[acquisition]\nsignal_scale = 1.0\n[background_suppression]\ninversion_efficiency = 1.0\n");
+        let out = simulate(&p, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        assert_eq!(out.label_factors.as_deref(), Some(&[-1.0, -1.0][..]));
+        let z = complex_from(&out.mag, &out.phase);
+        let nvox = out.acq_grid.dims.iter().product::<usize>();
+        let diff: f64 = (0..nvox).filter(|v| out.ground_truth.dseg[*v] == 1).map(|v| z[v * 2].0 - z[v * 2 + 1].0).sum();
+        assert!(diff < 0.0, "control minus label must be negative in GM under one perfect pulse: {diff}");
+        // the ground truth keeps the unsuppressed, positive delta_m
+        assert!(out.ground_truth.delta_m.iter().skip(1).step_by(2).any(|v| *v > 0.0));
+    }
+
+    #[test]
+    fn ir_at_90_degrees_without_inversion_is_the_spin_echo_run() {
+        let ph = phantom();
+        let se = protocol([3.0, 3.0, 3.0], 2, "control,label", "[acquisition]\nsignal_scale = 1.0\n");
+        let ir = protocol([3.0, 3.0, 3.0], 2, "control,label",
+                          "[acquisition]\nsignal_scale = 1.0\n[signal]\nacq_contrast = \"ir\"\ninversion_flip_angle = 0.0\n");
+        let a = simulate(&se, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        let b = simulate(&ir, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        let scale = max_abs(&a.mag) as f64;
+        let worst = a.mag.iter().zip(&b.mag).fold(0.0f64, |m, (x, y)| m.max((*x as f64 - *y as f64).abs() / scale));
+        assert!(worst < 1e-6, "IR(fa 90, fa_inv 0) must equal spin echo: {worst:e}");
+        // and a 30-degree excitation scales the whole image by sin(30) = 1/2
+        let ir30 = protocol([3.0, 3.0, 3.0], 2, "control,label",
+                            "[acquisition]\nsignal_scale = 1.0\n[signal]\nacq_contrast = \"ir\"\nexcitation_flip_angle = 30.0\ninversion_flip_angle = 0.0\n");
+        let c = simulate(&ir30, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        let worst = a.mag.iter().zip(&c.mag).fold(0.0f64, |m, (x, y)| m.max((0.5 * *x as f64 - *y as f64).abs() / scale));
+        // sin(30) scales tissue by 1/2 but the IR denominator 1 - cos(30) E differs from the
+        // spin echo's, so only the label/deltam blood term is exactly half; check loosely
+        assert!(worst < 0.5, "{worst}");
+    }
+
+    fn write_trajectory(rows: &[[f64; 6]]) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("aslscan-series-{}-{}", std::process::id(), rows.len()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tsv = dir.join("motion.tsv");
+        let mut text = String::from("trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+        for r in rows {
+            text.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\n", r[0], r[1], r[2], r[3], r[4], r[5]));
+        }
+        std::fs::write(&tsv, text).unwrap();
+        let path = tsv.to_string_lossy().replace('\\', "\\\\");
+        (dir, path)
+    }
+
+    #[test]
+    fn a_trajectory_translation_shifts_image_and_moved_ground_truth() {
+        // acq == phantom grid at 1 mm, o = 1, no distortion or noise: +2 mm in x is +2 voxels.
+        let ph = phantom();
+        let (dir, path) = write_trajectory(&[[0.0; 6], [2.0, 0.0, 0.0, 0.0, 0.0, 0.0]]);
+        let p = protocol([1.0, 1.0, 1.0], 6, "label,label",
+                         &format!("[acquisition]\noversample = 1\n[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\n"));
+        let out = simulate(&p, &ph, T2Mode::Class, &no_phase()).unwrap();
+        let [nx, ny, nz] = out.acq_grid.dims;
+        assert_eq!(out.poses[1].trans_mm, [2.0, 0.0, 0.0]);
+        assert_eq!(out.motion_seed, Some(MOTION_SEED_SALT));
+        let (gt, gts) = (&out.ground_truth.delta_m, out.ground_truth.delta_m_static.as_ref().unwrap());
+        // which way is +x in voxels? the grid's x axis may be flipped; find the sign from the GT
+        let at = |x: usize, y: usize, z: usize| x + nx * (y + ny * z);
+        let shift: i64 = if out.sim_grid.voxel_to_world[0][0] > 0.0 { 2 } else { -2 };
+        let peak = max_abs(&out.mag) as f64;
+        let (mut worst_img, mut n_checked) = (0.0f64, 0);
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 3..nx - 3 {
+                    let src = (x as i64 - shift) as usize;
+                    // moved truth is exactly the static truth shifted (trilinear weights 0/1)
+                    assert_eq!(gt[at(x, y, z) * 2 + 1], gts[at(src, y, z) * 2 + 1], "gt at {x},{y},{z}");
+                    assert_eq!(gt[at(x, y, z) * 2], gts[at(x, y, z) * 2], "volume 0 is unmoved");
+                    let d = (out.mag[at(x, y, z) * 2 + 1] as f64 - out.mag[at(src, y, z) * 2] as f64).abs() / peak;
+                    worst_img = worst_img.max(d);
+                    n_checked += 1;
+                }
+            }
+        }
+        println!("acquired magnitude under a +2 voxel shift: worst deviation {worst_img:.3e} of peak over {n_checked} voxels");
+        assert!(worst_img < 1e-5, "{worst_img}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn random_motion_is_reproducible_and_leaves_the_noise_alone() {
+        let ph = phantom();
+        let mk = |motion: &str| {
+            protocol([3.0, 3.0, 3.0], 2, "control,control",
+                     &format!("seed = 3\n[acquisition]\nnoise_variance = 4.0\nsignal_scale = 1.0\n{motion}"))
+        };
+        let still = mk("");
+        let moved = mk("[motion]\nmode = \"random\"\ntrans_mm = [2.0, 2.0, 0.0]\nrot_deg = [0.0, 0.0, 5.0]\nvolumes = [1]\n");
+        let a = simulate(&still, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        let b = simulate(&moved, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        let c = simulate(&moved, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        assert_eq!(b.mag, c.mag, "same seed, same motion, same data");
+        assert_eq!(b.poses, c.poses);
+        assert_eq!(b.poses[0], Pose::IDENTITY);
+        assert_ne!(b.poses[1], Pose::IDENTITY);
+        assert_eq!(b.motion_seed, Some(3 ^ MOTION_SEED_SALT));
+        // volume 0 did not move, and its noise stream is keyed on the volume index, so it is
+        // bit-identical between the still and the moved run; volume 1 differs.
+        let nvox = a.acq_grid.dims.iter().product::<usize>();
+        for vox in 0..nvox {
+            assert_eq!(a.mag[vox * 2], b.mag[vox * 2], "volume 0 changed at {vox}");
+        }
+        assert!((0..nvox).any(|vox| a.mag[vox * 2 + 1] != b.mag[vox * 2 + 1]));
+        assert!(b.ground_truth.delta_m_static.is_some());
+    }
+
+    #[test]
+    fn within_volume_events_attenuate_every_shot_when_certain() {
+        // 6 slices at 1 mm, mb 2 (3 shots), sequential timing; dropout_rate 1 with severity 0.5
+        // and no jumps halves every shot's signal: the whole image halves.
+        let ph = phantom();
+        let mut s = sidecar([1.0, 1.0, 1.0], 6);
+        s["MultibandAccelerationFactor"] = json!(2);
+        s["SliceTiming"] = json!([0.0, 0.04, 0.08, 0.0, 0.04, 0.08]);
+        let base = protocol_from(&s, "control,label", "[acquisition]\noversample = 1\n");
+        let ev = protocol_from(&s, "control,label",
+                               "[acquisition]\noversample = 1\n[motion.within_volume]\ndropout_rate = 1.0\nseverity = 0.5\n");
+        let a = simulate(&base, &ph, T2Mode::Class, &no_phase()).unwrap();
+        let b = simulate(&ev, &ph, T2Mode::Class, &no_phase()).unwrap();
+        assert_eq!(b.events.len(), 6);
+        assert_eq!(b.dropped.len(), 6);
+        assert!(b.dropped.iter().all(|d| (d.attenuation - 0.5).abs() < 1e-6 && d.slices.len() == 2));
+        assert!(b.poses.iter().all(|q| *q == Pose::IDENTITY));
+        let scale = max_abs(&a.mag) as f64;
+        let worst = a.mag.iter().zip(&b.mag).fold(0.0f64, |m, (x, y)| m.max((0.5 * *x as f64 - *y as f64).abs() / scale));
+        assert!(worst < 1e-6, "{worst}");
+        // the moved ground truth excludes the events: identical to the static one
+        assert_eq!(b.ground_truth.delta_m, *b.ground_truth.delta_m_static.as_ref().unwrap());
     }
 }
