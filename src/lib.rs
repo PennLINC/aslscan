@@ -26,6 +26,8 @@ pub mod kinetic;
 pub mod mrsignal;
 /// The background-suppression timeline: tissue `Mz` at readout and the blood label factor.
 pub mod longitudinal;
+/// SplitMix64 for the within-volume motion events, pure std.
+pub mod rng;
 /// Box-overlap averaging between the phantom, acquisition and simulation grids.
 pub mod resample;
 /// The volume list: `Row` and `RowKind`, pure std.

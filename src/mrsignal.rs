@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn ir_without_inversion_keeps_its_denominator() {
         let (m0, t1, tr) = (74.622, 1.33, 1.33);
-        let e = (-tr / t1 as f64).exp();
+        let e = (-tr / t1).exp();
         let p = IrParams { inversion_time: 0.5, excitation_flip_deg: 60.0, inversion_flip_deg: 0.0 };
         let got = tissue_ir(m0, t1, tr, &p);
         let fa = 60f64.to_radians();
@@ -166,9 +166,11 @@ mod tests {
         assert_eq!(tissue_ir(74.622, 0.0, 4.0, &p0), 0.0);
     }
 
-    /// Parse a fixture file: `case`, `scalars ...`, then named float rows. Returns
-    /// (scalars, t1, m0, want) per case.
-    fn read_fixture(name: &str) -> Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> {
+    /// One fixture case: (scalars, t1, m0, want).
+    type Case = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>);
+
+    /// Parse a fixture file: `case`, `scalars ...`, then named float rows.
+    fn read_fixture(name: &str) -> Vec<Case> {
         let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|_| panic!("{path} is committed; regenerate with tools/gen_mrsignal_fixtures.py"));

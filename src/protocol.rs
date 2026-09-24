@@ -13,11 +13,13 @@
 use std::path::Path;
 
 use mrsim_acq::kspace::{Acquisition, KspaceWindow, PartialFourierMode};
+use mrsim_acq::motion::{load_motion_tsv, MotionMode};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::kinetic::{Kinetic, LabelType};
-use crate::mrsignal::{parse_contrast, Contrast};
+use crate::longitudinal::Suppression;
+use crate::mrsignal::{parse_contrast, Contrast, IrParams};
 pub use crate::rows::{Row, RowKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +115,53 @@ pub struct Overlay {
     pub signal: Option<SignalOverlay>,
     pub acquisition: Option<AcqOverlay>,
     pub m0: Option<M0Overlay>,
+    pub background_suppression: Option<SuppressionOverlay>,
+    pub motion: Option<MotionOverlay>,
+}
+
+/// `[background_suppression]` (P3 addendum, part A). Read only when the sidecar's
+/// `BackgroundSuppression` is true.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuppressionOverlay {
+    /// The fraction of longitudinal magnetization each pulse inverts; default 0.95.
+    pub inversion_efficiency: Option<f64>,
+    /// A saturation pulse on the imaging region at labeling start; default false.
+    pub presaturation: Option<bool>,
+    /// Multi-PLD series: one pulse-time array per distinct PostLabelingDelay, ascending.
+    pub pulse_times_per_pld: Option<Vec<Vec<f64>>>,
+}
+
+/// `[motion]` (P3 addendum, part C).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MotionOverlay {
+    /// `off` (default) | `trajectory` | `random` | `linear`.
+    pub mode: Option<String>,
+    /// TSV path (confounds format: `trans_x/y/z` mm, `rot_x/y/z` **radians**), one row per
+    /// volume; relative to the overlay file when read through [`load`].
+    pub trajectory: Option<String>,
+    /// Per-axis amplitudes (mm) for `random` and `linear`.
+    pub trans_mm: Option<[f64; 3]>,
+    /// Per-axis amplitudes (degrees) for `random` and `linear`.
+    pub rot_deg: Option<[f64; 3]>,
+    /// The volumes `random`/`linear` affect; default all.
+    pub volumes: Option<Vec<usize>>,
+    pub within_volume: Option<WithinVolumeOverlay>,
+}
+
+/// `[motion.within_volume]`: multiband shot events (needs `MultibandAccelerationFactor > 1`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WithinVolumeOverlay {
+    /// Probability that a shot has an event, in `[0, 1]`.
+    pub dropout_rate: f64,
+    /// Signal attenuation of the event shot's slices, in `[0, 1]` (`DropoutLaw::Uniform`).
+    pub severity: f64,
+    /// Per-axis jump amplitudes (mm, degrees) drawn in `[-amp, amp]`, persisting for the rest of
+    /// the volume; default zero (pure dropout).
+    pub jump_mm: Option<[f64; 3]>,
+    pub jump_deg: Option<[f64; 3]>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -129,6 +178,13 @@ pub struct SignalOverlay {
     pub acq_contrast: Option<String>,
     /// s
     pub t2_blood: Option<f64>,
+    /// s; inversion recovery only (overlay > sidecar `InversionTime` > 1.0).
+    pub inversion_time: Option<f64>,
+    /// degrees; inversion recovery only (overlay > sidecar `FlipAngle` > 90). Undefined for
+    /// spin echo, whose equation assumes 90.
+    pub excitation_flip_angle: Option<f64>,
+    /// degrees; inversion recovery only (default 180).
+    pub inversion_flip_angle: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -164,6 +220,52 @@ pub struct M0Overlay {
     pub repetition_time: Option<f64>,
 }
 
+/// The resolved background suppression: the pulse set per row (empty for m0scan rows), the
+/// efficiency and the presaturation flag with their sources.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuppressionSpec {
+    pub epsilon: (f64, Source),
+    pub presaturation: (bool, Source),
+    /// Seconds from labeling start, per row in series order.
+    pub per_row: Vec<Vec<f64>>,
+    /// A multi-PLD series without `pulse_times_per_pld`: BIDS defines only the first PLD's
+    /// times, and they were applied to every row.
+    pub first_pld_applied_to_all: bool,
+}
+
+impl SuppressionSpec {
+    pub fn for_row(&self, i: usize) -> Suppression {
+        Suppression::new(self.per_row[i].clone(), self.epsilon.0, self.presaturation.0)
+    }
+}
+
+/// The resolved inversion-recovery parameters with their sources.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrSpec {
+    pub params: IrParams,
+    pub inversion_time: Source,
+    pub excitation_flip: Source,
+    pub inversion_flip: Source,
+}
+
+/// Within-volume (multiband shot) motion events.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithinVolume {
+    pub dropout_rate: f64,
+    pub severity: f64,
+    pub jump_mm: [f64; 3],
+    pub jump_deg: [f64; 3],
+}
+
+/// The resolved motion request.
+#[derive(Debug, Clone)]
+pub struct MotionSpec {
+    pub mode: MotionMode,
+    /// The overlay's mode name, for the sidecar.
+    pub mode_name: String,
+    pub within: Option<WithinVolume>,
+}
+
 /// The resolved protocol. Seconds unless the field name says `_ms`.
 #[derive(Debug, Clone)]
 pub struct Protocol {
@@ -171,6 +273,15 @@ pub struct Protocol {
     pub rows: Vec<Row>,
     pub m0_type: M0Type,
     pub background_suppression: bool,
+    /// `Some` when `background_suppression` is true (possibly with zero pulses).
+    pub suppression: Option<SuppressionSpec>,
+    /// `Some` when `contrast` is inversion recovery.
+    pub ir: Option<IrSpec>,
+    /// `Some` when the overlay asks for motion (a mode other than `off`, or shot events).
+    pub motion: Option<MotionSpec>,
+    /// With `mb > 1`: whether the slice timing is the interleaved (even groups then odd) shot
+    /// order of `mrsim_acq::motion::slice_schedule`, as opposed to sequential.
+    pub mb_interleaved: bool,
     /// Per acquired slice in data z order (after `SliceEncodingDirection`), minus the minimum (s).
     pub slice_offsets: Vec<f64>,
     pub field_strength: f64,
@@ -384,6 +495,125 @@ fn overlay_acq(o: Option<&AcqOverlay>) -> Result<OverlayAcq, String> {
     Ok(a)
 }
 
+/// With `mb > 1`, check that the per-slice offsets (data z order) are a schedule
+/// `mrsim_acq::motion::slice_schedule` can represent: the slices sharing each excitation are
+/// `{g, g + n_groups, ...}`, and the groups fire sequentially or interleaved (even groups then
+/// odd). Returns the `interleaved` flag. P1's "each time occurs `mb` times" check is necessary
+/// but not sufficient: `[0, 0, 1, 1]` with `mb = 2` passes it and would be grouped `{0, 2}`,
+/// `{1, 3}` by the motion module.
+fn multiband_schedule(offsets: &[f64], mb: usize) -> Result<bool, String> {
+    let nz = offsets.len();
+    if !nz.is_multiple_of(mb) {
+        return Err(format!(
+            "asl.json: SliceTiming has {nz} slices, not a multiple of MultibandAccelerationFactor {mb}"));
+    }
+    let n_groups = nz / mb;
+    let mut distinct: Vec<u64> = offsets.iter().map(|t| t.to_bits()).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let mut order = Vec::with_capacity(n_groups);
+    for b in &distinct {
+        let members: Vec<usize> = (0..nz).filter(|&z| offsets[z].to_bits() == *b).collect();
+        let g = members[0];
+        let want: Vec<usize> = (0..mb).map(|j| g + j * n_groups).collect();
+        if g >= n_groups || members != want {
+            return Err(format!(
+                "asl.json: SliceTiming excites slices {members:?} together, but with {nz} slices and \
+                 MultibandAccelerationFactor {mb} a shot excites slices {{g, g + {n_groups}, ...}}; \
+                 that is the only slice grouping the motion module's schedule represents"));
+        }
+        order.push(g);
+    }
+    let sequential: Vec<usize> = (0..n_groups).collect();
+    let interleaved: Vec<usize> = (0..n_groups).step_by(2).chain((1..n_groups).step_by(2)).collect();
+    if order == sequential {
+        Ok(false)
+    } else if order == interleaved {
+        Ok(true)
+    } else {
+        Err(format!(
+            "asl.json: SliceTiming fires the shot groups in order {order:?}; sequential {sequential:?} \
+             or interleaved {interleaved:?} are the schedules the motion module represents"))
+    }
+}
+
+fn vec3_amplitude(v: Option<[f64; 3]>, what: &str) -> Result<[f64; 3], String> {
+    let v = v.unwrap_or([0.0; 3]);
+    for x in v {
+        require_finite_nonneg(x, what)?;
+    }
+    Ok(v)
+}
+
+fn overlay_motion(m: Option<&MotionOverlay>, n: usize, mb: usize) -> Result<Option<MotionSpec>, String> {
+    let Some(m) = m else { return Ok(None) };
+    let mode_name = m.mode.clone().unwrap_or_else(|| "off".to_string()).to_ascii_lowercase();
+    let volumes: Vec<usize> = match &m.volumes {
+        Some(v) => {
+            if let Some(bad) = v.iter().find(|&&i| i >= n) {
+                return Err(format!("overlay: motion.volumes index {bad} is outside the {n} volumes"));
+            }
+            v.clone()
+        }
+        None => (0..n).collect(),
+    };
+    let trans_mm = vec3_amplitude(m.trans_mm, "overlay motion.trans_mm")?;
+    let rot_deg = vec3_amplitude(m.rot_deg, "overlay motion.rot_deg")?;
+    if mode_name != "trajectory" && m.trajectory.is_some() {
+        return Err(format!("overlay: motion.trajectory is only read with mode = \"trajectory\" (mode is {mode_name:?})"));
+    }
+    let mode = match mode_name.as_str() {
+        "off" => MotionMode::Off,
+        "random" | "linear" => {
+            if trans_mm == [0.0; 3] && rot_deg == [0.0; 3] {
+                return Err(format!(
+                    "overlay: motion.mode {mode_name:?} with zero trans_mm and rot_deg moves nothing; set an \
+                     amplitude or mode = \"off\""));
+            }
+            if mode_name == "random" {
+                MotionMode::Random { trans_mm, rot_deg, volumes }
+            } else {
+                MotionMode::Linear { trans_mm, rot_deg, volumes }
+            }
+        }
+        "trajectory" => {
+            let path = m.trajectory.as_ref()
+                .ok_or("overlay: motion.mode \"trajectory\" needs motion.trajectory, a TSV path")?;
+            let poses = load_motion_tsv(Path::new(path)).map_err(|e| format!("overlay motion.trajectory {path}: {e}"))?;
+            if poses.len() != n {
+                return Err(format!(
+                    "overlay motion.trajectory {path} has {} rows but the series has {n} volumes", poses.len()));
+            }
+            MotionMode::Trajectory { poses }
+        }
+        other => return Err(format!("overlay: motion.mode {other:?}: expected off | trajectory | random | linear")),
+    };
+    let within = match &m.within_volume {
+        None => None,
+        Some(w) => {
+            if mb <= 1 {
+                return Err("overlay: motion.within_volume describes multiband shot events and needs \
+                            MultibandAccelerationFactor > 1".to_string());
+            }
+            for (name, v) in [("dropout_rate", w.dropout_rate), ("severity", w.severity)] {
+                if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+                    return Err(format!("overlay: motion.within_volume.{name} must be in [0, 1], got {v}"));
+                }
+            }
+            Some(WithinVolume {
+                dropout_rate: w.dropout_rate,
+                severity: w.severity,
+                jump_mm: vec3_amplitude(w.jump_mm, "overlay motion.within_volume.jump_mm")?,
+                jump_deg: vec3_amplitude(w.jump_deg, "overlay motion.within_volume.jump_deg")?,
+            })
+        }
+    };
+    if matches!(mode, MotionMode::Off) && within.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(MotionSpec { mode, mode_name, within }))
+}
+
 // ---------------------------------------------------------------- the parse
 
 /// Parse from already-read text. [`load`] is the file-reading wrapper.
@@ -513,6 +743,16 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
     if reversed {
         slice_offsets.reverse();
     }
+    // Every slice's readout must fall inside the repetition, or the tissue has a negative
+    // recovery interval (P3 addendum, timing constraints; true for P1 protocols as well).
+    let max_offset = slice_offsets.iter().cloned().fold(0.0, f64::max);
+    for (i, r) in rows.iter().enumerate() {
+        if r.kind != RowKind::M0scan && r.t + max_offset > r.tr {
+            return Err(format!(
+                "asl.json: row {i} reads its last slice at {} s (signal time {} s + slice offset {} s), after \
+                 its RepetitionTimePreparation {} s", r.t + max_offset, r.t, max_offset, r.tr));
+        }
+    }
     let mb = match opt_num(sidecar, "MultibandAccelerationFactor")? {
         None => 1,
         Some(v) if v >= 1.0 && v.fract() == 0.0 => v as usize,
@@ -533,6 +773,7 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
             i += j;
         }
     }
+    let mb_interleaved = if mb > 1 { multiband_schedule(&slice_offsets, mb)? } else { false };
 
     let ped = string(sidecar, "PhaseEncodingDirection")?;
     let reverse_phase = match ped.as_str() {
@@ -627,6 +868,168 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
     };
     let contrast = parse_contrast(so.and_then(|s| s.acq_contrast.as_deref()).unwrap_or("se"))?;
 
+    // Inversion recovery (P3 addendum, part B): InversionTime and FlipAngle are standard BIDS
+    // fields, so they are inputs with the usual precedence; the inversion angle is overlay-only.
+    let side_ti = opt_num(sidecar, "InversionTime")?;
+    let side_fa = opt_num(sidecar, "FlipAngle")?;
+    let ir = match contrast {
+        Contrast::SpinEcho => {
+            if let Some(fa) = side_fa {
+                if (fa - 90.0).abs() > 1e-9 {
+                    return Err(format!(
+                        "asl.json: FlipAngle {fa} with acq_contrast \"se\": the spin-echo signal equation assumes \
+                         a 90-degree excitation; an inversion-recovery readout takes acq_contrast = \"ir\""));
+                }
+            }
+            if so.and_then(|s| s.excitation_flip_angle).is_some() {
+                return Err("overlay: signal.excitation_flip_angle is undefined for acq_contrast \"se\" (the \
+                            spin-echo equation assumes 90 degrees)".to_string());
+            }
+            if side_ti.is_some() || so.and_then(|s| s.inversion_time).is_some() {
+                return Err("InversionTime with acq_contrast \"se\": no inversion is simulated, and echoing the \
+                            field would describe a preparation that did not happen; use acq_contrast = \"ir\""
+                    .to_string());
+            }
+            if so.and_then(|s| s.inversion_flip_angle).is_some() {
+                return Err("overlay: signal.inversion_flip_angle is undefined for acq_contrast \"se\"".to_string());
+            }
+            None
+        }
+        Contrast::InversionRecovery => {
+            if background_suppression {
+                return Err("acq_contrast \"ir\" with BackgroundSuppression true: the IR equation is a steady state \
+                            and the suppression model is a timeline; P3 does not compose them".to_string());
+            }
+            let (ti, ti_src) = match (so.and_then(|s| s.inversion_time), side_ti) {
+                (Some(v), _) => (v, Source::Overlay),
+                (None, Some(v)) => (v, Source::Sidecar),
+                (None, None) => (1.0, Source::Default),
+            };
+            let (fa, fa_src) = match (so.and_then(|s| s.excitation_flip_angle), side_fa) {
+                (Some(v), _) => (v, Source::Overlay),
+                (None, Some(v)) => (v, Source::Sidecar),
+                (None, None) => (90.0, Source::Default),
+            };
+            let (fi, fi_src) = match so.and_then(|s| s.inversion_flip_angle) {
+                Some(v) => (v, Source::Overlay),
+                None => (180.0, Source::Default),
+            };
+            require_finite_nonneg(ti, "inversion time")?;
+            for (name, v) in [("excitation flip angle", fa), ("inversion flip angle", fi)] {
+                if !(v.is_finite() && (-180.0..=180.0).contains(&v)) {
+                    return Err(format!("{name} must be in [-180, 180] degrees, got {v}"));
+                }
+            }
+            for (i, r) in rows.iter().enumerate() {
+                if r.kind != RowKind::M0scan && r.tr < echo_time_s + ti {
+                    return Err(format!(
+                        "asl.json: row {i}: RepetitionTimePreparation {} s is shorter than EchoTime {} s + inversion \
+                         time {ti} s (simasl's IR constraint)", r.tr, echo_time_s));
+                }
+            }
+            Some(IrSpec {
+                params: IrParams { inversion_time: ti, excitation_flip_deg: fa, inversion_flip_deg: fi },
+                inversion_time: ti_src, excitation_flip: fa_src, inversion_flip: fi_src,
+            })
+        }
+    };
+
+    // Background suppression (P3 addendum, part A).
+    let bo = overlay.and_then(|o| o.background_suppression.as_ref());
+    let suppression = if background_suppression {
+        let n_pulses = match field(sidecar, "BackgroundSuppressionNumberPulses")? {
+            Value::Number(x) if x.as_f64().is_some_and(|v| v >= 0.0 && v.fract() == 0.0) => x.as_f64().unwrap() as usize,
+            other => {
+                return Err(format!(
+                    "asl.json: BackgroundSuppressionNumberPulses must be a non-negative integer, got {other}"))
+            }
+        };
+        let times: Vec<f64> = match field(sidecar, "BackgroundSuppressionPulseTime")? {
+            Value::Array(a) => a
+                .iter()
+                .map(|x| x.as_f64().ok_or_else(|| "asl.json: BackgroundSuppressionPulseTime holds a non-number".to_string()))
+                .collect::<Result<_, _>>()?,
+            _ => {
+                return Err("asl.json: BackgroundSuppressionPulseTime must be an array of seconds from labeling \
+                            start".to_string())
+            }
+        };
+        if times.len() != n_pulses {
+            return Err(format!(
+                "asl.json: BackgroundSuppressionNumberPulses is {n_pulses} but BackgroundSuppressionPulseTime has \
+                 {} entries", times.len()));
+        }
+        for t in &times {
+            require_finite_nonneg(*t, "asl.json: BackgroundSuppressionPulseTime entry")?;
+        }
+        let epsilon = match bo.and_then(|b| b.inversion_efficiency) {
+            Some(v) => {
+                if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+                    return Err(format!("overlay: background_suppression.inversion_efficiency must be in [0, 1], got {v}"));
+                }
+                (v, Source::Overlay)
+            }
+            None => (0.95, Source::Default),
+        };
+        let presaturation = match bo.and_then(|b| b.presaturation) {
+            Some(v) => (v, Source::Overlay),
+            None => (false, Source::Default),
+        };
+        // Distinct PLDs of the labeled rows, ascending: BIDS defines the pulse times for the
+        // first PLD only, and the overlay can supply one array per PLD.
+        let mut distinct: Vec<u64> = (0..n).filter(|&i| kinds[i] != RowKind::M0scan).map(|i| pld[i].to_bits()).collect();
+        distinct.sort_by(|a, b| f64::from_bits(*a).partial_cmp(&f64::from_bits(*b)).unwrap());
+        distinct.dedup();
+        let (per_row, first_pld_applied_to_all): (Vec<Vec<f64>>, bool) = match bo.and_then(|b| b.pulse_times_per_pld.as_ref()) {
+            Some(sets) => {
+                if sets.len() != distinct.len() {
+                    return Err(format!(
+                        "overlay: background_suppression.pulse_times_per_pld has {} arrays but the series has {} \
+                         distinct PostLabelingDelay values", sets.len(), distinct.len()));
+                }
+                for s in sets {
+                    for t in s {
+                        require_finite_nonneg(*t, "overlay background_suppression.pulse_times_per_pld entry")?;
+                    }
+                }
+                let per_row = (0..n)
+                    .map(|i| {
+                        if kinds[i] == RowKind::M0scan {
+                            Vec::new()
+                        } else {
+                            sets[distinct.iter().position(|b| *b == pld[i].to_bits()).unwrap()].clone()
+                        }
+                    })
+                    .collect();
+                (per_row, false)
+            }
+            None => (
+                (0..n).map(|i| if kinds[i] == RowKind::M0scan { Vec::new() } else { times.clone() }).collect(),
+                distinct.len() > 1,
+            ),
+        };
+        for (i, r) in rows.iter().enumerate() {
+            for &p in &per_row[i] {
+                if p >= r.t {
+                    return Err(format!(
+                        "row {i}: background-suppression pulse at {p} s is at or after the first slice's readout at \
+                         {} s; P3 models pulses before the first excitation only (a later pulse would act on the \
+                         next repetition of the earlier slices)", r.t));
+                }
+                if p < r.tau {
+                    return Err(format!(
+                        "row {i}: background-suppression pulse at {p} s falls before the bolus end at {} s; a pulse \
+                         during labeling inverts part of the bolus, which arrives with P4", r.tau));
+                }
+            }
+        }
+        Some(SuppressionSpec { epsilon, presaturation, per_row, first_pld_applied_to_all })
+    } else {
+        None
+    };
+
+    let motion = overlay_motion(overlay.and_then(|o| o.motion.as_ref()), n, mb)?;
+
     let m0_repetition_time_s = overlay.and_then(|o| o.m0.as_ref()).and_then(|m| m.repetition_time);
     if let Some(v) = m0_repetition_time_s {
         require_finite_positive(v, "overlay m0.repetition_time")?;
@@ -639,14 +1042,15 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
     let seed = overlay.and_then(|o| o.seed).unwrap_or(0);
 
     Ok(Protocol {
-        label_type, rows, m0_type, background_suppression, slice_offsets, field_strength,
-        voxel_size_mm, reverse_phase, phase_encoding_direction: ped, echo_time_s,
-        total_readout_time_s, accel, mb, alpha, lambda, t1b, t2_blood_s, contrast,
+        label_type, rows, m0_type, background_suppression, suppression, ir, motion, mb_interleaved,
+        slice_offsets, field_strength, voxel_size_mm, reverse_phase, phase_encoding_direction: ped,
+        echo_time_s, total_readout_time_s, accel, mb, alpha, lambda, t1b, t2_blood_s, contrast,
         m0_repetition_time_s, seed, acq, input_sidecar: sidecar.clone(),
     })
 }
 
-/// Read the files and [`parse`].
+/// Read the files and [`parse`]. A relative `motion.trajectory` path is taken relative to the
+/// overlay file's directory.
 pub fn load(asl_json: &Path, aslcontext_tsv: &Path, overlay: Option<&Path>, phantom: Option<&PhantomParams>)
     -> Result<Protocol, String>
 {
@@ -655,13 +1059,23 @@ pub fn load(asl_json: &Path, aslcontext_tsv: &Path, overlay: Option<&Path>, phan
     )
     .map_err(|e| format!("{}: {e}", asl_json.display()))?;
     let ctx = std::fs::read_to_string(aslcontext_tsv).map_err(|e| format!("{}: {e}", aslcontext_tsv.display()))?;
-    let ov: Option<Overlay> = match overlay {
+    let mut ov: Option<Overlay> = match overlay {
         None => None,
         Some(p) => Some(
             toml::from_str(&std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?)
                 .map_err(|e| format!("{}: {e}", p.display()))?,
         ),
     };
+    if let (Some(op), Some(o)) = (overlay, ov.as_mut()) {
+        if let Some(t) = o.motion.as_mut().and_then(|m| m.trajectory.as_mut()) {
+            let p = Path::new(t.as_str());
+            if p.is_relative() {
+                if let Some(dir) = op.parent() {
+                    *t = dir.join(p).to_string_lossy().to_string();
+                }
+            }
+        }
+    }
     parse(&sidecar, &ctx, ov.as_ref(), phantom)
 }
 
@@ -997,12 +1411,30 @@ mod tests {
         assert!(p.reverse_phase && p.background_suppression);
         assert_eq!(p.slice_offsets.len(), 20);
         assert!((p.rows[0].t - 3.8).abs() < 1e-12);
+        let sup = p.suppression.as_ref().unwrap();
+        assert_eq!(sup.per_row[0], vec![2.05, 3.276]);
+        assert_eq!(sup.epsilon, (0.95, Source::Default));
+        assert!(!sup.first_pld_applied_to_all);
+        assert!((crate::longitudinal::label_factor(&sup.for_row(0)) - 0.81).abs() < 1e-12);
         // asl004: 2D PCASL with a 96-entry PLD array, LabelingEfficiency in the sidecar, and a
-        // trailing blank line in aslcontext.tsv.
+        // trailing blank line in aslcontext.tsv; six PLDs, so BIDS' first-PLD pulse times apply
+        // to every row and the sidecar says so.
         let (s, c) = fixture("asl004");
         let p = parse(&s, &c, Some(&m0_overlay()), None).unwrap();
         assert_eq!(p.rows.len(), 96);
         assert_eq!(p.alpha, (0.88, Source::Sidecar));
+        let sup = p.suppression.as_ref().unwrap();
+        assert!(sup.first_pld_applied_to_all);
+        assert_eq!(sup.per_row[95], vec![1.428, 1.604]);
+        // ...unless the overlay gives one array per PLD (six here; five is refused)
+        let ov = overlay("[background_suppression]\npulse_times_per_pld = [[1.42], [1.43], [1.44], [1.45], [1.46], [1.47]]\n[m0]\nrepetition_time = 8.0\n");
+        let p = parse(&s, &c, Some(&ov), None).unwrap();
+        assert!(!p.suppression.as_ref().unwrap().first_pld_applied_to_all);
+        assert_eq!(p.suppression.as_ref().unwrap().per_row[0], vec![1.42]);
+        assert_eq!(p.suppression.as_ref().unwrap().per_row[95], vec![1.47]);
+        let ov = overlay("[background_suppression]\npulse_times_per_pld = [[1.42], [1.43], [1.44], [1.45], [1.46]]\n[m0]\nrepetition_time = 8.0\n");
+        let e = parse(&s, &c, Some(&ov), None).unwrap_err();
+        assert!(e.contains("5 arrays") && e.contains("6 distinct"), "{e}");
         assert!((p.rows[0].t - (0.25 + 1.4)).abs() < 1e-12 && (p.rows[95].t - (1.5 + 1.4)).abs() < 1e-12);
         // Its TE 14 ms / TRT 60 ms readout starts before the excitation under this line-timing model.
         let e = p.acquisition(58, 58).unwrap_err();
@@ -1019,6 +1451,12 @@ mod tests {
         s["MRAcquisitionType"] = json!("2D");
         s["SliceTiming"] = json!([0.0, 0.04, 0.08]);
         s["TotalReadoutTime"] = json!(0.02);
+        // its 3.5 s TR cannot hold the shifted 4.0 s PLD below; the readout-in-TR check would fire
+        s["RepetitionTimePreparation"] = json!(5.0);
+        // its pulses (0.15, 0.2 s) precede the 0.7 s bolus cutoff, which the pulse check refuses
+        s["BackgroundSuppression"] = json!(false);
+        // its 180-degree GRASE refocusing flip angle is not a spin-echo excitation
+        s["FlipAngle"] = json!(90);
         let e = parse(&s, &c, Some(&m0_overlay()), None).unwrap_err();
         assert!(e.contains("cutoff") && e.contains("row 0"), "{e}");
         // ...and with every PLD shifted past the cutoff it parses, tau being the first cutoff time.
@@ -1029,5 +1467,195 @@ mod tests {
         assert_eq!(p.rows.len(), 20);
         assert!((p.rows[0].t - 1.3).abs() < 1e-12 && (p.rows[0].tau - 0.7).abs() < 1e-12);
         assert!((p.rows[19].t - 4.0).abs() < 1e-12);
+    }
+
+    /// base(): tau 1.8, PLD 1.8 (t = 3.6), TR 4.0, offsets up to 0.10.
+    fn with_suppression(pulses: &[f64]) -> Value {
+        let mut s = base();
+        s["BackgroundSuppression"] = json!(true);
+        s["BackgroundSuppressionNumberPulses"] = json!(pulses.len());
+        s["BackgroundSuppressionPulseTime"] = json!(pulses);
+        s
+    }
+
+    #[test]
+    fn background_suppression_inputs_and_checks() {
+        let p = parse(&with_suppression(&[2.0, 3.2]), CTX, Some(&m0_overlay()), None).unwrap();
+        let sup = p.suppression.as_ref().unwrap();
+        assert_eq!(sup.per_row, vec![vec![2.0, 3.2]; 4]);
+        assert_eq!(sup.epsilon, (0.95, Source::Default));
+        assert_eq!(sup.presaturation, (false, Source::Default));
+        assert!(!sup.first_pld_applied_to_all);
+        assert!(sup.for_row(0).has_events());
+        // zero pulses is allowed (and is the P1 steady state)
+        let p = parse(&with_suppression(&[]), CTX, Some(&m0_overlay()), None).unwrap();
+        assert!(!p.suppression.as_ref().unwrap().for_row(0).has_events());
+        // m0scan rows get no pulses
+        let mut s = with_suppression(&[2.0, 3.2]);
+        s["M0Type"] = json!("Included");
+        s["PostLabelingDelay"] = json!([0.0, 1.8, 1.8]);
+        s["LabelingDuration"] = json!([0.0, 1.8, 1.8]);
+        s["RepetitionTimePreparation"] = json!([8.0, 4.0, 4.0]);
+        let p = parse(&s, "volume_type\nm0scan\ncontrol\nlabel\n", None, None).unwrap();
+        assert!(p.suppression.as_ref().unwrap().per_row[0].is_empty());
+        assert_eq!(p.suppression.as_ref().unwrap().per_row[1], vec![2.0, 3.2]);
+        // required fields, lengths, ranges
+        let mut s = with_suppression(&[2.0, 3.2]);
+        s.as_object_mut().unwrap().remove("BackgroundSuppressionNumberPulses");
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("BackgroundSuppressionNumberPulses"));
+        let mut s = with_suppression(&[2.0, 3.2]);
+        s["BackgroundSuppressionNumberPulses"] = json!(3);
+        let e = parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err();
+        assert!(e.contains("is 3") && e.contains("2 entries"), "{e}");
+        let mut s = with_suppression(&[2.0, 3.2]);
+        s["BackgroundSuppressionPulseTime"] = json!(2.0);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("array"));
+        // a pulse at or after the first slice readout (3.6), and one before the bolus end (1.8)
+        let e = parse(&with_suppression(&[2.0, 3.6]), CTX, Some(&m0_overlay()), None).unwrap_err();
+        assert!(e.contains("3.6 s") && e.contains("first"), "{e}");
+        let e = parse(&with_suppression(&[1.5, 3.2]), CTX, Some(&m0_overlay()), None).unwrap_err();
+        assert!(e.contains("1.5 s") && e.contains("bolus") && e.contains("P4"), "{e}");
+        // overlay values and ranges
+        let ov = overlay("[background_suppression]\ninversion_efficiency = 1.0\npresaturation = true\n[m0]\nrepetition_time = 8.0\n");
+        let p = parse(&with_suppression(&[2.0, 3.2]), CTX, Some(&ov), None).unwrap();
+        assert_eq!(p.suppression.as_ref().unwrap().epsilon, (1.0, Source::Overlay));
+        assert_eq!(p.suppression.as_ref().unwrap().presaturation, (true, Source::Overlay));
+        let ov = overlay("[background_suppression]\ninversion_efficiency = 1.5\n[m0]\nrepetition_time = 8.0\n");
+        assert!(parse(&with_suppression(&[2.0, 3.2]), CTX, Some(&ov), None).unwrap_err().contains("inversion_efficiency"));
+        // the overlay block is ignored when the sidecar says no suppression
+        let ov = overlay("[background_suppression]\ninversion_efficiency = 0.5\n[m0]\nrepetition_time = 8.0\n");
+        assert!(parse(&base(), CTX, Some(&ov), None).unwrap().suppression.is_none());
+        // multi-PLD without the override: first PLD's times everywhere, flagged
+        let mut s = with_suppression(&[2.0, 3.2]);
+        s["PostLabelingDelay"] = json!([1.8, 1.8, 2.0, 2.0]);
+        let p = parse(&s, CTX, Some(&m0_overlay()), None).unwrap();
+        assert!(p.suppression.as_ref().unwrap().first_pld_applied_to_all);
+        let ov = overlay("[background_suppression]\npulse_times_per_pld = [[2.0, 3.2], [2.0, 3.4]]\n[m0]\nrepetition_time = 8.0\n");
+        let p = parse(&s, CTX, Some(&ov), None).unwrap();
+        assert_eq!(p.suppression.as_ref().unwrap().per_row[3], vec![2.0, 3.4]);
+        assert!(!p.suppression.as_ref().unwrap().first_pld_applied_to_all);
+    }
+
+    #[test]
+    fn every_slice_must_read_inside_the_repetition() {
+        let mut s = base();
+        s["RepetitionTimePreparation"] = json!(3.65); // t 3.6 + last offset 0.10 = 3.7
+        let e = parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err();
+        assert!(e.contains("3.7") && e.contains("3.65"), "{e}");
+        s["RepetitionTimePreparation"] = json!(3.7);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).is_ok());
+    }
+
+    #[test]
+    fn inversion_recovery_inputs_and_rules() {
+        // spin echo refuses a non-90 FlipAngle and any inversion field
+        let mut s = base();
+        s["FlipAngle"] = json!(90);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap().ir.is_none());
+        s["FlipAngle"] = json!(60);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("90-degree"));
+        let mut s = base();
+        s["InversionTime"] = json!(1.0);
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("InversionTime"));
+        let ov = overlay("[signal]\nexcitation_flip_angle = 60\n[m0]\nrepetition_time = 8.0\n");
+        assert!(parse(&base(), CTX, Some(&ov), None).unwrap_err().contains("excitation_flip_angle"));
+        let ov = overlay("[signal]\ninversion_flip_angle = 120\n[m0]\nrepetition_time = 8.0\n");
+        assert!(parse(&base(), CTX, Some(&ov), None).unwrap_err().contains("inversion_flip_angle"));
+        // ir: defaults, then sidecar, then overlay
+        let ir = |extra: &str| overlay(&format!("[signal]\nacq_contrast = \"ir\"\n{extra}[m0]\nrepetition_time = 8.0\n"));
+        let p = parse(&base(), CTX, Some(&ir("")), None).unwrap();
+        assert_eq!(p.contrast, Contrast::InversionRecovery);
+        let spec = p.ir.as_ref().unwrap();
+        assert_eq!(spec.params, IrParams { inversion_time: 1.0, excitation_flip_deg: 90.0, inversion_flip_deg: 180.0 });
+        assert_eq!((spec.inversion_time, spec.excitation_flip, spec.inversion_flip), (Source::Default, Source::Default, Source::Default));
+        let mut s = base();
+        s["FlipAngle"] = json!(60);
+        s["InversionTime"] = json!(0.5);
+        let spec = parse(&s, CTX, Some(&ir("")), None).unwrap().ir.unwrap();
+        assert_eq!(spec.params, IrParams { inversion_time: 0.5, excitation_flip_deg: 60.0, inversion_flip_deg: 180.0 });
+        assert_eq!((spec.inversion_time, spec.excitation_flip), (Source::Sidecar, Source::Sidecar));
+        let spec = parse(&s, CTX, Some(&ir("inversion_time = 0.8\nexcitation_flip_angle = -30\ninversion_flip_angle = 150\n")), None).unwrap().ir.unwrap();
+        assert_eq!(spec.params, IrParams { inversion_time: 0.8, excitation_flip_deg: -30.0, inversion_flip_deg: 150.0 });
+        assert_eq!((spec.inversion_time, spec.excitation_flip, spec.inversion_flip), (Source::Overlay, Source::Overlay, Source::Overlay));
+        // ranges and simasl's TR >= TE + TI
+        assert!(parse(&base(), CTX, Some(&ir("excitation_flip_angle = 200\n")), None).unwrap_err().contains("[-180, 180]"));
+        assert!(parse(&base(), CTX, Some(&ir("inversion_time = -0.1\n")), None).unwrap_err().contains("inversion time"));
+        let e = parse(&base(), CTX, Some(&ir("inversion_time = 3.995\n")), None).unwrap_err();
+        assert!(e.contains("EchoTime") && e.contains("inversion"), "{e}");
+        // ir with suppression is refused naming both
+        let e = parse(&with_suppression(&[2.0, 3.2]), CTX, Some(&ir("")), None).unwrap_err();
+        assert!(e.contains("\"ir\"") && e.contains("BackgroundSuppression"), "{e}");
+    }
+
+    #[test]
+    fn multiband_schedule_must_be_representable() {
+        let mut s = base();
+        s["MultibandAccelerationFactor"] = json!(2);
+        // the counterexample: passes the mb-times check, groups {0, 2} and {1, 3} in the module
+        s["SliceTiming"] = json!([0.0, 0.0, 0.05, 0.05]);
+        let e = parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err();
+        assert!(e.contains("[0, 1]") && e.contains("g + 2"), "{e}");
+        // sequential: group g = z % 4 fires in order 0, 1, 2, 3
+        s["SliceTiming"] = json!([0.0, 0.1, 0.2, 0.3, 0.0, 0.1, 0.2, 0.3]);
+        let p = parse(&s, CTX, Some(&m0_overlay()), None).unwrap();
+        assert!(p.mb == 2 && !p.mb_interleaved);
+        // interleaved: groups 0, 2 fire first, then 1, 3
+        s["SliceTiming"] = json!([0.0, 0.2, 0.1, 0.3, 0.0, 0.2, 0.1, 0.3]);
+        let p = parse(&s, CTX, Some(&m0_overlay()), None).unwrap();
+        assert!(p.mb_interleaved);
+        // any other order
+        s["SliceTiming"] = json!([0.0, 0.3, 0.1, 0.2, 0.0, 0.3, 0.1, 0.2]);
+        let e = parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err();
+        assert!(e.contains("order [0, 2, 3, 1]"), "{e}");
+        // mb 1: no schedule to derive
+        assert!(!parse(&base(), CTX, Some(&m0_overlay()), None).unwrap().mb_interleaved);
+    }
+
+    #[test]
+    fn motion_overlay_resolves_or_is_refused() {
+        let mo = |extra: &str| overlay(&format!("[motion]\n{extra}[m0]\nrepetition_time = 8.0\n"));
+        assert!(parse(&base(), CTX, Some(&mo("")), None).unwrap().motion.is_none());
+        assert!(parse(&base(), CTX, Some(&mo("mode = \"off\"\n")), None).unwrap().motion.is_none());
+        let p = parse(&base(), CTX, Some(&mo("mode = \"random\"\ntrans_mm = [1.0, 0.5, 0.0]\nvolumes = [1, 3]\n")), None).unwrap();
+        let m = p.motion.as_ref().unwrap();
+        assert_eq!(m.mode_name, "random");
+        assert!(matches!(&m.mode, MotionMode::Random { trans_mm: [1.0, 0.5, 0.0], rot_deg: [0.0, 0.0, 0.0], volumes } if *volumes == vec![1, 3]));
+        assert!(m.within.is_none());
+        let p = parse(&base(), CTX, Some(&mo("mode = \"linear\"\nrot_deg = [0.0, 0.0, 2.0]\n")), None).unwrap();
+        assert!(matches!(&p.motion.as_ref().unwrap().mode, MotionMode::Linear { volumes, .. } if volumes.len() == 4));
+        assert!(parse(&base(), CTX, Some(&mo("mode = \"random\"\n")), None).unwrap_err().contains("moves nothing"));
+        assert!(parse(&base(), CTX, Some(&mo("mode = \"random\"\ntrans_mm = [1.0, 0.0, 0.0]\nvolumes = [4]\n")), None).unwrap_err().contains("index 4"));
+        assert!(parse(&base(), CTX, Some(&mo("mode = \"wobble\"\n")), None).unwrap_err().contains("wobble"));
+        assert!(parse(&base(), CTX, Some(&mo("mode = \"trajectory\"\n")), None).unwrap_err().contains("motion.trajectory"));
+        // trajectory: four rows for four volumes, radians in the file
+        let dir = std::env::temp_dir().join(format!("aslscan-motion-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tsv = dir.join("motion.tsv");
+        std::fs::write(&tsv, "trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n0\t0\t0\t0\t0\t0\n2\t0\t0\t0\t0\t0\n0\t0\t0\t0\t0\t0.0174533\n0\t0\t0\t0\t0\t0\n").unwrap();
+        let path = tsv.to_string_lossy().replace('\\', "\\\\");
+        let p = parse(&base(), CTX, Some(&mo(&format!("mode = \"trajectory\"\ntrajectory = \"{path}\"\n"))), None).unwrap();
+        match &p.motion.as_ref().unwrap().mode {
+            MotionMode::Trajectory { poses } => {
+                assert_eq!(poses.len(), 4);
+                assert_eq!(poses[1].trans_mm, [2.0, 0.0, 0.0]);
+                assert!((poses[2].rot_deg[2] - 1.0).abs() < 1e-3);
+            }
+            other => panic!("{other:?}"),
+        }
+        let e = parse(&base(), "volume_type\ncontrol\nlabel\n", Some(&mo(&format!("mode = \"trajectory\"\ntrajectory = \"{path}\"\n"))), None).unwrap_err();
+        assert!(e.contains("4 rows") && e.contains("2 volumes"), "{e}");
+        assert!(parse(&base(), CTX, Some(&mo(&format!("mode = \"random\"\ntrans_mm = [1, 0, 0]\ntrajectory = \"{path}\"\n"))), None).unwrap_err().contains("only read"));
+        // within-volume events need multiband
+        let wv = "[motion.within_volume]\ndropout_rate = 0.2\nseverity = 0.5\n";
+        assert!(parse(&base(), CTX, Some(&mo(wv)), None).unwrap_err().contains("MultibandAccelerationFactor"));
+        let mut s = base();
+        s["MultibandAccelerationFactor"] = json!(2);
+        s["SliceTiming"] = json!([0.0, 0.05, 0.0, 0.05]);
+        let p = parse(&s, CTX, Some(&mo(wv)), None).unwrap();
+        let m = p.motion.as_ref().unwrap();
+        assert!(matches!(m.mode, MotionMode::Off) && m.mode_name == "off");
+        assert_eq!(m.within.as_ref().unwrap(), &WithinVolume { dropout_rate: 0.2, severity: 0.5, jump_mm: [0.0; 3], jump_deg: [0.0; 3] });
+        assert!(parse(&s, CTX, Some(&mo("[motion.within_volume]\ndropout_rate = 1.2\nseverity = 0.5\n")), None).unwrap_err().contains("dropout_rate"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
