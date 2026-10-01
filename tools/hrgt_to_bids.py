@@ -4,6 +4,8 @@
     micromamba run -n simasl python tools/hrgt_to_bids.py --name hrgt_icbm_2009a_nls_3t --out work/phantom-3t
     micromamba run -n simasl python tools/hrgt_to_bids.py --name hrgt_icbm_2009a_nls_3t \\
         --out tests/fixtures/phantom-crop --crop 88:112 104:128 90:96
+    micromamba run -n simasl python tools/hrgt_to_bids.py --source work/compat/gt-synth/hrgt_synth.nii.gz \\
+        --out work/compat/phantom-synth
 
 One NIfTI per quantity, each with a JSON sidecar carrying Units; dseg.json carries the label
 names; phantom.json carries the kinetic constants the oracle was built with. Everything is
@@ -50,12 +52,18 @@ def parse_crop(spec):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--name", required=True, choices=sorted(GROUND_TRUTH_DATA.keys()))
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--name", choices=sorted(GROUND_TRUTH_DATA.keys()))
+    src.add_argument("--source", metavar="NII", help="a packed ground truth file; its JSON is NII with .json for .nii.gz")
     ap.add_argument("--out", required=True)
     ap.add_argument("--crop", nargs=3, metavar="START:STOP", help="x y z voxel ranges, half-open")
     a = ap.parse_args()
 
-    paths = GROUND_TRUTH_DATA[a.name]
+    if a.name:
+        paths, source = GROUND_TRUTH_DATA[a.name], a.name
+    else:
+        stem = a.source[:-7] if a.source.endswith(".nii.gz") else os.path.splitext(a.source)[0]
+        paths, source = {"nii": a.source, "json": stem + ".json"}, os.path.basename(stem)
     meta = json.load(open(paths["json"]))
     img = nib.load(paths["nii"])
     data = np.asanyarray(img.dataobj)
@@ -89,7 +97,7 @@ def main():
             sys.exit(f"{q}: source unit {units[qi]!r}, expected {expect_unit!r}")
         vol = data[..., 0, qi].astype(dtype)
         nib.Nifti1Image(np.ascontiguousarray(vol), affine).to_filename(os.path.join(a.out, stem + ".nii.gz"))
-        side = {"Units": out_unit, "SourceQuantity": q, "Source": a.name}
+        side = {"Units": out_unit, "SourceQuantity": q, "Source": source}
         if q == "seg_label":
             side["LabelMap"] = {str(k): v for k, v in sorted(label_names.items())}
             counts = {k: int((vol == k).sum()) for k in sorted(label_names)}
@@ -102,7 +110,7 @@ def main():
         "LambdaBloodBrain": params.get("lambda_blood_brain"),
         "T1ArterialBlood": params.get("t1_arterial_blood"),
         "MagneticFieldStrength": params.get("magnetic_field_strength"),
-        "Source": a.name,
+        "Source": source,
         "Converter": "hrgt_to_bids.py",
         "Crop": [list(c) for c in crop] if crop else None,
         "VoxelSize": [float(v) for v in img.header.get_zooms()[:3]],
