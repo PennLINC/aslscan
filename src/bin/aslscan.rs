@@ -50,6 +50,10 @@ struct Cli {
     /// Random seed; overrides the overlay's.
     #[arg(long)]
     seed: Option<u64>,
+    /// Pin the acquisition to what simasl (ASLDRO v2.2.0) can express: the same as the
+    /// overlay's `[compat] asldro = true`.
+    #[arg(long)]
+    compat_asldro: bool,
 }
 
 fn main() {
@@ -64,7 +68,7 @@ fn run() -> Result<(), String> {
     let t0 = Instant::now();
 
     let ph = phantom::load(&cli.phantom)?;
-    let mut p = protocol::load(&cli.asl_json, &cli.aslcontext, cli.overlay.as_deref(), ph.params.as_ref())?;
+    let mut p = protocol::load_with(&cli.asl_json, &cli.aslcontext, cli.overlay.as_deref(), ph.params.as_ref(), cli.compat_asldro)?;
     if let Some(s) = cli.seed {
         p.seed = s;
     }
@@ -80,6 +84,10 @@ fn run() -> Result<(), String> {
     );
     println!("phantom: {:?} voxels, labels {:?}, fieldmap {}", ph.grid.dims,
              ph.labels.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(), ph.fieldmap.is_some());
+    if let Some(c) = &p.compat {
+        println!("compat: ASLDRO, grid origin {}, desired SNR {}", p.grid_origin.as_str(),
+                 c.desired_snr.map_or("none".to_string(), |s| s.to_string()));
+    }
     println!(
         "contrast {}{}; background suppression {}; motion {}",
         p.contrast.as_str(),

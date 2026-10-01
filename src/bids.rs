@@ -66,7 +66,8 @@ mod writer {
 
     use super::{aslcontext_tsv, ground_truth_tail, Names};
     use crate::phantom::T2Mode;
-    use crate::protocol::{M0Type, Protocol};
+    use crate::protocol::{M0Type, Protocol, COMPAT_PINNED};
+    use crate::resample::GridOrigin;
     use crate::series::SeriesOutput;
 
     fn write_json(path: &Path, v: &Value) -> Result<(), String> {
@@ -137,7 +138,7 @@ mod writer {
                 "per-voxel T2/T2' maps (voxel mode) and the fieldmap stay in scanner space",
             ],
         }));
-        json!({
+        let mut block = json!({
             "Simulator": { "Name": "aslscan", "Version": env!("CARGO_PKG_VERSION") },
             "Seed": out.seeds.0,
             "M0ScanSeed": out.seeds.1,
@@ -176,7 +177,37 @@ mod writer {
             },
             "FieldmapPresent": out.fieldmap_present,
             "SliceOffsetsS": p.slice_offsets,
-        })
+        });
+        // Written only when used, so a P1/P3 sidecar is unchanged.
+        if p.grid_origin != GridOrigin::Corner {
+            block["Grid"]["Origin"] = json!(p.grid_origin.as_str());
+        }
+        if let (Some(_), Some(f)) = (&p.compat, &out.compat) {
+            let mut pinned: Map<String, Value> = COMPAT_PINNED.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+            pinned.insert("window".to_string(), json!("none"));
+            pinned.insert("readout_relaxation".to_string(), json!(false));
+            block["M0ScanContrast"] = json!(p.contrast.as_str());
+            block["Resolved"]["T2Blood"]["Used"] = json!(false);
+            block["Compat"] = json!({
+                "Asldro": true,
+                "Reference": "simasl (ASLDRO v2.2.0); mrsim-acq/docs/specs/2026-09-24-p2-asldro-compat-design.md",
+                "Pinned": pinned,
+                "DesiredSnr": f.desired_snr,
+                "NoiseVariance": f.noise_variance,
+                "M0ReferenceMean": f.m0_reference_mean,
+                "M0ReferenceVoxels": f.m0_reference_voxels,
+                "M0Reference": "mean |M0| over the nonzero voxels of the box-averaged M0 ground truth on the \
+                                acquisition grid; simasl's is its spline-resampled m0, so equal SNRs are not \
+                                equal noise unless the grids coincide",
+                "GridOrigin": p.grid_origin.as_str(),
+                "RelaxationAtEcho": "exp(-EchoTime/T2) per phantom voxel, tissue and blood alike, T2 = 0 giving 1; \
+                                     no relaxation in the readout",
+                "T2BloodUnused": true,
+                "SliceOffsetsAllZero": true,
+                "M0ScanRows": "the series' signal equation without label, as simasl's",
+            });
+        }
+        block
     }
 
     /// Write the whole dataset under `root`.

@@ -138,6 +138,66 @@ fn linearity_holds_with_a_shared_pose() {
 }
 
 #[test]
+fn linearity_holds_under_compat() {
+    // Compat scales tissue and blood of a voxel by the same exp(-TE/T2) before the acquisition
+    // and turns the readout's relaxation off: still linear per compartment. 2 mm voxel-centre
+    // grid, so the offset box weights are exercised too.
+    let run = |rows: &str| {
+        let s = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+            "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
+            "EchoTime": 0.01, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+            "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.0], "PhaseEncodingDirection": "j-",
+            "TotalReadoutTime": 0.001
+        });
+        let ov: Overlay = toml::from_str("[compat]\nasldro = true\n").unwrap();
+        let p = parse(&s, &format!("volume_type\n{rows}\n"), Some(&ov), crop().params.as_ref()).unwrap();
+        assert!(p.compat.is_some());
+        image_of(&p, RowOverride::None)
+    };
+    let worst = residual_of(&run("control"), &run("label"), &run("deltam"));
+    println!("linearity under compat: worst residual / tolerance = {worst:.3}");
+    assert!(worst <= 1.0, "{worst}");
+}
+
+#[test]
+fn compat_sidecar_names_every_pinned_value() {
+    let s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": false, "M0Type": "Included", "RepetitionTimePreparation": [10.0, 5.0, 5.0],
+        "EchoTime": 0.01, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.0], "PhaseEncodingDirection": "j-",
+        "TotalReadoutTime": 0.001
+    });
+    let ov: Overlay = toml::from_str("[compat]\nasldro = true\ndesired_snr = 50.0\n[signal]\nacq_contrast = \"ir\"\n").unwrap();
+    let p = parse(&s, "volume_type\nm0scan\ncontrol\nlabel\n", Some(&ov), crop().params.as_ref()).unwrap();
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-compat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("sub-01/perf/sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    let sim = &side["AslscanSimulation"];
+    let c = &sim["Compat"];
+    assert_eq!(c["Asldro"], json!(true));
+    for (k, v) in aslscan::protocol::COMPAT_PINNED {
+        assert_eq!(c["Pinned"][k].as_f64(), Some(v), "{k}");
+    }
+    assert_eq!(c["Pinned"]["window"], json!("none"));
+    assert_eq!(c["Pinned"]["readout_relaxation"], json!(false));
+    assert_eq!(c["DesiredSnr"], json!(50.0));
+    let f = out.compat.as_ref().unwrap();
+    assert_eq!(c["NoiseVariance"].as_f64(), Some(f.noise_variance));
+    assert_eq!(c["M0ReferenceMean"].as_f64(), Some(f.m0_reference_mean));
+    assert_eq!(c["GridOrigin"], json!("voxel-centre"));
+    assert_eq!(sim["Grid"]["Origin"], json!("voxel-centre"));
+    assert_eq!(sim["M0ScanContrast"], json!("ir"));
+    assert_eq!(sim["Resolved"]["T2Blood"]["Used"], json!(false));
+    assert_eq!(sim["Acquisition"]["NoiseVariance"].as_f64(), Some(f.noise_variance));
+    assert_eq!(side["ParallelReductionFactorInPlane"], json!(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn control_minus_label_variance_is_twice_one_volumes_noise() {
     // Independent noise: Var(C - L) = 2 Var(n). A shared realization would give zero.
     let noise = 4.0;

@@ -1246,6 +1246,14 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
 pub fn load(asl_json: &Path, aslcontext_tsv: &Path, overlay: Option<&Path>, phantom: Option<&PhantomParams>)
     -> Result<Protocol, String>
 {
+    load_with(asl_json, aslcontext_tsv, overlay, phantom, false)
+}
+
+/// [`load`], with `compat_asldro` the CLI's `--compat-asldro`: the same as writing
+/// `[compat] asldro = true` in the overlay (an overlay that says `false` is an error).
+pub fn load_with(
+    asl_json: &Path, aslcontext_tsv: &Path, overlay: Option<&Path>, phantom: Option<&PhantomParams>, compat_asldro: bool,
+) -> Result<Protocol, String> {
     let sidecar: Value = serde_json::from_str(
         &std::fs::read_to_string(asl_json).map_err(|e| format!("{}: {e}", asl_json.display()))?,
     )
@@ -1267,6 +1275,13 @@ pub fn load(asl_json: &Path, aslcontext_tsv: &Path, overlay: Option<&Path>, phan
                 }
             }
         }
+    }
+    if compat_asldro {
+        let c = ov.get_or_insert_with(Overlay::default).compat.get_or_insert_with(CompatOverlay::default);
+        if c.asldro == Some(false) {
+            return Err("--compat-asldro with an overlay that sets [compat] asldro = false".to_string());
+        }
+        c.asldro = Some(true);
     }
     parse(&sidecar, &ctx, ov.as_ref(), phantom)
 }
@@ -2000,5 +2015,25 @@ mod tests {
         assert!(toml::from_str::<Overlay>("[compat]\nasldr = true\n").is_err());
         let p = parse(&compat_base(), COMPAT_CTX, Some(&overlay("[compat]\nasldro = false\n")), None).unwrap();
         assert!(p.compat.is_none() && p.grid_origin == GridOrigin::Corner);
+    }
+
+    #[test]
+    fn the_cli_flag_is_the_overlay_key() {
+        let dir = std::env::temp_dir().join(format!("aslscan-compat-flag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (j, c, o) = (dir.join("asl.json"), dir.join("aslcontext.tsv"), dir.join("ov.toml"));
+        std::fs::write(&j, compat_base().to_string()).unwrap();
+        std::fs::write(&c, COMPAT_CTX).unwrap();
+        // no overlay at all: the flag alone
+        assert!(load_with(&j, &c, None, None, true).unwrap().compat.is_some());
+        assert!(load_with(&j, &c, None, None, false).unwrap().compat.is_none());
+        // an overlay saying true, or saying nothing about compat, is fine; false is a conflict
+        std::fs::write(&o, "[compat]\nasldro = true\ndesired_snr = 20.0\n").unwrap();
+        assert_eq!(load_with(&j, &c, Some(&o), None, true).unwrap().compat, Some(CompatSpec { desired_snr: Some(20.0) }));
+        std::fs::write(&o, "seed = 3\n").unwrap();
+        assert!(load_with(&j, &c, Some(&o), None, true).unwrap().compat.is_some());
+        std::fs::write(&o, "[compat]\nasldro = false\n").unwrap();
+        assert!(load_with(&j, &c, Some(&o), None, true).unwrap_err().contains("--compat-asldro"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
