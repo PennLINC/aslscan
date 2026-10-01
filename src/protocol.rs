@@ -1189,6 +1189,14 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
         if accel != 1 {
             refuse(format!("asl.json: ParallelReductionFactorInPlane = {accel}, pinned to 1,"))?;
         }
+        // The sidecar's own PartialFourier describes the acquisition too; outside compat the
+        // overlay's value is what is simulated and the input is kept as replaced, but compat
+        // overrides nothing silently.
+        if let Some(pf) = opt_num(sidecar, "PartialFourier")? {
+            if pf != 1.0 {
+                refuse(format!("asl.json: PartialFourier = {pf}, pinned to 1,"))?;
+            }
+        }
         if mb != 1 {
             refuse(format!("asl.json: MultibandAccelerationFactor = {mb}"))?;
         }
@@ -1973,6 +1981,11 @@ mod tests {
         let mut s = compat_base();
         s["ParallelReductionFactorInPlane"] = json!(2);
         check(&s, COMPAT_CTX, &ov, "ParallelReductionFactorInPlane");
+        let mut s = compat_base();
+        s["PartialFourier"] = json!(0.75);
+        check(&s, COMPAT_CTX, &ov, "PartialFourier");
+        s["PartialFourier"] = json!(1);
+        assert!(parse(&s, COMPAT_CTX, Some(&ov), None).is_ok());
         let mut s = compat_base();
         s["MultibandAccelerationFactor"] = json!(3);
         check(&s, COMPAT_CTX, &ov, "MultibandAccelerationFactor");

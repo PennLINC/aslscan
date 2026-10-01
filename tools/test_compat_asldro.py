@@ -25,9 +25,16 @@ def points(m, pts):
 def poses():
     rng = np.random.default_rng(20261001)
     out = [(rng.uniform(-30, 30, 3), rng.uniform(-10, 10, 3)) for _ in range(10)]
-    out.append((np.array([12.0, 90.0, -40.0]), np.array([1.0, -2.0, 3.0])))   # gimbal: R[2,0] = -1
-    out.append((np.array([-7.0, -90.0, 25.0]), np.array([0.5, 0.0, -1.0])))   # gimbal: R[2,0] = +1
+    # simasl's Rx(a) Ry(+-90) Rz(c) has R[2,0] = -cos(a + c) or cos(a - c): gimbal at c = -a, c = a
+    out.append((np.array([12.0, 90.0, -12.0]), np.array([1.0, -2.0, 3.0])))
+    out.append((np.array([-7.0, -90.0, -7.0]), np.array([0.5, 0.0, -1.0])))
     return out
+
+
+def test_the_gimbal_poses_are_singular():
+    for rot, _ in poses()[-2:]:
+        r = ca.rot_x(rot[0]) @ ca.rot_y(rot[1]) @ ca.rot_z(rot[2])
+        assert abs(abs(r[2, 0]) - 1) < 1e-12, (rot, r[2, 0])
 
 
 def test_zyx_angles_recompose_the_matrix():
@@ -36,6 +43,40 @@ def test_zyx_angles_recompose_the_matrix():
         a = ca.zyx_angles(r)
         back = ca.rot_z(a[2]) @ ca.rot_y(a[1]) @ ca.rot_x(a[0])
         assert np.abs(back - r).max() < 1e-12, (rot, a)
+
+
+def test_zyx_angles_take_the_gimbal_branch_for_both_signs():
+    for a, b, c in [(25.0, 90.0, -40.0), (-13.0, -90.0, 70.0), (0.0, 90.0, 0.0)]:
+        r = ca.rot_z(c) @ ca.rot_y(b) @ ca.rot_x(a)
+        assert abs(abs(r[2, 0]) - 1) < 1e-15
+        ang = ca.zyx_angles(r)
+        assert ang[2] == 0.0 and abs(ang[1] - b) < 1e-9, ang  # the gimbal branch sets rz = 0
+        back = ca.rot_z(ang[2]) @ ca.rot_y(ang[1]) @ ca.rot_x(ang[0])
+        assert np.abs(back - r).max() < 1e-12, (a, b, c, ang)
+
+
+def test_noise_stats_reject_correlated_imaginary_noise():
+    rng = np.random.default_rng(3)
+    ctx = ["m0scan", "control", "label"]
+    shape = (24, 24, 8, 3)
+
+    def field(correlated):
+        re = rng.standard_normal(shape)
+        if correlated:
+            w = rng.standard_normal((shape[0] + 1,) + shape[1:])
+            im = (w[:-1] + w[1:]) / np.sqrt(2)  # x-neighbours share a sample: rho 0.5
+        else:
+            im = rng.standard_normal(shape)
+        return re + 1j * im
+
+    good = ca.noise_stats([field(False) for _ in range(8)], ctx, 1.0)
+    assert good["pass"], good["checks"]
+    bad = ca.noise_stats([field(True) for _ in range(8)], ctx, 1.0)
+    assert not bad["checks"]["white"] and bad["adjacent_rho"]["im x"] > 0.4, bad["adjacent_rho"]
+    assert not bad["pass"]
+    nan = [field(False) for _ in range(8)]
+    nan[0][0, 0, 0, 0] = np.nan
+    assert not ca.noise_stats(nan, ctx, 1.0)["pass"]
 
 
 def test_converted_pose_moves_every_point_where_simasl_does():

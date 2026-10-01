@@ -158,8 +158,7 @@ def synthetic_ground_truth(out_dir):
     os.makedirs(out_dir, exist_ok=True)
     nii = os.path.join(out_dir, SYNTH + ".nii.gz")
     js = os.path.join(out_dir, SYNTH + ".json")
-    if os.path.exists(nii) and os.path.exists(js):
-        return {"nii": nii, "json": js}
+    # Regenerated on every run, never reused: a cached file would keep testing an old generator.
     src = ground_truth(PHANTOMS["3t"])
     img = nib.load(src["nii"])
     meta = json.load(open(src["json"]))
@@ -194,20 +193,37 @@ def synthetic_ground_truth(out_dir):
     return {"nii": nii, "json": js}
 
 
+def fingerprint(gt, crop=None):
+    """sha256 over the packed ground truth's NIfTI and JSON bytes, the converter's source and the
+    crop: what a converted phantom was made from."""
+    import hashlib
+    h = hashlib.sha256()
+    for path in (gt["nii"], gt["json"], os.path.join(REPO, "tools", "hrgt_to_bids.py")):
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+    h.update(repr(crop).encode())
+    return h.hexdigest()
+
+
 def convert_phantom(name, out, crop=None, source=None):
-    """tools/hrgt_to_bids.py, once per (name, crop); `source` converts a packed file instead."""
-    stamp = os.path.join(out, "phantom.json")
-    if os.path.exists(stamp):
-        meta = json.load(open(stamp))
-        if meta.get("Source") == name and meta.get("Crop") == ([list(c) for c in crop] if crop else None):
-            return out
+    """tools/hrgt_to_bids.py; reused only when its fingerprint (see `fingerprint`) matches the
+    inputs it would be converted from now. `source` converts a packed file instead of a name.
+    Returns (directory, fingerprint)."""
+    gt = {"nii": source, "json": source[:-7] + ".json"} if source else ground_truth(name)
+    fp = fingerprint(gt, crop)
+    stamp = os.path.join(out, ".fingerprint")
+    if os.path.exists(stamp) and open(stamp).read().strip() == fp:
+        return out, fp
+    if os.path.exists(out):
         shutil.rmtree(out)
     which = ["--source", source] if source else ["--name", name]
     cmd = [sys.executable, os.path.join(REPO, "tools", "hrgt_to_bids.py"), *which, "--out", out]
     if crop:
         cmd += ["--crop"] + [f"{a}:{b}" for a, b in crop]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
-    return out
+    open(stamp, "w").write(fp + "\n")
+    return out, fp
 
 
 def load_gt_arrays(gt):
@@ -311,7 +327,7 @@ def run_simasl(gt, series, parameter_override, zip_path, with_ground_truth=False
     for i, v in enumerate(vols):
         peak = max(1e-30, float(np.abs(v).max()))
         dev = float(np.abs(np.abs(v) - mag[..., i]).max()) / peak
-        if dev > 1e-6:
+        if not (np.isfinite(dev) and np.all(np.isfinite(v)) and dev <= 1e-6):
             raise SystemExit(f"the recorded volume {i} is not the archive's ({dev:.2e} of peak): the recording is not the run")
     return out
 
@@ -508,13 +524,13 @@ class Bench:
         os.makedirs(WORK, exist_ok=True)
         if phantom_key == "synth":
             self.gt = synthetic_ground_truth(os.path.join(WORK, "gt-synth"))
-            self.phantom = convert_phantom(SYNTH, os.path.join(WORK, "phantom-synth"), source=self.gt["nii"])
+            self.phantom, self.fingerprint = convert_phantom(SYNTH, os.path.join(WORK, "phantom-synth"), source=self.gt["nii"])
         elif crop:
             self.gt = packed_crop(self.name, CROP, os.path.join(WORK, "gt-crop"))
-            self.phantom = convert_phantom(self.name, os.path.join(WORK, "phantom-crop"), CROP)
+            self.phantom, self.fingerprint = convert_phantom(self.name, os.path.join(WORK, "phantom-crop"), CROP)
         else:
             self.gt = ground_truth(self.name)
-            self.phantom = convert_phantom(self.name, os.path.join(REPO, "work", f"phantom-{phantom_key}"))
+            self.phantom, self.fingerprint = convert_phantom(self.name, os.path.join(REPO, "work", f"phantom-{phantom_key}"))
         self.gt_affine, self.maps, self.meta = load_gt_arrays(self.gt)
         check_affine(self.gt_affine)
         self.shape = self.maps["seg_label"].shape
@@ -668,11 +684,17 @@ class Bench:
             mask = pure_mask(self.seg, a["affine"], self.shape, self.gt_affine, voxel, motion=m)
             rows = per_volume(a, s, ["m0scan", "control", "label"], mask)[:3]
             worst_pure = max(r["pure"]["max_rel"] for r in rows)
-            passed = bool(worst_pure <= tol and int(mask.sum()) >= MIN_PURE)
+            # A case is evaluable only with a large enough mask and finite numbers on both
+            # sides; a negative control must then show a finite error above the tolerance,
+            # never a NaN or an empty mask standing in for a failure.
+            valid = bool(int(mask.sum()) >= MIN_PURE and np.isfinite(worst_pure)
+                         and np.all(np.isfinite(a["complex"])) and all(np.all(np.isfinite(v)) for v in s["volumes"]))
+            passed = bool(valid and worst_pure <= tol)
+            as_expected = bool(valid and (worst_pure <= tol if should_pass else worst_pure > tol))
             case = {"case": name, "rot_deg": rot, "transl_mm": tr, "wrong": wrong, "expected_pass": should_pass,
                     "pure_voxels": int(mask.sum()), "all": {"max_rel": max(r["all"]["max_rel"] for r in rows)},
-                    "pure": {"max_rel": worst_pure}, "criterion": tol,
-                    "passed": passed, "as_expected": passed == should_pass}
+                    "pure": {"max_rel": worst_pure}, "criterion": tol, "valid": valid,
+                    "passed": passed, "as_expected": as_expected}
             out["cases"].append(case)
             out["pass"] &= case["as_expected"]
         out["gated"] = self.gated
@@ -703,21 +725,26 @@ def noise_stats(fields, ctx, predicted):
     st = {"n": int(n), "predicted_variance": predicted, "variance_re": var_re, "variance_im": var_im,
           "variance": 0.5 * (var_re + var_im), "mean_re": float(re.mean()), "mean_im": float(im.mean()),
           "rho_re_im": float(np.corrcoef(re, im)[0, 1])}
-    adj = {}
-    r = np.real(allz)
-    for ax, nm in ((0, "x"), (1, "y"), (2, "z")):
-        a = np.moveaxis(r, ax, 0)
-        adj[nm] = float(np.corrcoef(a[:-1].ravel(), a[1:].ravel())[0, 1])
-    st["adjacent_rho"] = adj
+    # whiteness and the control - label variance, on both components
+    adj, vcl = {}, {}
     c, l = ctx.index("control"), ctx.index("label")
-    dcl = (r[..., c, :] - r[..., l, :]).ravel()
-    st["var_cl_over_var_c"] = float(np.var(dcl) / np.var(r[..., c, :]))
+    for part, comp in (("re", np.real(allz)), ("im", np.imag(allz))):
+        for ax, nm in ((0, "x"), (1, "y"), (2, "z")):
+            a = np.moveaxis(comp, ax, 0)
+            adj[f"{part} {nm}"] = float(np.corrcoef(a[:-1].ravel(), a[1:].ravel())[0, 1])
+        dcl = (comp[..., c, :] - comp[..., l, :]).ravel()
+        vcl[part] = float(np.var(dcl) / np.var(comp[..., c, :]))
+    st["adjacent_rho"] = adj
+    st["var_cl_over_var_c"] = vcl["re"]
+    st["var_cl_over_var_c_by_part"] = vcl
+    finite = bool(np.all(np.isfinite(allz)))
     checks = {
+        "finite": finite,
         "mean": abs(st["mean_re"]) <= 3 * sd / np.sqrt(n) and abs(st["mean_im"]) <= 3 * sd / np.sqrt(n),
         "variance": abs(var_re / predicted - 1) <= 0.05 and abs(var_im / predicted - 1) <= 0.05,
         "re_im": abs(st["rho_re_im"]) < 0.02,
         "white": all(abs(v) < 0.02 for v in adj.values()),
-        "control_minus_label": abs(st["var_cl_over_var_c"] / 2 - 1) <= 0.10,
+        "control_minus_label": all(abs(v / 2 - 1) <= 0.10 for v in vcl.values()),
     }
     st["checks"] = {k: bool(v) for k, v in checks.items()}
     st["pass"] = bool(all(checks.values()))
@@ -784,9 +811,16 @@ def main():
     benches = ["A", "B", "C", "D", "D-grid", "E"] if a.bench == "all" else [a.bench]
     if a.crop and any(x not in ("A", "E") for x in benches):
         raise SystemExit("on the crop only A and E apply (the others need the full field of view)")
+    runs = [(b, name) for name in benches]
+    if a.bench == "all" and not b.gated:
+        # B and D are report-only on the anatomy; their gates are the synthetic blocks', and
+        # `all` must not succeed without them.
+        synth = Bench(a, "synth")
+        runs += [(synth, name) for name in ("B", "D", "D-grid")]
     ok = True
-    for name in benches:
+    for b, name in runs:
         res = getattr(b, "bench_" + name.lower().replace("-", "_"))()
+        res["phantom_fingerprint"] = b.fingerprint
         stem = os.path.join(WORK, f"{name}-{b.tag}")
         json.dump(res, open(stem + ".json", "w"), indent=2, default=float)
         md = markdown(name, b.tag, res)
