@@ -160,6 +160,34 @@ fn linearity_holds_under_compat() {
     assert!(worst <= 1.0, "{worst}");
 }
 
+/// Benchmark A (and E) of the P2 addendum on the crop, through the Python driver and simasl
+/// itself. Runs only when `ASLSCAN_SIMASL_ENV` names the micromamba environment with `asldro`
+/// and the binary was built (`--features cli`, so `CARGO_BIN_EXE_aslscan` exists); otherwise it
+/// says loudly that it skipped. `ASLSCAN_MICROMAMBA` overrides the micromamba executable.
+#[test]
+fn compat_benchmark_a_on_the_crop() {
+    let Ok(env) = std::env::var("ASLSCAN_SIMASL_ENV") else {
+        eprintln!("SKIPPED compat_benchmark_a_on_the_crop: set ASLSCAN_SIMASL_ENV to the simasl micromamba environment");
+        return;
+    };
+    let Some(bin) = option_env!("CARGO_BIN_EXE_aslscan") else {
+        eprintln!("SKIPPED compat_benchmark_a_on_the_crop: the aslscan binary is not built (add --features cli)");
+        return;
+    };
+    let mm = std::env::var("ASLSCAN_MICROMAMBA").unwrap_or_else(|_| "micromamba".to_string());
+    let driver = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/compat_asldro.py");
+    for bench in ["A", "E"] {
+        let out = std::process::Command::new(&mm)
+            .args(["run", "-n", &env, "python", driver, bench, "--crop", "--aslscan", bin])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("could not run micromamba");
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        println!("{text}");
+        assert!(out.status.success(), "benchmark {bench} on the crop failed:\n{text}");
+    }
+}
+
 #[test]
 fn compat_sidecar_names_every_pinned_value() {
     let s = json!({
