@@ -31,6 +31,8 @@ pub mod longitudinal;
 pub mod rng;
 /// Vascular crushing: the sine integral and the arterial survival (P4, part C), pure std.
 pub mod crushing;
+/// The bolus-position suppression model: parcel entry, cuts and sub-bolus factors (P4, part D).
+pub mod bolus;
 /// Physiological noise: cardiac and respiratory phase, the drift, the factors (P4, part E).
 pub mod physio;
 /// Box-overlap averaging between the phantom, acquisition and simulation grids.
