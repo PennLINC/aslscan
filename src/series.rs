@@ -715,7 +715,9 @@ fn simulate_core(
 
         // ---- P4: the label by parts (A), with parcel factors (D) and the physiological label
         // factor (E), and the arterial compartment (B) with crushing (C) ----
-        if p4.label_path && wants_gt {
+        // every row that carries label (the test controls can give a control row label), the
+        // ground truth only for label and deltam rows
+        if p4.label_path && (wants_gt || blood_sign(row.kind, ov) != 0.0) {
             let kin = p.kinetic(row);
             let sign0 = blood_sign(row.kind, ov) * factor * p4.label_physio[v].0;
             let bolus = bolus_region.map(|region| {
@@ -813,7 +815,7 @@ fn simulate_core(
                 }
                 // the extra ground truth, over every foreground voxel
                 for (gt, buf) in [(&mut gt_iv, &giv), (&mut gt_sup, &gsup), (&mut gt_art, &gart)] {
-                    if let Some(gt) = gt.as_mut() {
+                    if let (true, Some(gt)) = (wants_gt, gt.as_mut()) {
                         let sl = r_gt.mean_slice(z, |i| buf[i - base]);
                         for (jj, x) in sl.iter().enumerate() {
                             gt[(z * gslab + jj) * n + v] = *x;
@@ -1699,10 +1701,33 @@ mod tests {
         s["MultibandAccelerationFactor"] = json!(2);
         let (multi, _) = comps(&s, "control,label", &ov, T2Mode::Class);
         assert_eq!(single, multi);
-        // and slices sharing a readout time differ (their own anatomy)
-        let [nx, ny, _] = phantom().grid.dims;
-        let sl = |z: usize| &multi[0][z * nx * ny * 2..(z + 1) * nx * ny * 2];
-        assert_ne!(sl(0), sl(3));
+        // The extravascular part lands in each slice's own voxels at its own readout time: the
+        // label row's tissue compartments with the split on minus off are, per voxel,
+        // blood_se(-f (dm - iv)) at t = 3.6 + offset(z), f = 0.81 (two pulses at 0.95, both
+        // acting on every parcel). Slices 0 and 3 share a readout time but not anatomy.
+        let without = "model = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.2\n";
+        let (_, ov_off) = bs(&[2.0, 3.2], 0.95, without);
+        let (off, _) = comps(&s, "control,label", &ov_off, T2Mode::Class);
+        let ph = phantom();
+        let p = protocol_from(&s, "control,label", &ov);
+        let kin = p.kinetic(&p.rows[1]);
+        let [nx, ny, _] = ph.grid.dims;
+        let f = 0.81;
+        let mut checked = [0usize; 6];
+        for i in 0..ph.nvox() {
+            let c = ph.labels.iter().position(|(l, _)| *l == ph.dseg[i]).unwrap();
+            let z = i / (nx * ny);
+            let t = 3.6 + p.slice_offsets[z];
+            let (fl, att, t1, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
+            let want = -f * (delta_m(&kin, fl, att, t1, m0, t) - delta_m_iv(&kin, fl, att, t1, m0, t, 0.4));
+            let got = multi[c][i * 2 + 1] as f64 - off[c][i * 2 + 1] as f64;
+            let scale = off[c][i * 2 + 1].abs() as f64;
+            assert!((got - want).abs() <= 1e-6 * scale + 1e-9, "voxel {i} (slice {z}): {got} vs {want}");
+            if want.abs() > 0.0 {
+                checked[z] += 1;
+            }
+        }
+        assert!(checked[0] > 0 && checked[3] > 0, "slices 0 and 3 must both carry extravascular label: {checked:?}");
     }
 
     #[test]
@@ -1763,7 +1788,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aslscan-series-p4-moved-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tsv = dir.join("motion.tsv");
-        std::fs::write(&tsv, "trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n0\t0\t0\t0\t0\t0\n2\t0\t0\t0\t0\t0\n").unwrap();
+        // a fractional translation and a rotation, so a wrong sign, axis or frame cannot coincide
+        // with the right one as a whole-voxel shift would
+        std::fs::write(&tsv, "trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n0\t0\t0\t0\t0\t0\n1.3\t-0.7\t0\t0\t0\t0.05\n").unwrap();
         let path = tsv.to_string_lossy().replace('\\', "\\\\");
         let (s, model) = bs(&[2.0, 3.2], 0.95, "model = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.2\n[kinetic]\nexchange_time = 0.4\n");
         let ov = format!("{model}{TABLES}");
@@ -1788,6 +1815,12 @@ mod tests {
                 assert!((*x as f64 - *y as f64).abs() <= 1e-6 * peak, "{x} vs {y}");
             }
             assert_eq!(vol(a, 0), vol(b, 0), "volume 0 does not move");
+            // and the inverse pose is distinguishable, so the check discriminates
+            let q = moved.poses[1];
+            let inv = Pose { rot_deg: q.rot_deg.map(|r| -r), trans_mm: q.trans_mm.map(|t| -t) };
+            let wrong = mrsim_acq::motion::resample_by_pose(&vol(a, 1), g.dims, g.voxel_to_world, inv);
+            let dev = got.iter().zip(&wrong).map(|(x, y)| (*x as f64 - *y as f64).abs()).fold(0.0f64, f64::max);
+            assert!(dev > 1e-2 * peak, "the inverse pose must not pass: {dev:e} of peak {peak}");
         }
         let _ = std::fs::remove_dir_all(&dir);
         let _ = ph;

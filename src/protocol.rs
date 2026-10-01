@@ -1440,6 +1440,16 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                     return Err(format!("overlay: physio.{what} = {cv} must be in [0, 0.3] (so every period is positive)"));
                 }
             }
+            // The periodic terms are bounded by their amplitudes; at |a_c| + |a_r| >= 1 a factor
+            // could reach zero or flip the sign of the magnetization it scales. (The drift is
+            // unbounded in principle; its amplitude is the user's, recorded in the sidecar.)
+            for (what, a) in [("tissue", params.tissue), ("label", params.label)] {
+                if a[0].abs() + a[1].abs() >= 1.0 {
+                    return Err(format!(
+                        "overlay: physio {what}_cardiac and {what}_respiratory sum to {} in magnitude; at 1 or more the \
+                         {what} factor can reach zero or change sign", a[0].abs() + a[1].abs()));
+                }
+            }
             if params.tissue.iter().chain(&params.label).all(|a| *a == 0.0) {
                 return Err("overlay: [physio] with all six amplitudes zero would modulate nothing; set an amplitude \
                             or remove the table".to_string());
@@ -2556,6 +2566,10 @@ mod tests {
         assert!(p4(&s, "[physio]\ntissue_cardiac = 0.01\ncardiac_cv = 0.4\n", None).unwrap_err().contains("cardiac_cv"));
         assert!(p4(&s, "[physio]\ntissue_cardiac = 0.01\ndrift_time = 0.0\n", None).unwrap_err().contains("drift_time"));
         assert!(p4(&s, "[physio]\ntissue_cardiac = 0.01\nrespiratory_frequency = -1.0\n", None).unwrap_err().contains("respiratory_frequency"));
+        // bounded periodic amplitudes
+        assert!(p4(&s, "[physio]\ntissue_cardiac = 0.6\ntissue_respiratory = -0.4\n", None).unwrap_err().contains("change sign"));
+        assert!(p4(&s, "[physio]\nlabel_cardiac = 1.5\n", None).unwrap_err().contains("label"));
+        assert!(p4(&s, "[physio]\ntissue_cardiac = 0.6\ntissue_respiratory = 0.3\ntissue_drift = 2.0\n", None).is_ok());
         assert_eq!(p4(&s, "[kinetic]\nexchange_time = 0.5\n", None).unwrap().exchange_time, Some(0.5));
         assert!(p4(&s, "[kinetic]\nexchange_time = 0.0\n", None).unwrap_err().contains("exchange_time"));
     }

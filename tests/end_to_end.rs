@@ -265,6 +265,13 @@ fn linearity_fails_when_the_extravascular_part_lands_in_the_blood() {
 }
 
 #[test]
+fn linearity_fails_for_a_control_label_swap_on_the_p4_path() {
+    // the swap gives the control row the label: the P4 label path must run for it
+    let worst = p4_linearity(0.4, RowOverride::SwapControlLabel, RowOverride::SwapControlLabel);
+    assert!(worst > 1e2, "swapped control/label must break the identity on the P4 path: {worst}");
+}
+
+#[test]
 fn linearity_fails_when_the_intravascular_part_lands_in_tissue_0() {
     // a slow exchange keeps a measurable intravascular part for the control to move
     let worst = p4_linearity(10.0, RowOverride::None, RowOverride::BloodIntoTissue0);

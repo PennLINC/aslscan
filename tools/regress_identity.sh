@@ -6,8 +6,9 @@
 #
 # Builds the base in a sibling worktree (../aslscan-base-<rev>, its own target dir) and this
 # tree, runs both binaries on the same protocols, and compares every NIfTI (decompressed) and
-# every sidecar byte for byte. Needs work/phantom-3t and work/phantom-3t-z100 (see
-# tools/hrgt_to_bids.py and the P3 plan). Exits nonzero on any difference or failed run.
+# every sidecar byte for byte. Needs work/phantom-3t, work/phantom-3t-z100 and work/phantom-3t-z97 (see
+# tools/hrgt_to_bids.py: z97 is --crop 0:197 0:233 46:143, which fits asl004's 24 slices of 4.05 mm).
+# Exits nonzero on any difference or failed run.
 set -euo pipefail
 BASE=${1:?usage: tools/regress_identity.sh <base-rev>}
 export PATH=$HOME/.cargo/bin:$PATH
@@ -25,6 +26,7 @@ NEW=$HERE/target/release/aslscan
 P=$HERE/tests/fixtures/protocols
 FULL=$HERE/work/phantom-3t
 Z100=$HERE/work/phantom-3t-z100
+Z97=$HERE/work/phantom-3t-z97
 CROP=$HERE/tests/fixtures/phantom-crop
 A=$OUT/inputs
 printf '[m0]\nrepetition_time = 8.0\n' > $A/ov.toml
@@ -32,6 +34,9 @@ printf 'seed = 5\n[m0]\nrepetition_time = 8.0\n[motion]\nmode = "random"\ntrans_
 printf '[m0]\nrepetition_time = 8.0\n[acquisition]\nnoise_variance = 4.0\n' > $A/ov-noise.toml
 printf '[m0]\nrepetition_time = 8.0\n[signal]\nacq_contrast = "ir"\n' > $A/ov-ir.toml
 sed 's/"BackgroundSuppression":true/"BackgroundSuppression":false/' $P/asl002/asl.json > $A/asl002-off.json
+# asl004 as published reads its first line before the excitation in this model (the main spec's
+# deferred pre-echo line timing), so it runs with the readout shortened to 0.025 s
+sed 's/"TotalReadoutTime":0.06/"TotalReadoutTime":0.025/' $P/asl004/asl.json > $A/asl004.json
 # a second geometry for the P3 paths: the crop at 2 x 2 x 3 mm
 crop_json() {
   printf '{"ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8, "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0], "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05], "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.012, %s}\n' "$1"
@@ -42,6 +47,12 @@ printf 'control\nlabel\ncontrol\nlabel\n' | sed '1i volume_type' > $A/crop-ctx.t
 printf 'seed = 3\n[signal]\nacq_contrast = "ir"\n' > $A/crop-ir.toml
 printf 'seed = 3\n[motion]\nmode = "random"\ntrans_mm = [1.0, 1.0, 0.0]\nrot_deg = [0.0, 0.0, 2.0]\nvolumes = [1, 3]\n' > $A/crop-motion.toml
 printf 'seed = 3\n' > $A/crop-seed.toml
+# PASL on the crop: cutoff 0.7 s, PLD 1.8 s; suppression after the cutoff, and motion
+pasl_json() {
+  printf '{"ArterialSpinLabelingType": "PASL", "BolusCutOffFlag": true, "BolusCutOffTechnique": "Q2TIPS", "BolusCutOffDelayTime": 0.7, "PostLabelingDelay": 1.8, "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0], "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05], "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.012, %s}\n' "$1"
+}
+pasl_json '"BackgroundSuppression": true, "BackgroundSuppressionNumberPulses": 2, "BackgroundSuppressionPulseTime": [0.9, 1.5]' > $A/pasl-bs.json
+pasl_json '"BackgroundSuppression": false' > $A/pasl-plain.json
 cases=(
   "pasl_cutoff|$P/pasl_cutoff/asl.json|$P/pasl_cutoff/aslcontext.tsv|$P/pasl_cutoff/overlay.toml|$FULL"
   "crop_pcasl|$P/crop_pcasl/asl.json|$P/crop_pcasl/aslcontext.tsv|$P/crop_pcasl/overlay.toml|$CROP"
@@ -52,13 +63,18 @@ cases=(
   "crop_bs|$A/crop-bs.json|$A/crop-ctx.tsv|$A/crop-seed.toml|$CROP"
   "crop_ir|$A/crop-plain.json|$A/crop-ctx.tsv|$A/crop-ir.toml|$CROP"
   "crop_motion|$A/crop-plain.json|$A/crop-ctx.tsv|$A/crop-motion.toml|$CROP"
+  "crop_voxel|$P/crop_pcasl/asl.json|$P/crop_pcasl/aslcontext.tsv|$P/crop_pcasl/overlay.toml|$CROP|--t2-mode voxel"
+  "crop_pasl_bs|$A/pasl-bs.json|$A/crop-ctx.tsv|$A/crop-seed.toml|$CROP"
+  "crop_pasl_motion|$A/pasl-plain.json|$A/crop-ctx.tsv|$A/crop-motion.toml|$CROP"
+  "asl004_bs|$A/asl004.json|$P/asl004/aslcontext.tsv|$A/ov.toml|$Z97"
+  "asl004_voxel|$A/asl004.json|$P/asl004/aslcontext.tsv|$A/ov.toml|$Z97|--t2-mode voxel"
 )
 fail=0
 for c in "${cases[@]}"; do
-  IFS='|' read -r name json ctx ov ph <<< "$c"
+  IFS='|' read -r name json ctx ov ph extra <<< "$c"
   for side in old new; do
     bin=$OLD; [ $side = new ] && bin=$NEW
-    if ! $bin --asl-json $json --aslcontext $ctx --overlay $ov --phantom $ph --out $OUT/$side-$name > $OUT/log-$side-$name.txt 2>&1; then
+    if ! $bin --asl-json $json --aslcontext $ctx --overlay $ov --phantom $ph $extra --out $OUT/$side-$name > $OUT/log-$side-$name.txt 2>&1; then
       echo "$name: $side run FAILED"; tail -2 $OUT/log-$side-$name.txt; fail=1; continue 2
     fi
   done
@@ -73,8 +89,8 @@ for c in "${cases[@]}"; do
       *) cmp -s "$f" "$g" || { echo "  DIFF $name $rel"; bad=1; } ;;
     esac
   done < <(find $OUT/old-$name -type f)
-  extra=$(find $OUT/new-$name -type f | wc -l)
-  [ "$extra" = "$n" ] || { echo "  file count $n vs $extra"; bad=1; }
+  nnew=$(find $OUT/new-$name -type f | wc -l)
+  [ "$nnew" = "$n" ] || { echo "  file count $n vs $nnew"; bad=1; }
   echo "$name: $n files, $([ $bad = 0 ] && echo identical || echo DIFFERENT)"
   [ $bad = 0 ] || fail=1
 done

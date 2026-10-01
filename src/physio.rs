@@ -128,14 +128,26 @@ impl OuDrift {
         if t1 <= t0 {
             return self.value(t0);
         }
+        // Walk the grid intervals by integer index: recomputing the index from a grid time
+        // (`floor(n * step / step)`) lands on n - 1 for many n, which would merge the rest of the
+        // window into one trapezoid.
+        let last = self.x.len() - 1;
+        let mut k = ((t0 / DRIFT_STEP).floor().max(0.0) as usize).min(last - 1);
+        if ((k + 1) as f64 * DRIFT_STEP) <= t0 && k + 1 < last {
+            k += 1;
+        }
         let mut acc = 0.0;
         let mut s = t0;
         while s < t1 {
-            let (k, _) = self.at_grid(s);
-            let e = ((k + 1) as f64 * DRIFT_STEP).min(t1);
-            let e = if e <= s { t1 } else { e };
+            // the end of interval k, or t1; past the grid the interpolant is constant (clamped)
+            let e = if k + 1 < last { ((k + 1) as f64 * DRIFT_STEP).min(t1) } else { t1 };
+            let e = e.max(s);
             acc += 0.5 * (self.value(s) + self.value(e)) * (e - s);
+            if e >= t1 {
+                break;
+            }
             s = e;
+            k += 1;
         }
         acc / (t1 - t0)
     }
@@ -274,6 +286,19 @@ mod tests {
         let lag = (30.0 / DRIFT_STEP) as usize;
         let c = d.x.iter().zip(&d.x[lag..]).map(|(a, b)| (a - mean) * (b - mean)).sum::<f64>() / (n - lag as f64) / var;
         assert!((c - (-1.0f64).exp()).abs() < 0.05, "lag correlation {c}");
+        // the window mean is exact for the interpolant over many grid intervals, including
+        // windows that start on grid times where floor(n * step / step) rounds to n - 1 (n = 43
+        // is the first: 2.15 s; 4.0 s is a labeling start at TR 4 s)
+        let w = OuDrift::new(30.0, &mut Normal::new(8), 40.0);
+        for (t0, t1) in [(4.0, 5.8), (2.15, 3.95), (8.0, 9.8), (0.013, 1.987), (4.0, 4.0 + 1e-9)] {
+            let n = 200_000;
+            let h = (t1 - t0) / n as f64;
+            // composite Simpson per grid interval is exact for a piecewise-linear integrand; a
+            // fine midpoint rule over the whole window is within ~h of it, enough at this n
+            let quad = (0..n).map(|i| w.value(t0 + (i as f64 + 0.5) * h)).sum::<f64>() / n as f64;
+            let got = w.mean(t0, t1);
+            assert!((got - quad).abs() < 1e-6, "[{t0}, {t1}]: {got} vs {quad}");
+        }
         // the window mean is exact for the interpolant: a hand-built two-point case
         let two = OuDrift { x: vec![1.0, 3.0, 3.0] };
         assert!((two.mean(0.0, DRIFT_STEP) - 2.0).abs() < 1e-15);
