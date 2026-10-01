@@ -447,10 +447,13 @@ def run_aslscan(binary, phantom_dir, side, ctx, overlay, run_dir):
 def pure_mask(seg, acq_affine, acq_dims, gt_affine, voxel, motion=None):
     """The addendum's pure mask: acquisition voxels whose sample point q (the voxel centre, or
     its pre-motion position M^-1 p) has one foreground label over |i - q| <= max(8, v/2 + 0.5)
-    phantom voxels per axis: the box footprint and the spline's reach together."""
+    phantom voxels per axis: the box footprint and the spline's reach together. With motion,
+    aslscan interpolates trilinearly between the box-averaged cells around q, whose footprints
+    reach 1.5 cells from q: the half-width is then max(8, 1.5 v + 0.5)."""
     dims = seg.shape
     labels = [int(l) for l in np.unique(seg) if l > 0]
-    half = np.array([max(SPLINE_REACH, v / 2.0 + 0.5) for v in voxel])
+    reach = 1.5 if motion is not None else 0.5
+    half = np.array([max(SPLINE_REACH, reach * v + 0.5) for v in voxel])
     idx = np.indices(acq_dims).reshape(3, -1).T.astype(float)
     world = idx @ acq_affine[:3, :3].T + acq_affine[:3, 3]
     if motion is not None:
