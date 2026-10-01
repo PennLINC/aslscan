@@ -215,6 +215,62 @@ fn p4_all(rows: &str, extra: &str) -> Protocol {
     parse(&s, &ctx, Some(&ov), crop().params.as_ref()).unwrap()
 }
 
+/// One-row P4 series for the linearity identity: every part on, crushing at 4 cm/s, the
+/// exchange time given. One-row series share the physiological factors (row 0 at t = 0).
+fn p4_one(row: &str, tau_ex: f64) -> Protocol {
+    let s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": true, "BackgroundSuppressionNumberPulses": 2,
+        "BackgroundSuppressionPulseTime": [1.5, 3.2], "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
+        "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05], "PhaseEncodingDirection": "j-",
+        "TotalReadoutTime": 0.012, "VascularCrushing": true, "VascularCrushingVENC": 4.0
+    });
+    let ov: Overlay = toml::from_str(&format!(
+        "seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n\
+         [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n\
+         [kinetic]\nexchange_time = {tau_ex}\n\
+         [macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }}\n\
+         arterial_transit_time = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n\
+         [vascular_crushing]\narterial_velocity = {{ grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }}\n\
+         [physio]\ntissue_cardiac = 0.02\ntissue_respiratory = 0.01\nlabel_cardiac = 0.03\nlabel_drift = 0.01\n"
+    )).unwrap();
+    parse(&s, &format!("volume_type\n{row}\n"), Some(&ov), crop().params.as_ref()).unwrap()
+}
+
+fn p4_linearity(tau_ex: f64, ov_c: RowOverride, ov_l: RowOverride) -> f64 {
+    let c = image_of(&p4_one("control", tau_ex), ov_c);
+    let l = image_of(&p4_one("label", tau_ex), ov_l);
+    let b = image_of(&p4_one("deltam", tau_ex), RowOverride::None);
+    residual_of(&c, &l, &b)
+}
+
+#[test]
+fn linearity_holds_with_every_p4_part_on() {
+    // the arterial compartment is in its window at the readout (t = 3.6, 3.65; aATT 2.5 / 2.7)
+    let out = simulate_with(&p4_one("label", 0.4), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert!(out.ground_truth.delta_m_arterial.as_ref().unwrap().iter().any(|v| *v > 0.0));
+    let worst = p4_linearity(0.4, RowOverride::None, RowOverride::None);
+    println!("linearity with every P4 part on: worst residual / tolerance = {worst:.3}");
+    assert!(worst <= 1.0, "{worst}");
+}
+
+#[test]
+fn linearity_fails_when_the_extravascular_part_lands_in_the_blood() {
+    let worst = p4_linearity(0.4, RowOverride::None, RowOverride::ExtravascularIntoBlood);
+    // measured 54x the tolerance (the identity itself holds at 0.18): the exchanged label is a
+    // smaller part than the whole bolus the P1 controls move, so the margin is smaller too
+    println!("extravascular part in the blood: residual / tolerance = {worst:.1}");
+    assert!(worst > 10.0, "the extravascular part in the blood compartment must break the identity: {worst}");
+}
+
+#[test]
+fn linearity_fails_when_the_intravascular_part_lands_in_tissue_0() {
+    // a slow exchange keeps a measurable intravascular part for the control to move
+    let worst = p4_linearity(10.0, RowOverride::None, RowOverride::BloodIntoTissue0);
+    assert!(worst > 1e2, "the intravascular part in tissue compartment 0 must break the identity: {worst}");
+}
+
 #[test]
 fn p4_sidecar_blocks_and_ground_truth_files() {
     let p = p4_all("control,label,control,label", "");

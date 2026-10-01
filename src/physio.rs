@@ -39,9 +39,9 @@ impl PhaseProcess {
         let phase0 = 2.0 * PI * rng.unit();
         let mut bounds = vec![0.0];
         while *bounds.last().unwrap() <= horizon {
-            let mut z = rng.next();
+            let mut z = rng.draw();
             while z.abs() > 3.0 {
-                z = rng.next();
+                z = rng.draw();
             }
             let period = 1.0 / f + (cv / f) * z;
             bounds.push(bounds.last().unwrap() + period);
@@ -102,9 +102,9 @@ impl OuDrift {
         let a = (-DRIFT_STEP / tau_d).exp();
         let b = (1.0 - a * a).sqrt();
         let mut x = Vec::with_capacity(n);
-        x.push(rng.next());
+        x.push(rng.draw());
         for k in 1..n {
-            let z = rng.next();
+            let z = rng.draw();
             x.push(x[k - 1] * a + b * z);
         }
         OuDrift { x }

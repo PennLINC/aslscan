@@ -2486,7 +2486,7 @@ mod tests {
         assert!(p4(&crushed(json!(4.0)), &format!("{TABLES}[vascular_crushing]\narterial_velocity = {{ grey_matter = 1.0 }}\nno_arterial_compartment = true\n"), None)
             .unwrap_err().contains("contradicts"));
         assert!(p4(&crushed(json!(4.0)), "", None).unwrap_err().contains("[macrovascular]"));
-        assert!(p4(&crushed(json!(4.0)), &format!("[vascular_crushing]\nno_arterial_compartment = true\narterial_velocity = {{ grey_matter = 1.0 }}\n"), None)
+        assert!(p4(&crushed(json!(4.0)), "[vascular_crushing]\nno_arterial_compartment = true\narterial_velocity = { grey_matter = 1.0 }\n", None)
             .unwrap_err().contains("act on nothing"));
         assert!(p4(&crushed(json!(0.05)), &format!("{TABLES}{vel}"), None).unwrap_err().contains("0.1"));
         assert!(p4(&crushed(json!([4.0, 4.0])), &format!("{TABLES}{vel}"), None).unwrap_err().contains("entries"));

@@ -46,7 +46,7 @@ impl Normal {
         self.rng.unit()
     }
 
-    pub fn next(&mut self) -> f64 {
+    pub fn draw(&mut self) -> f64 {
         if let Some(z) = self.cached.take() {
             return z;
         }
@@ -70,7 +70,7 @@ mod tests {
         let k = 1_000_000;
         let (mut s, mut s2) = (0.0f64, 0.0f64);
         for _ in 0..k {
-            let z = n.next();
+            let z = n.draw();
             s += z;
             s2 += z * z;
         }
@@ -79,11 +79,11 @@ mod tests {
         assert!(mean.abs() < 3e-3 && (var - 1.0).abs() < 3e-3, "mean {mean} var {var}");
         // the second value of a pair costs no draw
         let mut a = Normal::new(7);
-        let _ = a.next();
+        let _ = a.draw();
         let state = a.rng.0;
-        let _ = a.next();
+        let _ = a.draw();
         assert_eq!(a.rng.0, state, "the cached value must not advance the stream");
-        let _ = a.next();
+        let _ = a.draw();
         assert_ne!(a.rng.0, state);
     }
 

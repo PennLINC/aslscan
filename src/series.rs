@@ -1561,6 +1561,7 @@ mod tests {
         assert!(gt.iter().zip(&b.ground_truth.delta_m).all(|(iv, dm)| *iv <= *dm * (1.0 + 1e-6) + 1e-12));
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn check_arterial_image(s: &Value, rows: &str, aatt_gm: f64, expect_signal: bool) {
         let ph = phantom();
         let ov = format!("{HOM}[macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.0, csf = 0.0 }}\n\
@@ -1765,7 +1766,7 @@ mod tests {
         std::fs::write(&tsv, "trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n0\t0\t0\t0\t0\t0\n2\t0\t0\t0\t0\t0\n").unwrap();
         let path = tsv.to_string_lossy().replace('\\', "\\\\");
         let (s, model) = bs(&[2.0, 3.2], 0.95, "model = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.2\n[kinetic]\nexchange_time = 0.4\n");
-        let ov = format!("{model}{}", TABLES.replace("2.5", "2.5"));
+        let ov = format!("{model}{TABLES}");
         let moving = format!("{ov}[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\n");
         let still = run(&s, "label,label", &ov, T2Mode::Class);
         let moved = run(&s, "label,label", &moving, T2Mode::Class);
