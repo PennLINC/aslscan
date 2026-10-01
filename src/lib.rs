@@ -26,8 +26,13 @@ pub mod kinetic;
 pub mod mrsignal;
 /// The background-suppression timeline: tissue `Mz` at readout and the blood label factor.
 pub mod longitudinal;
-/// SplitMix64 for the within-volume motion events, pure std.
+/// SplitMix64 for the within-volume motion events and a Box-Muller normal for the
+/// physiological noise, pure std.
 pub mod rng;
+/// Vascular crushing: the sine integral and the arterial survival (P4, part C), pure std.
+pub mod crushing;
+/// Physiological noise: cardiac and respiratory phase, the drift, the factors (P4, part E).
+pub mod physio;
 /// Box-overlap averaging between the phantom, acquisition and simulation grids.
 pub mod resample;
 /// The volume list: `Row` and `RowKind`, pure std.
