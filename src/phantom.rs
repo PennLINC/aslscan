@@ -49,6 +49,10 @@ pub struct Phantom {
     /// `label-N`).
     pub labels: Vec<(i32, String)>,
     pub params: Option<PhantomParams>,
+    /// Arterial blood volume fraction, if `abv.nii.gz` exists (P4, part B).
+    pub abv: Option<Vec<f32>>,
+    /// Arterial transit time (s), if `aatt.nii.gz` exists (P4, part B).
+    pub aatt: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +199,25 @@ pub fn load(dir: &Path) -> Result<Phantom, String> {
         None
     };
 
+    // The arterial compartment's optional maps (P4 addendum, part B).
+    let abv = optional_map(dir, "abv", "fraction", &grid)?;
+    if let Some(a) = &abv {
+        for (i, (&v, &l)) in a.iter().zip(&dseg).enumerate() {
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!("phantom: abv voxel {i} is {v}; a blood volume fraction is in [0, 1]"));
+            }
+            if l == 0 && v != 0.0 {
+                return Err(format!("phantom: abv is {v} at background voxel {i}; background has no blood"));
+            }
+        }
+    }
+    let aatt = optional_map(dir, "aatt", "s", &grid)?;
+    if let Some(i) = aatt.as_ref().and_then(|a| a.iter().position(|v| *v < 0.0)) {
+        return Err(format!("phantom: aatt voxel {i} is negative"));
+    }
+
     let pj = dir.join("phantom.json");
+    let (has_abv, has_aatt) = (abv.is_some(), aatt.is_some());
     let params = if pj.exists() {
         let v = read_json(&pj)?;
         let f = |k: &str| v.get(k).and_then(Value::as_f64);
@@ -203,12 +225,39 @@ pub fn load(dir: &Path) -> Result<Phantom, String> {
             lambda: f("LambdaBloodBrain"),
             t1b: f("T1ArterialBlood"),
             field_strength: f("MagneticFieldStrength"),
+            has_abv,
+            has_aatt,
         })
+    } else if has_abv || has_aatt {
+        // The flags must reach `protocol` even without phantom.json; the kinetic fields stay
+        // absent, which `protocol` already treats as no phantom value.
+        Some(PhantomParams { has_abv, has_aatt, ..Default::default() })
     } else {
         None
     };
 
-    Ok(Phantom { grid, perfusion, att, t1, t2, t2star, m0, dseg, fieldmap, labels, params })
+    Ok(Phantom { grid, perfusion, att, t1, t2, t2star, m0, dseg, fieldmap, labels, params, abv, aatt })
+}
+
+/// An optional map `name.nii.gz` with `name.json` `Units: unit`, on the phantom grid, finite.
+fn optional_map(dir: &Path, name: &str, unit: &str, grid: &Grid) -> Result<Option<Vec<f32>>, String> {
+    let nii = dir.join(format!("{name}.nii.gz"));
+    if !nii.exists() {
+        return Ok(None);
+    }
+    let side = read_json(&dir.join(format!("{name}.json")))?;
+    match side.get("Units").and_then(Value::as_str) {
+        Some(u) if u == unit => {}
+        other => return Err(format!("phantom: {name}.json Units is {other:?}, expected {unit:?}")),
+    }
+    let (data, g) = mrsim_acq::io::load_volume(&nii).map_err(|e| format!("phantom: {name}: {e}"))?;
+    if g.dims != grid.dims || !same_affine(&g.voxel_to_world, &grid.voxel_to_world) {
+        return Err(format!("phantom: {name} is not on the phantom grid"));
+    }
+    if let Some(i) = data.iter().position(|v| !v.is_finite()) {
+        return Err(format!("phantom: {name} voxel {i} is not finite"));
+    }
+    Ok(Some(data))
 }
 
 /// `(label, voxel, map name)` of the first voxel that breaks per-label constancy.
@@ -342,7 +391,7 @@ mod tests {
         let ph = load(&crop()).unwrap();
         assert_eq!(ph.grid.dims, [24, 24, 6]);
         assert_eq!(ph.labels, vec![(1, "grey_matter".to_string()), (2, "white_matter".to_string()), (3, "csf".to_string())]);
-        assert_eq!(ph.params, Some(PhantomParams { lambda: Some(0.9), t1b: Some(1.65), field_strength: Some(3.0) }));
+        assert_eq!(ph.params, Some(PhantomParams { lambda: Some(0.9), t1b: Some(1.65), field_strength: Some(3.0), has_abv: false, has_aatt: false }));
         assert!(ph.fieldmap.is_none());
         let gm = first_voxel_of(&ph, 1);
         assert!((ph.t2[gm] - 0.08).abs() < 1e-6 && (ph.perfusion[gm] - 60.0).abs() < 1e-4);
@@ -365,6 +414,55 @@ mod tests {
         write_3d(&d.join("M0map.nii.gz"), small.dims, &vec![1.0; 24 * 24 * 5], &small).unwrap();
         let e = load(&d).unwrap_err();
         assert!(e.contains("M0map") && e.contains("[24, 24, 5]"), "{e}");
+    }
+
+    #[test]
+    fn arterial_maps_load_with_their_flags_and_checks() {
+        let d = scratch("arterial");
+        let ph = load(&d).unwrap();
+        assert!(ph.abv.is_none() && ph.aatt.is_none());
+        let n = ph.nvox();
+        let abv: Vec<f32> = ph.dseg.iter().map(|l| if *l > 0 { 0.02 } else { 0.0 }).collect();
+        write_3d(&d.join("abv.nii.gz"), ph.grid.dims, &abv, &ph.grid).unwrap();
+        std::fs::write(d.join("abv.json"), "{\"Units\": \"fraction\"}").unwrap();
+        let ph2 = load(&d).unwrap();
+        assert_eq!(ph2.abv.as_deref(), Some(&abv[..]));
+        let p = ph2.params.unwrap();
+        assert!(p.has_abv && !p.has_aatt);
+        assert_eq!(p.lambda, ph.params.unwrap().lambda, "phantom.json values are unchanged");
+        write_3d(&d.join("aatt.nii.gz"), ph.grid.dims, &vec![0.5; n], &ph.grid).unwrap();
+        std::fs::write(d.join("aatt.json"), "{\"Units\": \"s\"}").unwrap();
+        let p = load(&d).unwrap().params.unwrap();
+        assert!(p.has_abv && p.has_aatt);
+        // without phantom.json the flags still arrive, the kinetic fields absent
+        std::fs::remove_file(d.join("phantom.json")).unwrap();
+        assert_eq!(load(&d).unwrap().params, Some(PhantomParams { has_abv: true, has_aatt: true, ..Default::default() }));
+        // the checks: units, range, background, sign
+        std::fs::write(d.join("abv.json"), "{\"Units\": \"percent\"}").unwrap();
+        assert!(load(&d).unwrap_err().contains("abv.json"));
+        std::fs::write(d.join("abv.json"), "{\"Units\": \"fraction\"}").unwrap();
+        let mut bad = abv.clone();
+        let fg = ph.dseg.iter().position(|l| *l > 0).unwrap();
+        bad[fg] = 1.5;
+        write_3d(&d.join("abv.nii.gz"), ph.grid.dims, &bad, &ph.grid).unwrap();
+        assert!(load(&d).unwrap_err().contains("[0, 1]"));
+        // the crop is all foreground: make voxel 0 background (label 0, zero M0)
+        let mut dseg: Vec<f32> = ph.dseg.iter().map(|l| *l as f32).collect();
+        dseg[0] = 0.0;
+        write_3d(&d.join("dseg.nii.gz"), ph.grid.dims, &dseg, &ph.grid).unwrap();
+        let mut m0 = ph.m0.clone();
+        m0[0] = 0.0;
+        write_3d(&d.join("M0map.nii.gz"), ph.grid.dims, &m0, &ph.grid).unwrap();
+        let mut bad = abv.clone();
+        bad[0] = 0.01;
+        write_3d(&d.join("abv.nii.gz"), ph.grid.dims, &bad, &ph.grid).unwrap();
+        assert!(load(&d).unwrap_err().contains("background"));
+        let mut good = abv.clone();
+        good[0] = 0.0;
+        write_3d(&d.join("abv.nii.gz"), ph.grid.dims, &good, &ph.grid).unwrap();
+        assert!(load(&d).is_ok());
+        write_3d(&d.join("aatt.nii.gz"), ph.grid.dims, &vec![-0.5; n], &ph.grid).unwrap();
+        assert!(load(&d).unwrap_err().contains("aatt"));
     }
 
     #[test]

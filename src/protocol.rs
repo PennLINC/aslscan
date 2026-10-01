@@ -10,6 +10,7 @@
 //! [`Source`] so the output sidecar can record which won. Silent defaults are the failure mode
 //! for datasets in the wild.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use mrsim_acq::kspace::{Acquisition, KspaceWindow, PartialFourierMode};
@@ -19,7 +20,9 @@ use serde_json::Value;
 
 use crate::kinetic::{Kinetic, LabelType};
 use crate::longitudinal::Suppression;
+use crate::bolus::Region;
 use crate::mrsignal::{parse_contrast, Contrast, IrParams};
+use crate::physio::PhysioParams;
 use crate::resample::GridOrigin;
 pub use crate::rows::{Row, RowKind};
 
@@ -38,6 +41,8 @@ pub enum Source {
     Phantom,
     Overlay,
     Default,
+    /// Inherited from the resolved blood T2 (P4: the arterial T2's default).
+    T2Blood,
 }
 
 impl Source {
@@ -47,6 +52,7 @@ impl Source {
             Source::Phantom => "Phantom",
             Source::Overlay => "Overlay",
             Source::Default => "Default",
+            Source::T2Blood => "T2Blood",
         }
     }
 }
@@ -57,6 +63,10 @@ pub struct PhantomParams {
     pub lambda: Option<f64>,
     pub t1b: Option<f64>,
     pub field_strength: Option<f64>,
+    /// The phantom carries `abv.nii.gz` / `aatt.nii.gz` (P4, part B), so activation can be
+    /// decided here, before the compat check.
+    pub has_abv: bool,
+    pub has_aatt: bool,
 }
 
 /// The acquisition knobs BIDS does not express, all from the overlay with these defaults.
@@ -119,6 +129,87 @@ pub struct Overlay {
     pub background_suppression: Option<SuppressionOverlay>,
     pub motion: Option<MotionOverlay>,
     pub compat: Option<CompatOverlay>,
+    pub macrovascular: Option<MacroOverlay>,
+    pub vascular_crushing: Option<CrushOverlay>,
+    pub physio: Option<PhysioOverlay>,
+}
+
+/// `[macrovascular]` (P4, part B): per-label values keyed by `dseg.json` names.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacroOverlay {
+    pub arterial_blood_volume: Option<BTreeMap<String, f64>>,
+    pub arterial_transit_time: Option<BTreeMap<String, f64>>,
+}
+
+/// `[vascular_crushing]` (P4, part C).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrushOverlay {
+    /// cm/s per label: the top of the laminar speed range.
+    pub arterial_velocity: Option<BTreeMap<String, f64>>,
+    /// Accept `VascularCrushing: true` with no arterial compartment to act on.
+    pub no_arterial_compartment: Option<bool>,
+}
+
+/// `[physio]` (P4, part E).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhysioOverlay {
+    pub tissue_cardiac: Option<f64>,
+    pub tissue_respiratory: Option<f64>,
+    pub tissue_drift: Option<f64>,
+    pub label_cardiac: Option<f64>,
+    pub label_respiratory: Option<f64>,
+    pub label_drift: Option<f64>,
+    pub cardiac_frequency: Option<f64>,
+    pub cardiac_cv: Option<f64>,
+    pub respiratory_frequency: Option<f64>,
+    pub respiratory_cv: Option<f64>,
+    /// s
+    pub drift_time: Option<f64>,
+}
+
+/// `[background_suppression] slab_entry_time`: seconds, or `"arrival"`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SlabEntry {
+    Seconds(f64),
+    Word(String),
+}
+
+/// Where an arterial quantity comes from (P4, part B).
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuantitySource {
+    Map,
+    Table(BTreeMap<String, f64>),
+}
+
+/// The resolved arterial compartment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MacroSpec {
+    pub abv: QuantitySource,
+    pub aatt: QuantitySource,
+    /// s
+    pub t2_arterial: (f64, Source),
+}
+
+/// The resolved vascular crushing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrushSpec {
+    /// cm/s per row; 0 is crushing off for that volume.
+    pub venc: Vec<f64>,
+    /// cm/s per label; `None` with `no_arterial_compartment`.
+    pub arterial_velocity: Option<BTreeMap<String, f64>>,
+    pub no_arterial_compartment: bool,
+}
+
+/// The suppression model (P4, part D).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SuppressionModel {
+    /// P3: every pulse inverts the whole bolus.
+    GlobalBolus,
+    BolusPosition(Region),
 }
 
 /// `[compat]` (P2 addendum, part A).
@@ -171,6 +262,12 @@ pub struct SuppressionOverlay {
     pub presaturation: Option<bool>,
     /// Multi-PLD series: one pulse-time array per distinct PostLabelingDelay, ascending.
     pub pulse_times_per_pld: Option<Vec<Vec<f64>>>,
+    /// `"global-bolus"` (P3, default) or `"bolus-position"` (P4, part D).
+    pub model: Option<String>,
+    /// `"global"` or `"slab"`; required by and only read with `"bolus-position"`.
+    pub pulse_region: Option<String>,
+    /// With `"slab"`: seconds from labeling to slab entry, or `"arrival"`.
+    pub slab_entry_time: Option<SlabEntry>,
 }
 
 /// `[motion]` (P3 addendum, part C).
@@ -211,6 +308,8 @@ pub struct KineticOverlay {
     pub label_efficiency: Option<f64>,
     pub lambda_blood_brain: Option<f64>,
     pub t1_arterial_blood: Option<f64>,
+    /// s; turns the intravascular/extravascular split on (P4, part A).
+    pub exchange_time: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -219,6 +318,8 @@ pub struct SignalOverlay {
     pub acq_contrast: Option<String>,
     /// s
     pub t2_blood: Option<f64>,
+    /// s; the arterial compartment's T2 (P4, part B), default the resolved blood T2.
+    pub t2_arterial: Option<f64>,
     /// s; inversion recovery only (overlay > sidecar `InversionTime` > 1.0).
     pub inversion_time: Option<f64>,
     /// degrees; inversion recovery only (overlay > sidecar `FlipAngle` > 90). Undefined for
@@ -275,6 +376,8 @@ pub struct SuppressionSpec {
     /// A multi-PLD series without `pulse_times_per_pld`: BIDS defines only the first PLD's
     /// times, and they were applied to every row.
     pub first_pld_applied_to_all: bool,
+    /// P3's global bolus, or P4's bolus position.
+    pub model: SuppressionModel,
 }
 
 impl SuppressionSpec {
@@ -327,6 +430,16 @@ pub struct Protocol {
     pub compat: Option<CompatSpec>,
     /// Where the acquisition grid sits on the phantom (`[compat] grid_origin`).
     pub grid_origin: GridOrigin,
+    /// P4, part A: the exchange time (s).
+    pub exchange_time: Option<f64>,
+    /// P4, part B.
+    pub macrovascular: Option<MacroSpec>,
+    /// P4, part C (`VascularCrushing: true`).
+    pub crushing: Option<CrushSpec>,
+    /// P4, part E.
+    pub physio: Option<PhysioParams>,
+    /// Each row's start on the series clock (s): the sum of the earlier rows' repetition times.
+    pub row_start: Vec<f64>,
     /// With `mb > 1`: whether the slice timing is the interleaved (even groups then odd) shot
     /// order of `mrsim_acq::motion::slice_schedule`, as opposed to sequential.
     pub mb_interleaved: bool,
@@ -750,9 +863,7 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
     if opt_bool(sidecar, "LookLocker")? {
         return Err("asl.json: LookLocker is true; Look-Locker readouts arrive with P6".to_string());
     }
-    if opt_bool(sidecar, "VascularCrushing")? {
-        return Err("asl.json: VascularCrushing is true; vascular crushing arrives with P4".to_string());
-    }
+    // (VascularCrushing is P4's, part C, resolved with the other P4 inputs below.)
     // Required by BIDS, and read rather than defaulted: an absent field would be written back
     // absent and the dataset would not validate.
     let background_suppression = match field(sidecar, "BackgroundSuppression")? {
@@ -1107,6 +1218,53 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                 distinct.len() > 1,
             ),
         };
+        // The model (P4, part D): global-bolus unless asked, and its region keys only with
+        // bolus-position, so no key is read for nothing.
+        let model_name = bo.and_then(|b| b.model.as_deref()).unwrap_or("global-bolus");
+        let model = match model_name {
+            "global-bolus" => {
+                if bo.is_some_and(|b| b.pulse_region.is_some() || b.slab_entry_time.is_some()) {
+                    return Err("overlay: background_suppression.pulse_region and slab_entry_time are read only with \
+                                model = \"bolus-position\"; under \"global-bolus\" they would have no effect"
+                        .to_string());
+                }
+                SuppressionModel::GlobalBolus
+            }
+            "bolus-position" => {
+                let region = match (bo.and_then(|b| b.pulse_region.as_deref()), bo.and_then(|b| b.slab_entry_time.as_ref())) {
+                    (None, _) => {
+                        return Err("overlay: background_suppression.model = \"bolus-position\" needs pulse_region \
+                                    (\"global\" or \"slab\")".to_string())
+                    }
+                    (Some("global"), None) => Region::Global,
+                    (Some("global"), Some(_)) => {
+                        return Err("overlay: background_suppression.slab_entry_time is read only with \
+                                    pulse_region = \"slab\"".to_string())
+                    }
+                    (Some("slab"), None) => {
+                        return Err("overlay: background_suppression.pulse_region = \"slab\" needs slab_entry_time \
+                                    (seconds after labeling, or \"arrival\")".to_string())
+                    }
+                    (Some("slab"), Some(SlabEntry::Seconds(d))) => {
+                        Region::Slab(require_finite_nonneg(*d, "overlay background_suppression.slab_entry_time")?)
+                    }
+                    (Some("slab"), Some(SlabEntry::Word(w))) if w == "arrival" => Region::Arrival,
+                    (Some("slab"), Some(SlabEntry::Word(w))) => {
+                        return Err(format!(
+                            "overlay: background_suppression.slab_entry_time {w:?}: expected seconds or \"arrival\""))
+                    }
+                    (Some(other), _) => {
+                        return Err(format!(
+                            "overlay: background_suppression.pulse_region {other:?}: expected \"global\" or \"slab\""))
+                    }
+                };
+                SuppressionModel::BolusPosition(region)
+            }
+            other => {
+                return Err(format!(
+                    "overlay: background_suppression.model {other:?}: expected \"global-bolus\" or \"bolus-position\""))
+            }
+        };
         for (i, r) in rows.iter().enumerate() {
             for &p in &per_row[i] {
                 if p >= r.t {
@@ -1115,19 +1273,186 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                          {} s; P3 models pulses before the first excitation only (a later pulse would act on the \
                          next repetition of the earlier slices)", r.t));
                 }
-                if p < r.tau {
+                // Partial-bolus inversion (P4, part D): a slab pulse never touches blood upstream
+                // of the slab, and a PASL bolus is labeled whole at 0, so both may fall inside the
+                // bolus; a global pulse during (P)CASL labeling also inverts blood not yet labeled.
+                let allowed_early = match model {
+                    SuppressionModel::GlobalBolus => false,
+                    SuppressionModel::BolusPosition(Region::Global) => label_type == LabelType::Pasl,
+                    SuppressionModel::BolusPosition(_) => true,
+                };
+                if p < r.tau && !allowed_early {
+                    let why = match model {
+                        SuppressionModel::GlobalBolus => "a pulse during labeling inverts part of the bolus, which the \
+                                                          global-bolus model cannot express; use model = \
+                                                          \"bolus-position\"",
+                        _ => "a global pulse during (P)CASL labeling also inverts blood not yet labeled, whose \
+                              recovery until its labeling (the inflowing blood's history) is not modeled; use \
+                              pulse_region = \"slab\" if the pulse spares the labeling plane",
+                    };
                     return Err(format!(
-                        "row {i}: background-suppression pulse at {p} s falls before the bolus end at {} s; a pulse \
-                         during labeling inverts part of the bolus, which arrives with P4", r.tau));
+                        "row {i}: background-suppression pulse at {p} s falls before the bolus end at {} s; {why}",
+                        r.tau));
                 }
             }
         }
-        Some(SuppressionSpec { epsilon, presaturation, per_row, first_pld_pulses, first_pld_applied_to_all })
+        Some(SuppressionSpec { epsilon, presaturation, per_row, first_pld_pulses, first_pld_applied_to_all, model })
     } else {
+        if bo.is_some_and(|b| b.model.is_some() || b.pulse_region.is_some() || b.slab_entry_time.is_some()) {
+            return Err("overlay: background_suppression.model, pulse_region and slab_entry_time need \
+                        BackgroundSuppression true".to_string());
+        }
         None
     };
 
     let motion = overlay_motion(overlay.and_then(|o| o.motion.as_ref()), n, mb)?;
+
+    // ---- P4 (addendum; plan Task 4): activation and refusal, in the plan's order ----
+    // 1. The arterial compartment: on with [macrovascular] or either map; then each quantity
+    //    needs exactly one source.
+    let mo = overlay.and_then(|o| o.macrovascular.as_ref());
+    let (has_abv, has_aatt) = phantom.map_or((false, false), |p| (p.has_abv, p.has_aatt));
+    let macro_on = mo.is_some() || has_abv || has_aatt;
+    let check_table = |t: &BTreeMap<String, f64>, what: &str, upper: Option<f64>| -> Result<(), String> {
+        for (name, v) in t {
+            if !(v.is_finite() && *v >= 0.0 && upper.is_none_or(|u| *v <= u)) {
+                return Err(format!("overlay: macrovascular.{what}.{name} = {v} is out of range"));
+            }
+        }
+        Ok(())
+    };
+    let source = |map: bool, table: Option<&BTreeMap<String, f64>>, what: &str, upper: Option<f64>|
+        -> Result<QuantitySource, String>
+    {
+        match (map, table) {
+            (true, Some(_)) => Err(format!(
+                "{what} is given both by the phantom's map and by overlay [macrovascular]; one source each")),
+            (true, None) => Ok(QuantitySource::Map),
+            (false, Some(t)) => {
+                check_table(t, what, upper)?;
+                Ok(QuantitySource::Table(t.clone()))
+            }
+            (false, None) => Err(format!(
+                "the arterial compartment is on but {what} has no source: give the phantom map or an overlay \
+                 [macrovascular] {what} table")),
+        }
+    };
+    let macro_partial = if macro_on {
+        let abv = source(has_abv, mo.and_then(|m| m.arterial_blood_volume.as_ref()), "arterial_blood_volume", Some(1.0))?;
+        let aatt = source(has_aatt, mo.and_then(|m| m.arterial_transit_time.as_ref()), "arterial_transit_time", None)?;
+        Some((abv, aatt))
+    } else {
+        None
+    };
+    // 2. The arterial T2: only with the compartment; default the resolved blood T2.
+    let t2_arterial_in = so.and_then(|s| s.t2_arterial);
+    let macrovascular = match macro_partial {
+        None => {
+            if t2_arterial_in.is_some() {
+                return Err("overlay: signal.t2_arterial without an arterial compartment ([macrovascular] or the \
+                            abv/aatt maps)".to_string());
+            }
+            None
+        }
+        Some((abv, aatt)) => {
+            let t2_arterial = match t2_arterial_in {
+                Some(v) => (require_finite_positive(v, "overlay signal.t2_arterial")?, Source::Overlay),
+                None => (t2_blood_s.0, Source::T2Blood),
+            };
+            Some(MacroSpec { abv, aatt, t2_arterial })
+        }
+    };
+    // 3. Crushing.
+    let co = overlay.and_then(|o| o.vascular_crushing.as_ref());
+    let crushing = if opt_bool(sidecar, "VascularCrushing")? {
+        let venc = per_row(
+            num_or_array(sidecar, "VascularCrushingVENC")
+                .map_err(|e| format!("{e} (required with VascularCrushing true)"))?,
+            "VascularCrushingVENC", &kinds, false)?;
+        for (i, v) in venc.iter().enumerate() {
+            if !(*v == 0.0 || (v.is_finite() && *v >= 0.1)) {
+                return Err(format!(
+                    "asl.json: VascularCrushingVENC = {v} for row {i}: 0 (off) or at least 0.1 cm/s, below which \
+                     capillary flow could no longer be assumed unaffected"));
+            }
+        }
+        let no_arterial = co.and_then(|c| c.no_arterial_compartment).unwrap_or(false);
+        let velocity = co.and_then(|c| c.arterial_velocity.clone());
+        if macrovascular.is_some() {
+            if no_arterial {
+                return Err("overlay: vascular_crushing.no_arterial_compartment = true contradicts the arterial \
+                            compartment that is on".to_string());
+            }
+            let Some(v) = &velocity else {
+                return Err("VascularCrushing true with an arterial compartment needs overlay [vascular_crushing] \
+                            arterial_velocity (cm/s per label)".to_string());
+            };
+            for (name, x) in v {
+                if !(x.is_finite() && *x >= 0.0) {
+                    return Err(format!("overlay: vascular_crushing.arterial_velocity.{name} = {x} is out of range"));
+                }
+            }
+        } else {
+            if !no_arterial {
+                return Err("asl.json: VascularCrushing true, but there is no arterial compartment for the crushers \
+                            to act on: give [macrovascular], or set [vascular_crushing] no_arterial_compartment = \
+                            true to accept that they act on nothing modeled".to_string());
+            }
+            if velocity.is_some() {
+                return Err("overlay: vascular_crushing.arterial_velocity with no arterial compartment would act on \
+                            nothing".to_string());
+            }
+        }
+        Some(CrushSpec { venc, arterial_velocity: velocity, no_arterial_compartment: no_arterial })
+    } else {
+        if sidecar.get("VascularCrushingVENC").is_some_and(|v| !v.is_null()) || co.is_some() {
+            return Err("VascularCrushingVENC or [vascular_crushing] without VascularCrushing true".to_string());
+        }
+        None
+    };
+    // Part A.
+    let exchange_time = match ko.and_then(|k| k.exchange_time) {
+        Some(v) => Some(require_finite_positive(v, "overlay kinetic.exchange_time")?),
+        None => None,
+    };
+    // 7. Physiological noise.
+    let physio = match overlay.and_then(|o| o.physio.as_ref()) {
+        None => None,
+        Some(po) => {
+            let d = PhysioParams::default();
+            let amp = |v: Option<f64>, what: &str| -> Result<f64, String> {
+                let v = v.unwrap_or(0.0);
+                if v.is_finite() { Ok(v) } else { Err(format!("overlay: physio.{what} is not finite")) }
+            };
+            let params = PhysioParams {
+                tissue: [amp(po.tissue_cardiac, "tissue_cardiac")?, amp(po.tissue_respiratory, "tissue_respiratory")?,
+                         amp(po.tissue_drift, "tissue_drift")?],
+                label: [amp(po.label_cardiac, "label_cardiac")?, amp(po.label_respiratory, "label_respiratory")?,
+                        amp(po.label_drift, "label_drift")?],
+                cardiac_frequency: require_finite_positive(po.cardiac_frequency.unwrap_or(d.cardiac_frequency), "overlay physio.cardiac_frequency")?,
+                cardiac_cv: po.cardiac_cv.unwrap_or(d.cardiac_cv),
+                respiratory_frequency: require_finite_positive(po.respiratory_frequency.unwrap_or(d.respiratory_frequency), "overlay physio.respiratory_frequency")?,
+                respiratory_cv: po.respiratory_cv.unwrap_or(d.respiratory_cv),
+                drift_time: require_finite_positive(po.drift_time.unwrap_or(d.drift_time), "overlay physio.drift_time")?,
+            };
+            for (what, cv) in [("cardiac_cv", params.cardiac_cv), ("respiratory_cv", params.respiratory_cv)] {
+                if !(cv.is_finite() && (0.0..=0.3).contains(&cv)) {
+                    return Err(format!("overlay: physio.{what} = {cv} must be in [0, 0.3] (so every period is positive)"));
+                }
+            }
+            if params.tissue.iter().chain(&params.label).all(|a| *a == 0.0) {
+                return Err("overlay: [physio] with all six amplitudes zero would modulate nothing; set an amplitude \
+                            or remove the table".to_string());
+            }
+            Some(params)
+        }
+    };
+    let mut row_start = Vec::with_capacity(n);
+    let mut clock = 0.0;
+    for r in &rows {
+        row_start.push(clock);
+        clock += r.tr;
+    }
 
     let m0_repetition_time_s = overlay.and_then(|o| o.m0.as_ref()).and_then(|m| m.repetition_time);
     if let Some(v) = m0_repetition_time_s {
@@ -1209,6 +1534,18 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
         if m0_type == M0Type::Separate {
             refuse("asl.json: M0Type \"Separate\" (simasl's M0 is an m0scan row: use M0Type \"Included\")".to_string())?;
         }
+        for (part, on) in [
+            ("[kinetic] exchange_time (P4 part A)", exchange_time.is_some()),
+            ("the arterial compartment (P4 part B)", macrovascular.is_some()),
+            ("VascularCrushing (P4 part C)", crushing.is_some()),
+            ("background_suppression.model = \"bolus-position\" (P4 part D)",
+             suppression.as_ref().is_some_and(|s| s.model != SuppressionModel::GlobalBolus)),
+            ("[physio] (P4 part E)", physio.is_some()),
+        ] {
+            if on {
+                refuse(part.to_string())?;
+            }
+        }
         if slice_offsets.iter().any(|t| *t != 0.0) {
             refuse(format!(
                 "asl.json: SliceTiming {timing:?} (unequal entries give each slice its own kinetic time)"))?;
@@ -1241,7 +1578,7 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
     };
 
     Ok(Protocol {
-        compat, grid_origin,
+        compat, grid_origin, exchange_time, macrovascular, crushing, physio, row_start,
         label_type, rows, m0_type, background_suppression, suppression, ir, motion, mb_interleaved,
         slice_offsets, field_strength, voxel_size_mm, reverse_phase, phase_encoding_direction: ped,
         echo_time_s, total_readout_time_s, accel, mb, alpha, lambda, t1b, t2_blood_s, contrast,
@@ -1475,7 +1812,8 @@ mod tests {
         assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("P6"));
         let mut s = base();
         s["VascularCrushing"] = json!(true);
-        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("P4"));
+        // P4 accepts crushing, but not without its VENC (and, part C, an arterial compartment)
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("VascularCrushingVENC"));
         let mut s = base();
         s.as_object_mut().unwrap().remove("BackgroundSuppression");
         assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("BackgroundSuppression"));
@@ -1582,7 +1920,7 @@ mod tests {
         assert_eq!(p.t1b, (1.65, Source::Default));
         assert_eq!(p.t2_blood_s, (0.165, Source::Default));
         assert_eq!(p.seed, 0);
-        let ph = PhantomParams { lambda: Some(0.91), t1b: Some(1.7), field_strength: Some(3.0) };
+        let ph = PhantomParams { lambda: Some(0.91), t1b: Some(1.7), field_strength: Some(3.0), ..Default::default() };
         let p = parse(&base(), CTX, Some(&m0_overlay()), Some(&ph)).unwrap();
         assert_eq!(p.lambda, (0.91, Source::Phantom));
         assert_eq!(p.t1b, (1.7, Source::Phantom));
@@ -1731,7 +2069,7 @@ mod tests {
         let e = parse(&with_suppression(&[2.0, 3.6]), CTX, Some(&m0_overlay()), None).unwrap_err();
         assert!(e.contains("3.6 s") && e.contains("first"), "{e}");
         let e = parse(&with_suppression(&[1.5, 3.2]), CTX, Some(&m0_overlay()), None).unwrap_err();
-        assert!(e.contains("1.5 s") && e.contains("bolus") && e.contains("P4"), "{e}");
+        assert!(e.contains("1.5 s") && e.contains("bolus") && e.contains("bolus-position"), "{e}");
         // overlay values and ranges
         let ov = overlay("[background_suppression]\ninversion_efficiency = 1.0\npresaturation = true\n[m0]\nrepetition_time = 8.0\n");
         let p = parse(&with_suppression(&[2.0, 3.2]), CTX, Some(&ov), None).unwrap();
@@ -2048,5 +2386,202 @@ mod tests {
         std::fs::write(&o, "[compat]\nasldro = false\n").unwrap();
         assert!(load_with(&j, &c, Some(&o), None, true).unwrap_err().contains("--compat-asldro"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------ P4
+
+    const M0: &str = "[m0]\nrepetition_time = 8.0\n";
+    const TABLES: &str = "[macrovascular]\narterial_blood_volume = { grey_matter = 0.02, white_matter = 0.01, csf = 0.0 }\n\
+                          arterial_transit_time = { grey_matter = 0.5, white_matter = 0.7, csf = 0.0 }\n";
+
+    fn p4(s: &Value, ov: &str, ph: Option<PhantomParams>) -> Result<Protocol, String> {
+        parse(s, CTX, Some(&overlay(&format!("{M0}{ov}"))), ph.as_ref())
+    }
+
+    fn maps(abv: bool, aatt: bool) -> Option<PhantomParams> {
+        Some(PhantomParams { has_abv: abv, has_aatt: aatt, ..Default::default() })
+    }
+
+    #[test]
+    fn p4_inputs_are_off_and_absent_for_p1_p3_protocols() {
+        // (pcasl_single and pcasl_multipld are refused by the P3 readout-in-TR check, as before P4)
+        for name in ["asl002", "pasl_cutoff", "crop_pcasl"] {
+            let (s, ctx) = fixture(name);
+            let ov = overlay(M0);
+            let p = parse(&s, &ctx, Some(&ov), None).unwrap();
+            assert!(p.exchange_time.is_none() && p.macrovascular.is_none() && p.crushing.is_none() && p.physio.is_none());
+            if let Some(sup) = &p.suppression {
+                assert_eq!(sup.model, SuppressionModel::GlobalBolus);
+            }
+            // the row clock: cumulative repetition times
+            let mut clock = 0.0;
+            for (i, r) in p.rows.iter().enumerate() {
+                assert_eq!(p.row_start[i], clock);
+                clock += r.tr;
+            }
+        }
+    }
+
+    #[test]
+    fn the_arterial_compartment_resolves_each_quantity_from_one_source() {
+        let s = base();
+        // both tables
+        let m = p4(&s, TABLES, None).unwrap().macrovascular.unwrap();
+        assert!(matches!(m.abv, QuantitySource::Table(_)) && matches!(m.aatt, QuantitySource::Table(_)));
+        // both maps
+        let m = p4(&s, "", maps(true, true)).unwrap().macrovascular.unwrap();
+        assert_eq!((m.abv, m.aatt), (QuantitySource::Map, QuantitySource::Map));
+        // the two mixed combinations
+        let m = p4(&s, "[macrovascular]\narterial_transit_time = { grey_matter = 0.5 }\n", maps(true, false)).unwrap().macrovascular.unwrap();
+        assert!(m.abv == QuantitySource::Map && matches!(m.aatt, QuantitySource::Table(_)));
+        let m = p4(&s, "[macrovascular]\narterial_blood_volume = { grey_matter = 0.02 }\n", maps(false, true)).unwrap().macrovascular.unwrap();
+        assert!(matches!(m.abv, QuantitySource::Table(_)) && m.aatt == QuantitySource::Map);
+        // missing, duplicate, empty, a lone map
+        assert!(p4(&s, "[macrovascular]\narterial_blood_volume = { grey_matter = 0.02 }\n", None).unwrap_err().contains("arterial_transit_time has no source"));
+        assert!(p4(&s, TABLES, maps(true, false)).unwrap_err().contains("both"));
+        assert!(p4(&s, "[macrovascular]\n", None).unwrap_err().contains("no source"));
+        assert!(p4(&s, "", maps(true, false)).unwrap_err().contains("arterial_transit_time has no source"));
+        // ranges
+        assert!(p4(&s, "[macrovascular]\narterial_blood_volume = { grey_matter = 1.5 }\narterial_transit_time = { grey_matter = 0.5 }\n", None)
+            .unwrap_err().contains("out of range"));
+        assert!(p4(&s, "[macrovascular]\narterial_blood_volume = { grey_matter = 0.1 }\narterial_transit_time = { grey_matter = -0.5 }\n", None)
+            .unwrap_err().contains("out of range"));
+        // no P4 input, no maps: off
+        assert!(p4(&s, "", maps(false, false)).unwrap().macrovascular.is_none());
+    }
+
+    #[test]
+    fn the_arterial_t2_inherits_the_resolved_blood_t2() {
+        let s = base();
+        let m = p4(&s, TABLES, None).unwrap().macrovascular.unwrap();
+        assert_eq!(m.t2_arterial, (0.165, Source::T2Blood));
+        let m = p4(&s, &format!("{TABLES}[signal]\nt2_blood = 0.2\n"), None).unwrap().macrovascular.unwrap();
+        assert_eq!(m.t2_arterial, (0.2, Source::T2Blood));
+        let m = p4(&s, &format!("{TABLES}[signal]\nt2_arterial = 0.25\n"), None).unwrap().macrovascular.unwrap();
+        assert_eq!(m.t2_arterial, (0.25, Source::Overlay));
+        assert!(p4(&s, "[signal]\nt2_arterial = 0.25\n", None).unwrap_err().contains("t2_arterial without"));
+        assert!(p4(&s, &format!("{TABLES}[signal]\nt2_arterial = 0.0\n"), None).unwrap_err().contains("t2_arterial"));
+    }
+
+    #[test]
+    fn crushing_follows_the_combination_matrix() {
+        let crushed = |venc: Value| {
+            let mut s = base();
+            s["VascularCrushing"] = json!(true);
+            s["VascularCrushingVENC"] = venc;
+            s
+        };
+        let vel = "[vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 0.0 }\n";
+        // with the arterial compartment and velocities: on, VENC per row
+        let c = p4(&crushed(json!(4.0)), &format!("{TABLES}{vel}"), None).unwrap().crushing.unwrap();
+        assert_eq!(c.venc, vec![4.0; 4]);
+        assert!(!c.no_arterial_compartment && c.arterial_velocity.is_some());
+        let c = p4(&crushed(json!([0.0, 4.0, 0.0, 4.0])), &format!("{TABLES}{vel}"), None).unwrap().crushing.unwrap();
+        assert_eq!(c.venc, vec![0.0, 4.0, 0.0, 4.0]);
+        // the refusals
+        let mut no_venc = base();
+        no_venc["VascularCrushing"] = json!(true);
+        assert!(p4(&no_venc, &format!("{TABLES}{vel}"), None).unwrap_err().contains("VascularCrushingVENC"));
+        assert!(p4(&crushed(json!(4.0)), TABLES, None).unwrap_err().contains("arterial_velocity"));
+        assert!(p4(&crushed(json!(4.0)), &format!("{TABLES}[vascular_crushing]\narterial_velocity = {{ grey_matter = 1.0 }}\nno_arterial_compartment = true\n"), None)
+            .unwrap_err().contains("contradicts"));
+        assert!(p4(&crushed(json!(4.0)), "", None).unwrap_err().contains("[macrovascular]"));
+        assert!(p4(&crushed(json!(4.0)), &format!("[vascular_crushing]\nno_arterial_compartment = true\narterial_velocity = {{ grey_matter = 1.0 }}\n"), None)
+            .unwrap_err().contains("act on nothing"));
+        assert!(p4(&crushed(json!(0.05)), &format!("{TABLES}{vel}"), None).unwrap_err().contains("0.1"));
+        assert!(p4(&crushed(json!([4.0, 4.0])), &format!("{TABLES}{vel}"), None).unwrap_err().contains("entries"));
+        let mut venc_only = base();
+        venc_only["VascularCrushingVENC"] = json!(4.0);
+        assert!(p4(&venc_only, "", None).unwrap_err().contains("without VascularCrushing"));
+        assert!(p4(&base(), vel, None).unwrap_err().contains("without VascularCrushing"));
+        // the escape hatch: accepted, recorded, nothing to act on
+        let c = p4(&crushed(json!(4.0)), "[vascular_crushing]\nno_arterial_compartment = true\n", None).unwrap().crushing.unwrap();
+        assert!(c.no_arterial_compartment && c.arterial_velocity.is_none());
+        // VascularCrushing false stays what P1 accepted
+        let mut off = base();
+        off["VascularCrushing"] = json!(false);
+        assert!(p4(&off, "", None).unwrap().crushing.is_none());
+    }
+
+    #[test]
+    fn the_suppression_model_and_its_region_keys() {
+        let bp = |region: &str| format!("[background_suppression]\nmodel = \"bolus-position\"\n{region}");
+        let s = with_suppression(&[2.0, 3.2]);
+        let model = |ov: &str| p4(&s, ov, None).map(|p| p.suppression.unwrap().model);
+        assert_eq!(model("").unwrap(), SuppressionModel::GlobalBolus);
+        assert_eq!(model(&bp("pulse_region = \"global\"\n")).unwrap(), SuppressionModel::BolusPosition(Region::Global));
+        assert_eq!(model(&bp("pulse_region = \"slab\"\nslab_entry_time = 0.4\n")).unwrap(), SuppressionModel::BolusPosition(Region::Slab(0.4)));
+        assert_eq!(model(&bp("pulse_region = \"slab\"\nslab_entry_time = \"arrival\"\n")).unwrap(), SuppressionModel::BolusPosition(Region::Arrival));
+        assert!(model(&bp("")).unwrap_err().contains("needs pulse_region"));
+        assert!(model(&bp("pulse_region = \"slab\"\n")).unwrap_err().contains("needs slab_entry_time"));
+        assert!(model(&bp("pulse_region = \"global\"\nslab_entry_time = 0.4\n")).unwrap_err().contains("only with"));
+        assert!(model(&bp("pulse_region = \"slab\"\nslab_entry_time = -0.4\n")).unwrap_err().contains("slab_entry_time"));
+        assert!(model(&bp("pulse_region = \"slab\"\nslab_entry_time = \"later\"\n")).unwrap_err().contains("arrival"));
+        assert!(model(&bp("pulse_region = \"brain\"\n")).unwrap_err().contains("pulse_region"));
+        assert!(model("[background_suppression]\nmodel = \"other\"\n").unwrap_err().contains("model"));
+        assert!(model("[background_suppression]\npulse_region = \"global\"\n").unwrap_err().contains("no effect"));
+        // model keys without suppression
+        assert!(p4(&base(), &bp("pulse_region = \"global\"\n"), None).unwrap_err().contains("BackgroundSuppression true"));
+    }
+
+    #[test]
+    fn partial_bolus_inversion_rules() {
+        // a pulse at 1.5 s, inside the 1.8 s PCASL bolus
+        let early = with_suppression(&[1.5, 3.2]);
+        let bp = |region: &str| format!("[background_suppression]\nmodel = \"bolus-position\"\n{region}");
+        assert!(p4(&early, "", None).unwrap_err().contains("bolus-position"));
+        assert!(p4(&early, &bp("pulse_region = \"slab\"\nslab_entry_time = 0.3\n"), None).is_ok());
+        assert!(p4(&early, &bp("pulse_region = \"slab\"\nslab_entry_time = \"arrival\"\n"), None).is_ok());
+        assert!(p4(&early, &bp("pulse_region = \"global\"\n"), None).unwrap_err().contains("inflowing blood"));
+        // PASL: a global pulse before the cutoff is allowed
+        let mut pasl = with_suppression(&[0.5, 1.5]);
+        pasl["ArterialSpinLabelingType"] = json!("PASL");
+        pasl["BolusCutOffFlag"] = json!(true);
+        pasl["BolusCutOffTechnique"] = json!("Q2TIPS");
+        pasl["BolusCutOffDelayTime"] = json!(0.7);
+        pasl.as_object_mut().unwrap().remove("LabelingDuration");
+        assert!(p4(&pasl, "", None).is_err(), "global-bolus still refuses it");
+        assert!(p4(&pasl, &bp("pulse_region = \"global\"\n"), None).is_ok());
+    }
+
+    #[test]
+    fn physio_and_exchange_inputs() {
+        let s = base();
+        let p = p4(&s, "[physio]\ntissue_cardiac = 0.01\nlabel_drift = 0.02\n", None).unwrap();
+        let ph = p.physio.unwrap();
+        assert_eq!(ph.tissue, [0.01, 0.0, 0.0]);
+        assert_eq!(ph.label, [0.0, 0.0, 0.02]);
+        assert_eq!((ph.cardiac_frequency, ph.respiratory_frequency, ph.drift_time), (1.0, 0.25, 30.0));
+        assert!(p4(&s, "[physio]\ncardiac_frequency = 1.1\n", None).unwrap_err().contains("all six amplitudes zero"));
+        assert!(p4(&s, "[physio]\ntissue_cardiac = 0.01\ncardiac_cv = 0.4\n", None).unwrap_err().contains("cardiac_cv"));
+        assert!(p4(&s, "[physio]\ntissue_cardiac = 0.01\ndrift_time = 0.0\n", None).unwrap_err().contains("drift_time"));
+        assert!(p4(&s, "[physio]\ntissue_cardiac = 0.01\nrespiratory_frequency = -1.0\n", None).unwrap_err().contains("respiratory_frequency"));
+        assert_eq!(p4(&s, "[kinetic]\nexchange_time = 0.5\n", None).unwrap().exchange_time, Some(0.5));
+        assert!(p4(&s, "[kinetic]\nexchange_time = 0.0\n", None).unwrap_err().contains("exchange_time"));
+    }
+
+    #[test]
+    fn every_p4_part_is_refused_under_compat() {
+        let s = compat_base();
+        let ov = |extra: &str| overlay(&format!("[compat]\nasldro = true\n{extra}"));
+        let check = |s: &Value, extra: &str, ph: Option<PhantomParams>, want: &str| {
+            let e = parse(s, COMPAT_CTX, Some(&ov(extra)), ph.as_ref()).unwrap_err();
+            assert!(e.contains(want) && e.contains("simasl"), "{want}: {e}");
+        };
+        check(&s, "[kinetic]\nexchange_time = 0.5\n", None, "part A");
+        check(&s, TABLES, None, "part B");
+        check(&s, "", maps(true, true), "part B");
+        let mut c = compat_base();
+        c["VascularCrushing"] = json!(true);
+        c["VascularCrushingVENC"] = json!(4.0);
+        check(&c, "[vascular_crushing]\nno_arterial_compartment = true\n", None, "part C");
+        check(&s, "[physio]\ntissue_cardiac = 0.01\n", None, "part E");
+        // part D needs suppression, which compat refuses first (P2); the order is fine either way
+        let mut b = compat_base();
+        b["BackgroundSuppression"] = json!(true);
+        b["BackgroundSuppressionNumberPulses"] = json!(0);
+        b["BackgroundSuppressionPulseTime"] = json!([]);
+        let e = parse(&b, COMPAT_CTX, Some(&ov("[background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"global\"\n")), None).unwrap_err();
+        assert!(e.contains("simasl"), "{e}");
     }
 }
