@@ -1,0 +1,20 @@
+{
+  "ArterialSpinLabelingType": "PCASL",
+  "LabelingDuration": 1.8,
+  "PostLabelingDelay": [1.8, 1.8, 1.0, 1.0],
+  "BackgroundSuppression": true,
+  "BackgroundSuppressionNumberPulses": 2,
+  "BackgroundSuppressionPulseTime": [1.5, 2.7],
+  "M0Type": "Absent",
+  "RepetitionTimePreparation": 4.0,
+  "EchoTime": 0.012,
+  "MagneticFieldStrength": 3,
+  "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+  "MRAcquisitionType": "2D",
+  "SliceTiming": [0.0, 0.05],
+  "PhaseEncodingDirection": "j-",
+  "TotalReadoutTime": 0.012,
+  "VascularCrushing": true,
+  "VascularCrushingVENC": [0.0, 0.0, 4.0, 4.0],
+  "LabelingEfficiency": 0.85
+}

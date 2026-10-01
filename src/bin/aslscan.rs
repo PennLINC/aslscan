@@ -101,6 +101,26 @@ fn run() -> Result<(), String> {
             "{}{}", m.mode_name, if m.within.is_some() { " + within-volume events" } else { "" })),
     );
 
+    let mut p4 = Vec::new();
+    if let Some(te) = p.exchange_time {
+        p4.push(format!("exchange {te} s"));
+    }
+    if let Some(m) = &p.macrovascular {
+        p4.push(format!("arterial compartment (T2 {} s, {})", m.t2_arterial.0, m.t2_arterial.1.as_str()));
+    }
+    if let Some(c) = &p.crushing {
+        p4.push(if c.no_arterial_compartment { "crushing (nothing to act on)".to_string() } else { "crushing".to_string() });
+    }
+    if p.suppression.as_ref().is_some_and(|s| s.model != protocol::SuppressionModel::GlobalBolus) {
+        p4.push("bolus-position suppression".to_string());
+    }
+    if p.physio.is_some() {
+        p4.push("physiological noise".to_string());
+    }
+    if !p4.is_empty() {
+        println!("P4: {}", p4.join(", "));
+    }
+
     let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
     let t1 = Instant::now();
     let out = series::simulate(&p, &ph, mode, &phase)?;

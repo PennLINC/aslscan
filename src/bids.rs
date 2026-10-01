@@ -66,7 +66,8 @@ mod writer {
 
     use super::{aslcontext_tsv, ground_truth_tail, Names};
     use crate::phantom::T2Mode;
-    use crate::protocol::{M0Type, Protocol, COMPAT_PINNED};
+    use crate::bolus::Region;
+    use crate::protocol::{M0Type, Protocol, QuantitySource, SuppressionModel, COMPAT_PINNED};
     use crate::resample::GridOrigin;
     use crate::series::SeriesOutput;
 
@@ -182,6 +183,7 @@ mod writer {
         if p.grid_origin != GridOrigin::Corner {
             block["Grid"]["Origin"] = json!(p.grid_origin.as_str());
         }
+        p4_blocks(&mut block, p, out);
         if let (Some(_), Some(f)) = (&p.compat, &out.compat) {
             let mut pinned: Map<String, Value> = COMPAT_PINNED.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
             pinned.insert("window".to_string(), json!("none"));
@@ -208,6 +210,93 @@ mod writer {
             });
         }
         block
+    }
+
+    /// The P4 sidecar blocks (addendum, "Outputs"), each only when its part is on.
+    fn p4_blocks(block: &mut Value, p: &Protocol, out: &SeriesOutput) {
+        if let Some(te) = p.exchange_time {
+            block["Exchange"] = json!({
+                "ExchangeTime": te,
+                "Model": "single pass, irreversible, applied to the GKM kernel per parcel",
+                "Placement": "intravascular label in the blood compartments, exchanged label in the tissue ones",
+            });
+        }
+        if let Some(m) = &p.macrovascular {
+            let q = |s: &QuantitySource, map: &str| match s {
+                QuantitySource::Map => json!({ "Map": map }),
+                QuantitySource::Table(t) => json!(t),
+            };
+            block["Macrovascular"] = json!({
+                "ArterialBloodVolume": q(&m.abv, "abv.nii.gz"),
+                "ArterialTransitTime": q(&m.aatt, "aatt.nii.gz"),
+                "T2Arterial": resolved(m.t2_arterial),
+                "Model": "plug flow, no dispersion (Chappell et al. 2010, the macrovascular term)",
+            });
+            block["CompartmentOrder"] = json!("tissue per label, then labeled blood per label, then arterial blood per label");
+        }
+        if let Some(c) = &p.crushing {
+            let mut v = json!({
+                "Venc": c.venc,
+                "Model": "isotropic laminar: c = Si(pi r) / (pi r), r = v_max / VENC",
+                "VencConvention": "phase pi at VENC (assumed; BIDS defines VascularCrushingVENC as a strength in cm/s)",
+                "Unmodeled": ["crusher eddy currents", "crusher bulk-motion phase", "capillary flow"],
+                "EddyDrive": Value::Null,
+                "PrepPhase": Value::Null,
+            });
+            match (&c.arterial_velocity, &out.crush_survival) {
+                (Some(vel), Some(surv)) => {
+                    v["ArterialVelocity"] = json!(vel);
+                    v["Survival"] = json!(surv);
+                    v["SurvivalOrder"] = json!("per row, per label in Labels order");
+                }
+                _ => {
+                    v["NoArterialCompartment"] = json!(true);
+                    v["Note"] = json!("no arterial compartment: the crushers act on nothing modeled, and the data are \
+                                       the uncrushed simulation");
+                }
+            }
+            block["VascularCrushing"] = v;
+        }
+        if let Some(s) = &p.suppression {
+            if let SuppressionModel::BolusPosition(region) = s.model {
+                let (name, entry) = match region {
+                    Region::Global => ("global", Value::Null),
+                    Region::Slab(d) => ("slab", json!(d)),
+                    Region::Arrival => ("slab", json!("arrival")),
+                };
+                if let Some(o) = block.as_object_mut() {
+                    // no single factor per row under this model: the ground truth carries it
+                    o.remove("BackgroundSuppressionLabelFactor");
+                }
+                block["BackgroundSuppressionModel"] = json!("bolus-position");
+                block["BackgroundSuppression"] = json!({
+                    "Model": "bolus-position",
+                    "ModelNote": "a pulse acts on a parcel of label once it is inside the pulse's region; the \
+                                  bolus is a sum of sub-boluses weighted by their factors (P4 addendum, part D)",
+                    "PulseRegion": name,
+                    "SlabEntryTime": entry,
+                    "InversionEfficiency": resolved(s.epsilon),
+                    "Presaturation": { "Value": s.presaturation.0, "Source": s.presaturation.1.as_str() },
+                    "FirstPldPulseTimesAppliedToAll": s.first_pld_applied_to_all,
+                    "PulseTimesPerRow": s.per_row,
+                    "TissueModel": "signed longitudinal timeline per acquired slice; m0scan rows unsuppressed",
+                    "EffectiveFactor": "desc-deltamSuppressed_gt over desc-deltam_gt, per voxel and row",
+                });
+            }
+        }
+        if let Some(ph) = &p.physio {
+            block["Physio"] = json!({
+                "TissueAmplitudes": { "Cardiac": ph.tissue[0], "Respiratory": ph.tissue[1], "Drift": ph.tissue[2] },
+                "LabelAmplitudes": { "Cardiac": ph.label[0], "Respiratory": ph.label[1], "Drift": ph.label[2] },
+                "CardiacFrequency": ph.cardiac_frequency, "CardiacCv": ph.cardiac_cv,
+                "RespiratoryFrequency": ph.respiratory_frequency, "RespiratoryCv": ph.respiratory_cv,
+                "DriftTime": ph.drift_time, "DriftGridStep": crate::physio::DRIFT_STEP,
+                "Seed": p.seed, "SeedSalt": format!("{:#x}", crate::physio::PHYSIO_SEED_SALT),
+                "Model": "global factors 1 + a_c sin(phi_c) + a_r sin(phi_r) + a_d x: the tissue's at each slice's \
+                          readout, the label's averaged over the labeling window ((P)CASL) or at labeling (PASL)",
+                "GroundTruth": "desc-physio_gt.tsv",
+            });
+        }
     }
 
     /// Write the whole dataset under `root`.
@@ -339,11 +428,15 @@ mod writer {
                 }
             }
             m0side.insert("FlipAngle".to_string(), json!(90.0));
-            m0side.insert("AslscanSimulation".to_string(), json!({
+            let mut m0sim = json!({
                 "Seed": out.seeds.1, "Magnitude": true, "Contrast": "se",
                 "Note": "a plain spin-echo readout at its own repetition time: no suppression, no inversion, no motion",
                 "InputValuesReplaced": m0_replaced,
-            }));
+            });
+            if p.physio.is_some() {
+                m0sim["Physio"] = json!("not applied: the separate M0 scan is not a row of the series' clock");
+            }
+            m0side.insert("AslscanSimulation".to_string(), m0sim);
             write_json(&PathBuf::from(format!("{prefix_s}_m0scan.json")), &Value::Object(m0side))?;
         }
 
@@ -384,6 +477,39 @@ mod writer {
                 "Description": "+delta_m at each label/deltam row's own timing, unmoved, box-averaged; zero for other rows",
                 "Resampling": mean,
             }))?;
+        }
+        // P4 ground truth (addendum, "Outputs"): each names the stages it includes.
+        let frame = if moved { "moved by each row's pose like desc-deltam_gt" } else { "static" };
+        for (desc, data, stages) in [
+            ("deltamIntravascular", &gt.delta_m_iv, "kinetics and the exchange split (part A); no pulse or physiological factor"),
+            ("deltamSuppressed", &gt.delta_m_suppressed, "kinetics and the bolus-position pulse factors (part D), both parts of the tissue label"),
+            ("deltamArterial", &gt.delta_m_arterial, "the arterial term with parcel factor 1 (part B), before crushing"),
+        ] {
+            if let Some(d) = data {
+                write_4d(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.nii.gz")), out.acq_grid.dims, out.n_volumes, d, &out.acq_grid)
+                    .map_err(|e| e.to_string())?;
+                write_json(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.json")), &json!({
+                    "Units": "arbitrary (same as M0map)", "Stages": stages, "Frame": frame, "Resampling": mean,
+                }))?;
+            }
+        }
+        if let Some(a) = &gt.abv {
+            wgt("aBV", a, "fraction", mean)?;
+        }
+        if let Some(a) = &gt.aatt {
+            wgt("aATT", a, "s", "volume-weighted mean over phantom voxels with aBV > 0; 0 where none")?;
+        }
+        if let Some(lines) = &out.physio {
+            let mut tsv = String::from(
+                "volume\tslice\ttime\tcardiac_phase\trespiratory_phase\tdrift\ttissue_factor\tlabel_window_start\t\
+                 label_window_end\tlabel_mean_sin_cardiac\tlabel_mean_sin_respiratory\tlabel_mean_drift\tlabel_factor\n");
+            for l in lines {
+                tsv.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", l.volume, l.slice, l.time, l.cardiac_phase,
+                    l.respiratory_phase, l.drift, l.tissue_factor, l.label_window.0, l.label_window.1, l.label_means[0],
+                    l.label_means[1], l.label_means[2], l.label_factor));
+            }
+            std::fs::write(format!("{gt_prefix}_desc-physio_gt.tsv"), tsv).map_err(|e| e.to_string())?;
         }
         if p.motion.is_some() {
             let mut tsv = String::from("volume\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");

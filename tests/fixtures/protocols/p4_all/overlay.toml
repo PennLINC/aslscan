@@ -1,0 +1,29 @@
+# Every P4 part on (P4 plan, Task 7): slab suppression with a pulse during labeling, crushing
+# alternating per PLD, exchange, per-label arterial values whose windows contain the readouts
+# (PLD 1.0: t = 2.8; PLD 1.8: t = 3.6), and physiological noise. For the crop phantom.
+seed = 11
+
+[acquisition]
+oversample = 2
+signal_scale = 100.0
+
+[background_suppression]
+model = "bolus-position"
+pulse_region = "slab"
+slab_entry_time = 0.3
+
+[kinetic]
+exchange_time = 0.4
+
+[macrovascular]
+arterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }
+arterial_transit_time = { grey_matter = 2.2, white_matter = 2.4, csf = 0.0 }
+
+[vascular_crushing]
+arterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }
+
+[physio]
+tissue_cardiac = 0.02
+tissue_respiratory = 0.01
+label_cardiac = 0.03
+label_drift = 0.01

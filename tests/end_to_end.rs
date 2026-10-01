@@ -188,6 +188,69 @@ fn compat_benchmark_a_on_the_crop() {
     }
 }
 
+/// A PCASL protocol on the crop with every P4 part on: two slab suppression pulses (one during
+/// labeling), crushing alternating 0 / 4 cm/s, exchange, per-label arterial values whose windows
+/// contain the readout, and physiological noise.
+fn p4_all(rows: &str, extra: &str) -> Protocol {
+    let n = rows.split(',').count();
+    let venc: Vec<f64> = (0..n).map(|i| if i % 2 == 0 { 0.0 } else { 4.0 }).collect();
+    let s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": true, "BackgroundSuppressionNumberPulses": 2,
+        "BackgroundSuppressionPulseTime": [1.5, 3.2], "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
+        "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05], "PhaseEncodingDirection": "j-",
+        "TotalReadoutTime": 0.012, "VascularCrushing": true, "VascularCrushingVENC": venc
+    });
+    let ov: Overlay = toml::from_str(&format!(
+        "seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n\
+         [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n\
+         [kinetic]\nexchange_time = 0.4\n\
+         [macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }}\n\
+         arterial_transit_time = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n\
+         [vascular_crushing]\narterial_velocity = {{ grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }}\n\
+         [physio]\ntissue_cardiac = 0.02\ntissue_respiratory = 0.01\nlabel_cardiac = 0.03\nlabel_drift = 0.01\n{extra}"
+    )).unwrap();
+    let ctx = format!("volume_type\n{}\n", rows.split(',').collect::<Vec<_>>().join("\n"));
+    parse(&s, &ctx, Some(&ov), crop().params.as_ref()).unwrap()
+}
+
+#[test]
+fn p4_sidecar_blocks_and_ground_truth_files() {
+    let p = p4_all("control,label,control,label", "");
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-p4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("sub-01/perf/sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    let sim = &side["AslscanSimulation"];
+    assert_eq!(sim["Exchange"]["ExchangeTime"], json!(0.4));
+    assert_eq!(sim["Macrovascular"]["T2Arterial"]["Source"], json!("T2Blood"));
+    assert_eq!(sim["Macrovascular"]["ArterialBloodVolume"]["grey_matter"], json!(0.03));
+    assert!(sim["CompartmentOrder"].as_str().unwrap().contains("arterial"));
+    assert_eq!(sim["VascularCrushing"]["Venc"], json!([0.0, 4.0, 0.0, 4.0]));
+    let surv = sim["VascularCrushing"]["Survival"].as_array().unwrap();
+    assert_eq!(surv.len(), 4);
+    assert_eq!(surv[0][0], json!(1.0));
+    assert!(surv[1][0].as_f64().unwrap() < 1.0);
+    assert_eq!(sim["BackgroundSuppressionModel"], json!("bolus-position"));
+    assert_eq!(sim["BackgroundSuppression"]["PulseRegion"], json!("slab"));
+    assert_eq!(sim["BackgroundSuppression"]["SlabEntryTime"], json!(0.3));
+    assert!(sim.get("BackgroundSuppressionLabelFactor").is_none());
+    assert_eq!(sim["Physio"]["SeedSalt"], json!("0x50485953494f"));
+    // the standard fields are echoed as given
+    assert_eq!(side["VascularCrushing"], json!(true));
+    assert_eq!(side["VascularCrushingVENC"], json!([0.0, 4.0, 0.0, 4.0]));
+    let gt = dir.join("sub-01/perf/ground-truth");
+    for f in ["deltamIntravascular", "deltamSuppressed", "deltamArterial", "aBV", "aATT"] {
+        assert!(gt.join(format!("sub-01_desc-{f}_gt.nii.gz")).exists(), "{f}");
+        assert!(gt.join(format!("sub-01_desc-{f}_gt.json")).exists(), "{f}");
+    }
+    let tsv = std::fs::read_to_string(gt.join("sub-01_desc-physio_gt.tsv")).unwrap();
+    assert_eq!(tsv.lines().count(), 1 + 4 * 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn compat_sidecar_names_every_pinned_value() {
     let s = json!({
