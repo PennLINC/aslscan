@@ -50,6 +50,13 @@ fn div0(n: f64, d: f64) -> f64 {
 /// for `t <= 0`, where simasl's chained comparison makes every mask false and the zero-initialised
 /// output is never written.
 pub fn delta_m(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t: f64) -> f64 {
+    let (f, m0b, t1p) = gkm_constants(k, f_ml_100g_min, t1t, m0);
+    gkm_body(k, f, m0b, dt, t1p, t)
+}
+
+/// `f` (per second), `M0b` and `T1'`, with simasl's guards.
+#[inline]
+fn gkm_constants(k: &Kinetic, f_ml_100g_min: f64, t1t: f64, m0: f64) -> (f64, f64, f64) {
     let f = f_ml_100g_min / 6000.0;
     // M0b and f/lambda, with simasl's scalar guard on lambda (gkm_filter.py:135-147).
     let (m0b, flow_over_lambda) =
@@ -57,7 +64,20 @@ pub fn delta_m(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t: f
     // 1/T1' = 1/T1t + f/lambda, both divisions guarded (gkm_filter.py:149-153).
     let denom = div0(1.0, t1t) + flow_over_lambda;
     let t1p = div0(1.0, denom);
+    (f, m0b, t1p)
+}
 
+/// [`delta_m`] with `T1'` given rather than derived from the tissue `T1` (P4 addendum, part A:
+/// the intravascular part is the GKM with `T1'` replaced by `T1''`). The same delivery masks,
+/// branches and guards; the arithmetic of [`delta_m`] is this function's.
+pub fn delta_m_with_t1p(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1p: f64, m0: f64, t: f64) -> f64 {
+    let f = f_ml_100g_min / 6000.0;
+    let m0b = if k.lambda != 0.0 { m0 / k.lambda } else { 0.0 };
+    gkm_body(k, f, m0b, dt, t1p, t)
+}
+
+#[inline]
+fn gkm_body(k: &Kinetic, f: f64, m0b: f64, dt: f64, t1p: f64, t: f64) -> f64 {
     // Delivery state. simasl builds three masks and writes the arriving and arrived results
     // into a zero-initialised array; the not-arrived mask only ever writes zero.
     let arriving = dt < t && t < dt + k.tau;
@@ -97,6 +117,99 @@ pub fn delta_m(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t: f
             }
         }
     }
+}
+
+/// The sub-bolus of parcels `a..b` (in `[0, tau]`; P4 addendum, "the one idea"): (P)CASL
+/// parcels labeled in `[a, b]` are a GKM bolus of duration `b - a` started `a` later (the
+/// transit decay is the same for every parcel); PASL parcels arriving in `[ATT + a, ATT + b]`
+/// are a GKM bolus with `ATT' = ATT + a` and no shift. The uncut sub-bolus (`a = 0`,
+/// `b = tau`) calls [`delta_m`] with the original arguments, so the P1 path is the P1 code.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_m_sub(k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, t: f64, a: f64, b: f64) -> f64 {
+    if a == 0.0 && b == k.tau {
+        return delta_m(k, f, dt, t1t, m0, t);
+    }
+    let ks = Kinetic { tau: b - a, ..*k };
+    match k.label_type {
+        LabelType::Pasl => delta_m(&ks, f, dt + a, t1t, m0, t),
+        LabelType::Casl | LabelType::Pcasl => delta_m(&ks, f, dt, t1t, m0, t - a),
+    }
+}
+
+/// `T1''` of the intravascular part: `1/T1'' = 1/T1' + 1/tau_ex`, with `T1'` guarded as
+/// [`delta_m`] guards it. `None` where `T1'` is the guarded zero, which only happens where
+/// `f/lambda` is zero and the GKM is therefore zero too.
+fn t1pp(k: &Kinetic, f_ml_100g_min: f64, t1t: f64, m0: f64, tau_ex: f64) -> Option<(f64, f64, f64)> {
+    let (f, m0b, t1p) = gkm_constants(k, f_ml_100g_min, t1t, m0);
+    if t1p == 0.0 {
+        return None;
+    }
+    Some((f, m0b, 1.0 / (1.0 / t1p + 1.0 / tau_ex)))
+}
+
+/// The intravascular part of [`delta_m`] (P4 addendum, part A): each parcel resident for `s`
+/// has not yet exchanged with probability `exp(-s/tau_ex)`, which makes it the GKM with `T1'`
+/// replaced by `T1''`. (P)CASL is [`delta_m_with_t1p`]'s arithmetic. PASL is not: its branch
+/// forms `exp(kk t)` and `exp(-kk dt)` separately, and with `T1''` short `kk` is large and
+/// negative, so those overflow to `0 * (inf - inf)`; here the exponents are combined, which is
+/// the same quantity and finite for every `tau_ex`.
+pub fn delta_m_iv(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t: f64, tau_ex: f64) -> f64 {
+    let Some((f, m0b, t1pp)) = t1pp(k, f_ml_100g_min, t1t, m0, tau_ex) else { return 0.0 };
+    match k.label_type {
+        LabelType::Casl | LabelType::Pcasl => gkm_body(k, f, m0b, dt, t1pp, t),
+        LabelType::Pasl => pasl_stable(k, f, m0b, dt, t1pp, t),
+    }
+}
+
+/// [`delta_m_iv`] of the sub-bolus `a..b`, by the shifts of [`delta_m_sub`].
+#[allow(clippy::too_many_arguments)]
+pub fn delta_m_iv_sub(k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, t: f64, a: f64, b: f64, tau_ex: f64) -> f64 {
+    if a == 0.0 && b == k.tau {
+        return delta_m_iv(k, f, dt, t1t, m0, t, tau_ex);
+    }
+    let ks = Kinetic { tau: b - a, ..*k };
+    match k.label_type {
+        LabelType::Pasl => delta_m_iv(&ks, f, dt + a, t1t, m0, t, tau_ex),
+        LabelType::Casl | LabelType::Pcasl => delta_m_iv(&ks, f, dt, t1t, m0, t - a, tau_ex),
+    }
+}
+
+/// The PASL branch of [`gkm_body`] with `exp(kk t) (exp(-kk x) - exp(-kk y))` evaluated as
+/// `exp(kk (t - x)) - exp(kk (t - y))` (and `expm1` when `y = t`): the same masks and guards.
+fn pasl_stable(k: &Kinetic, f: f64, m0b: f64, dt: f64, t1p: f64, t: f64) -> f64 {
+    let arriving = dt < t && t < dt + k.tau;
+    let arrived = t >= dt + k.tau;
+    if !(arriving || arrived) {
+        return 0.0;
+    }
+    let kk = (if k.t1b != 0.0 { 1.0 / k.t1b } else { 0.0 }) - div0(1.0, t1p);
+    let decay = if k.t1b > 0.0 { (-t / k.t1b).exp() } else { 0.0 };
+    if arriving {
+        let num = (kk * (t - dt)).exp_m1();
+        let q = div0(num, kk * (t - dt));
+        2.0 * m0b * f * (t - dt) * k.alpha * decay * q
+    } else {
+        let num = (kk * (t - dt)).exp() - (kk * (t - dt - k.tau)).exp();
+        let q = div0(num, kk * k.tau);
+        2.0 * m0b * f * k.alpha * k.tau * decay * q
+    }
+}
+
+/// The arterial (macrovascular) difference magnetization (P4 addendum, part B), with the
+/// parcel factor `g = 1`: `2 alpha M0b aBV exp(-aATT/T1b)` for (P)CASL and
+/// `2 alpha M0b aBV exp(-t/T1b)` for PASL, inside `aATT <= t < aATT + tau`, zero outside, with
+/// the GKM's `lambda` and `T1b` guards. Returns the value and the sub-bolus coordinate of the
+/// parcel the voxel's arteries hold (`t - aATT` for both labeling types), `None` outside.
+pub fn arterial_dm(k: &Kinetic, abv: f64, aatt: f64, m0: f64, t: f64) -> (f64, Option<f64>) {
+    if !(aatt <= t && t < aatt + k.tau) {
+        return (0.0, None);
+    }
+    let m0b = if k.lambda != 0.0 { m0 / k.lambda } else { 0.0 };
+    let decay = match k.label_type {
+        LabelType::Pasl => if k.t1b > 0.0 { (-t / k.t1b).exp() } else { 0.0 },
+        LabelType::Casl | LabelType::Pcasl => if k.t1b != 0.0 { (-aatt / k.t1b).exp() } else { 0.0 },
+    };
+    (2.0 * k.alpha * m0b * abv * decay, Some(t - aatt))
 }
 
 #[cfg(test)]
@@ -278,5 +391,263 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------ P4
+
+    /// `delta_m` exactly as it was before the P4 refactor (`p2-complete`): the bit-identity reference.
+    fn delta_m_ref(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t: f64) -> f64 {
+        let f = f_ml_100g_min / 6000.0;
+        // M0b and f/lambda, with simasl's scalar guard on lambda (gkm_filter.py:135-147).
+        let (m0b, flow_over_lambda) =
+            if k.lambda != 0.0 { (m0 / k.lambda, f / k.lambda) } else { (0.0, 0.0) };
+        // 1/T1' = 1/T1t + f/lambda, both divisions guarded (gkm_filter.py:149-153).
+        let denom = div0(1.0, t1t) + flow_over_lambda;
+        let t1p = div0(1.0, denom);
+
+        // Delivery state. simasl builds three masks and writes the arriving and arrived results
+        // into a zero-initialised array; the not-arrived mask only ever writes zero.
+        let arriving = dt < t && t < dt + k.tau;
+        let arrived = t >= dt + k.tau;
+        if !(arriving || arrived) {
+            return 0.0;
+        }
+
+        match k.label_type {
+            LabelType::Pasl => {
+                // k = 1/T1b - 1/T1', with the scalar guard on T1b (gkm_filter.py:168-170).
+                let kk = (if k.t1b != 0.0 { 1.0 / k.t1b } else { 0.0 }) - div0(1.0, t1p);
+                // The arterial decay factor is replaced by ZERO (not the quotient) for T1b <= 0
+                // (gkm_filter.py:205, :218): `exp(-t/T1b) if t1b > 0 else 0`.
+                let decay = if k.t1b > 0.0 { (-t / k.t1b).exp() } else { 0.0 };
+                if arriving {
+                    // q_pasl_arriving, numerator and denominator computed separately so that
+                    // t == dt cannot divide by zero (it is masked out anyway) (gkm_filter.py:173-185).
+                    let num = (kk * t).exp() * ((-kk * dt).exp() - (-kk * t).exp());
+                    let q = div0(num, kk * (t - dt));
+                    2.0 * m0b * f * (t - dt) * k.alpha * decay * q
+                } else {
+                    let num = (kk * t).exp() * ((-kk * dt).exp() - (-kk * (dt + k.tau)).exp());
+                    let q = div0(num, kk * k.tau);
+                    2.0 * m0b * f * k.alpha * k.tau * decay * q
+                }
+            }
+            LabelType::Casl | LabelType::Pcasl => {
+                // Here the T1b test is `!= 0`, not `> 0` (gkm_filter.py:252, :265).
+                let decay = if k.t1b != 0.0 { (-dt / k.t1b).exp() } else { 0.0 };
+                if arriving {
+                    let q = 1.0 - (-div0(t - dt, t1p)).exp();
+                    2.0 * m0b * f * t1p * k.alpha * decay * q
+                } else {
+                    let q = 1.0 - (-div0(k.tau, t1p)).exp();
+                    2.0 * m0b * f * t1p * k.alpha * decay * (-div0(t - k.tau - dt, t1p)).exp() * q
+                }
+            }
+        }
+    }
+
+    const KS: [(f64, f64, f64, f64); 4] = [(60.0, 0.8, 1.33, 74.622), (20.0, 1.2, 0.83, 60.0), (0.0, 1000.0, 3.0, 90.0), (45.0, 0.5, 1.1, 1.0)];
+
+    fn kinds() -> Vec<Kinetic> {
+        vec![
+            K_PCASL, K_PASL,
+            Kinetic { label_type: LabelType::Casl, ..K_PCASL },
+            Kinetic { lambda: 0.0, ..K_PCASL }, Kinetic { lambda: 0.0, ..K_PASL },
+            Kinetic { t1b: 0.0, ..K_PCASL }, Kinetic { t1b: 0.0, ..K_PASL },
+            Kinetic { t1b: -1.0, ..K_PCASL }, Kinetic { t1b: -1.0, ..K_PASL },
+        ]
+    }
+
+    #[test]
+    fn delta_m_keeps_its_bits_after_the_refactor() {
+        let mut n = 0;
+        for k in kinds() {
+            for &(f, dt, t1t, m0) in &KS {
+                for i in 0..=6000 {
+                    let t = i as f64 * 1e-3;
+                    let (a, b) = (delta_m(&k, f, dt, t1t, m0, t), delta_m_ref(&k, f, dt, t1t, m0, t));
+                    assert_eq!(a.to_bits(), b.to_bits(), "{k:?} f {f} dt {dt} t {t}: {a:e} vs {b:e}");
+                    n += 1;
+                }
+            }
+        }
+        // the zero-T1 tissue case and t on every mask edge
+        for k in kinds() {
+            for t in [0.8, 0.8 + k.tau, 0.0, -1.0] {
+                assert_eq!(delta_m(&k, 60.0, 0.8, 0.0, 74.6, t).to_bits(), delta_m_ref(&k, 60.0, 0.8, 0.0, 74.6, t).to_bits());
+            }
+        }
+        assert!(n > 200_000);
+    }
+
+    /// A deterministic pseudo-random partition of `[0, tau]` with 2..6 cuts, plus `extra` cuts.
+    fn partition(seed: u64, tau: f64, extra: &[f64]) -> Vec<f64> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let ncut = 2 + (next() * 5.0) as usize;
+        let mut cuts: Vec<f64> = (0..ncut).map(|_| next() * tau).collect();
+        cuts.extend(extra.iter().copied().filter(|c| *c > 0.0 && *c < tau));
+        cuts.push(0.0);
+        cuts.push(tau);
+        cuts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        cuts.dedup();
+        cuts
+    }
+
+    /// `x` and its representable neighbours.
+    fn around(x: f64) -> [f64; 3] {
+        [f64::from_bits(x.to_bits() - 1), x, f64::from_bits(x.to_bits() + 1)]
+    }
+
+    #[test]
+    fn sub_boluses_sum_to_the_whole_bolus() {
+        let mut worst = 0.0f64;
+        for k in [K_PCASL, K_PASL, Kinetic { label_type: LabelType::Casl, ..K_PCASL }] {
+            for &(f, dt, t1t, m0) in &KS[..2] {
+                let peak = (0..=6000).map(|i| delta_m(&k, f, dt, t1t, m0, i as f64 * 1e-3).abs()).fold(0.0f64, f64::max);
+                let mut times: Vec<f64> = (0..=600).map(|i| i as f64 * 1e-2).collect();
+                for e in [dt, dt + k.tau] {
+                    times.extend(around(e));
+                }
+                for (pi, &t) in times.iter().enumerate() {
+                    // cuts at the representable neighbours of the delivery edges in the
+                    // sub-bolus coordinate, as well as random ones
+                    let edge = t - dt;
+                    let extra: Vec<f64> = around(edge).iter().chain(around(edge - k.tau).iter()).copied().collect();
+                    let cuts = partition(pi as u64 + 17, k.tau, &extra);
+                    let sum: f64 = cuts.windows(2).map(|w| delta_m_sub(&k, f, dt, t1t, m0, t, w[0], w[1])).sum();
+                    let whole = delta_m(&k, f, dt, t1t, m0, t);
+                    if t <= dt {
+                        assert_eq!(whole, 0.0);
+                        assert_eq!(sum, 0.0, "{k:?} t {t}: not arrived must stay an exact zero");
+                    }
+                    let e = (sum - whole).abs() / peak;
+                    worst = worst.max(e);
+                    assert!(e <= 1e-12, "{k:?} f {f} t {t}: {sum:e} vs {whole:e} ({e:e} of peak)");
+                }
+            }
+        }
+        println!("sub-bolus partition identity: worst {worst:.2e} of peak");
+        // the uncut sub-bolus is delta_m itself, bit for bit
+        for t in [1.0, 2.0, 3.6, 5.0] {
+            assert_eq!(delta_m_sub(&K_PCASL, 60.0, 0.8, 1.33, 74.6, t, 0.0, K_PCASL.tau).to_bits(),
+                       delta_m(&K_PCASL, 60.0, 0.8, 1.33, 74.6, t).to_bits());
+            assert_eq!(delta_m_sub(&K_PASL, 60.0, 0.8, 1.33, 74.6, t, 0.0, K_PASL.tau).to_bits(),
+                       delta_m(&K_PASL, 60.0, 0.8, 1.33, 74.6, t).to_bits());
+        }
+    }
+
+    #[test]
+    fn intravascular_part_is_partition_invariant_and_bounded() {
+        for k in [K_PCASL, K_PASL] {
+            for tau_ex in [0.05, 0.5, 3.0] {
+                let peak = (0..=600).map(|i| delta_m(&k, F, DT, T1T, M0, i as f64 * 1e-2)).fold(0.0f64, f64::max);
+                for i in 0..=600 {
+                    let t = i as f64 * 1e-2;
+                    let dm = delta_m(&k, F, DT, T1T, M0, t);
+                    let iv = delta_m_iv(&k, F, DT, T1T, M0, t, tau_ex);
+                    assert!(iv.is_finite() && iv >= 0.0 && iv <= dm * (1.0 + 1e-12),
+                            "{k:?} tau_ex {tau_ex} t {t}: iv {iv} dm {dm}");
+                    let cuts = partition(i as u64 + 5, k.tau, &[]);
+                    let sum: f64 = cuts.windows(2).map(|w| delta_m_iv_sub(&k, F, DT, T1T, M0, t, w[0], w[1], tau_ex)).sum();
+                    assert!((sum - iv).abs() <= 1e-12 * peak, "{k:?} tau_ex {tau_ex} t {t}: {sum:e} vs {iv:e}");
+                    if t <= DT {
+                        assert_eq!(iv, 0.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn intravascular_part_limits_are_finite_in_both_branches() {
+        for k in [K_PCASL, K_PASL] {
+            // slow exchange: everything stays intravascular
+            for t in [1.0, 1.4, 2.0, 3.6] {
+                let dm = delta_m(&k, F, DT, T1T, M0, t);
+                let iv = delta_m_iv(&k, F, DT, T1T, M0, t, 1e9);
+                assert!((iv - dm).abs() <= 1e-8 * dm, "{k:?} t {t}: {iv} vs {dm}");
+            }
+            // fast exchange: just-arrived label has not exchanged yet; a second later it has
+            let t = DT + 1e-7;
+            let share = delta_m_iv(&k, F, DT, T1T, M0, t, 1e-6) / delta_m(&k, F, DT, T1T, M0, t);
+            assert!((share - 0.95).abs() < 0.01, "{k:?}: share {share} at ATT + 1e-7");
+            // both delivery branches at tau_ex = 1e-6 are finite (the shared PASL form gives NaN)
+            for t in [DT + 0.3, DT + k.tau + 0.5, DT + 1.0] {
+                let iv = delta_m_iv(&k, F, DT, T1T, M0, t, 1e-6);
+                let dm = delta_m(&k, F, DT, T1T, M0, t);
+                assert!(iv.is_finite(), "{k:?} t {t}: {iv}");
+                if t >= DT + 1.0 {
+                    assert!(iv / dm < 2e-6, "{k:?} t {t}: share {}", iv / dm);
+                }
+            }
+        }
+        // the PASL shared form really is the trap the stable form avoids
+        let t1p = t1_prime(F, T1T, 0.9);
+        let t1pp = 1.0 / (1.0 / t1p + 1e6);
+        assert!(delta_m_with_t1p(&K_PASL, F, DT, t1pp, M0, DT + 1e-7).is_nan());
+    }
+
+    #[test]
+    fn stable_pasl_form_equals_the_shared_form_where_that_is_finite() {
+        let t1p = t1_prime(F, T1T, 0.9);
+        for tau_ex in [0.2, 1.0, 10.0] {
+            let t1pp = 1.0 / (1.0 / t1p + 1.0 / tau_ex);
+            for i in 0..=400 {
+                let t = i as f64 * 1e-2;
+                let a = delta_m_iv(&K_PASL, F, DT, T1T, M0, t, tau_ex);
+                let b = delta_m_with_t1p(&K_PASL, F, DT, t1pp, M0, t);
+                assert!(a == b || (a - b).abs() <= 1e-12 * b.abs(), "t {t}: {a:e} vs {b:e}");
+            }
+        }
+        // and delta_m_with_t1p at the GKM's own T1' is delta_m
+        for t in [1.2, 2.0, 3.6] {
+            assert_eq!(delta_m_with_t1p(&K_PCASL, F, DT, t1p, M0, t).to_bits(), delta_m(&K_PCASL, F, DT, T1T, M0, t).to_bits());
+        }
+    }
+
+    #[test]
+    fn intravascular_guards_give_the_gkm_zeros() {
+        for k in [Kinetic { lambda: 0.0, ..K_PCASL }, Kinetic { lambda: 0.0, ..K_PASL }, Kinetic { t1b: 0.0, ..K_PCASL },
+                  Kinetic { t1b: 0.0, ..K_PASL }, Kinetic { t1b: -1.0, ..K_PASL }] {
+            for t in [1.2, 2.0, 3.6] {
+                assert_eq!(delta_m(&k, F, DT, T1T, M0, t), 0.0);
+                assert_eq!(delta_m_iv(&k, F, DT, T1T, M0, t, 0.5), 0.0, "{k:?} t {t}");
+            }
+        }
+        // zero flow and zero tissue T1: T1' is the guarded zero
+        assert_eq!(delta_m_iv(&K_PCASL, 0.0, DT, 0.0, M0, 3.6, 0.5), 0.0);
+    }
+
+    #[test]
+    fn arterial_term_follows_its_closed_forms() {
+        let (abv, aatt) = (0.02, 0.5);
+        for t in [0.5, 1.0, 2.29] {
+            let (v, a) = arterial_dm(&K_PCASL, abv, aatt, M0, t);
+            let want = 2.0 * 0.85 * (M0 / 0.9) * abv * (-aatt / 1.65f64).exp();
+            assert!(close(v, want, 1e-14), "t {t}");
+            assert_eq!(a, Some(t - aatt));
+        }
+        for t in [0.5, 0.9, 1.19] {
+            let (v, a) = arterial_dm(&K_PASL, abv, aatt, M0, t);
+            let want = 2.0 * 0.98 * (M0 / 0.9) * abv * (-t / 1.65f64).exp();
+            assert!(close(v, want, 1e-14), "t {t}");
+            assert_eq!(a, Some(t - aatt));
+        }
+        // the window: [aatt, aatt + tau)
+        assert_eq!(arterial_dm(&K_PCASL, abv, aatt, M0, aatt - 1e-12), (0.0, None));
+        assert_eq!(arterial_dm(&K_PCASL, abv, aatt, M0, aatt + 1.8), (0.0, None));
+        assert!(arterial_dm(&K_PCASL, abv, aatt, M0, aatt).0 > 0.0);
+        // guards
+        assert_eq!(arterial_dm(&Kinetic { lambda: 0.0, ..K_PCASL }, abv, aatt, M0, 1.0).0, 0.0);
+        assert_eq!(arterial_dm(&Kinetic { t1b: 0.0, ..K_PCASL }, abv, aatt, M0, 1.0).0, 0.0);
+        assert_eq!(arterial_dm(&Kinetic { t1b: -1.0, ..K_PASL }, abv, aatt, M0, 1.0).0, 0.0);
+        assert!(arterial_dm(&Kinetic { t1b: -1.0, ..K_PCASL }, abv, aatt, M0, 1.0).0 > 0.0,
+                "(P)CASL tests != 0, as the GKM does");
     }
 }
