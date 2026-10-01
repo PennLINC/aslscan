@@ -38,7 +38,7 @@ use crate::longitudinal::{label_factor, tissue_mz};
 use crate::mrsignal::{blood_ir, blood_se, tissue_ir, tissue_se, Contrast};
 use crate::phantom::{Phantom, Relaxation, T2Mode};
 use crate::protocol::{M0Type, Protocol, Row, RowKind, WithinVolume};
-use crate::resample::{acquisition_grid, axis_aligned_voxels, Resampler};
+use crate::resample::{acquisition_grid, axis_aligned_voxels, corner_offset, Resampler};
 use crate::rng::SplitMix64;
 
 /// The seed the separate M0 scan's call uses, derived from the series seed so the two calls
@@ -201,7 +201,7 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
 
     // ---- grids ----
     let pv = axis_aligned_voxels(&ph.grid)?;
-    let acq_grid = acquisition_grid(&ph.grid, p.voxel_size_mm, p.acq.matrix)?;
+    let acq_grid = acquisition_grid(&ph.grid, p.voxel_size_mm, p.acq.matrix, p.grid_origin)?;
     let o = p.acq.oversample;
     let sim_grid = hires_grid(&acq_grid, o);
     let [nx, ny, nz] = acq_grid.dims;
@@ -213,8 +213,9 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
     }
     let dv = p.voxel_size_mm;
     let sim_vox = [dv[0] / o as f64, dv[1] / o as f64, dv[2]];
-    let r_sim = Resampler::new(ph.grid.dims, pv, sim_grid.dims, sim_vox);
-    let r_acq = Resampler::new(ph.grid.dims, pv, acq_grid.dims, dv);
+    let off = corner_offset(&ph.grid, &acq_grid)?;
+    let r_sim = Resampler::with_offset(ph.grid.dims, pv, sim_grid.dims, sim_vox, off);
+    let r_acq = Resampler::with_offset(ph.grid.dims, pv, acq_grid.dims, dv, off);
     let nvox_sim = snx * sny * nz;
     let nvox_acq = nx * ny * nz;
 

@@ -20,6 +20,7 @@ use serde_json::Value;
 use crate::kinetic::{Kinetic, LabelType};
 use crate::longitudinal::Suppression;
 use crate::mrsignal::{parse_contrast, Contrast, IrParams};
+use crate::resample::GridOrigin;
 pub use crate::rows::{Row, RowKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +118,47 @@ pub struct Overlay {
     pub m0: Option<M0Overlay>,
     pub background_suppression: Option<SuppressionOverlay>,
     pub motion: Option<MotionOverlay>,
+    pub compat: Option<CompatOverlay>,
 }
+
+/// `[compat]` (P2 addendum, part A).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompatOverlay {
+    /// Pin the acquisition to what simasl (ASLDRO v2.2.0) can express; the CLI's
+    /// `--compat-asldro` sets it.
+    pub asldro: Option<bool>,
+    /// simasl's SNR, converted to the acquisition's noise variance; 0 or absent is no noise.
+    /// Read only with `asldro = true`.
+    pub desired_snr: Option<f64>,
+    /// `"corner"` (P1) or `"voxel-centre"` (simasl); default `voxel-centre` under `asldro`,
+    /// `corner` otherwise.
+    pub grid_origin: Option<String>,
+}
+
+/// The resolved compat mode (`asldro = true`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompatSpec {
+    /// `None` when absent or 0: no noise.
+    pub desired_snr: Option<f64>,
+}
+
+/// The acquisition values `asldro = true` pins, as `(overlay key, value)`: what simasl's
+/// acquisition can express (no readout effects, one coil, full sampling, unit scale, and the
+/// noise coming from `desired_snr` instead of `noise_variance`).
+pub const COMPAT_PINNED: [(&str, f64); 11] = [
+    ("oversample", 1.0),
+    ("partial_fourier", 1.0),
+    ("n_coils", 1.0),
+    ("ghost_offset", 0.0),
+    ("n_spikes", 0.0),
+    ("eddy_strength", 0.0),
+    ("eddy_quad", 0.0),
+    ("eddy_phase", 0.0),
+    ("signal_scale", 1.0),
+    ("noise_variance", 0.0),
+    ("ParallelReductionFactorInPlane", 1.0),
+];
 
 /// `[background_suppression]` (P3 addendum, part A). Read only when the sidecar's
 /// `BackgroundSuppression` is true.
@@ -282,6 +323,10 @@ pub struct Protocol {
     pub ir: Option<IrSpec>,
     /// `Some` when the overlay asks for motion (a mode other than `off`, or shot events).
     pub motion: Option<MotionSpec>,
+    /// `Some` under `[compat] asldro = true` (P2).
+    pub compat: Option<CompatSpec>,
+    /// Where the acquisition grid sits on the phantom (`[compat] grid_origin`).
+    pub grid_origin: GridOrigin,
     /// With `mb > 1`: whether the slice timing is the interleaved (even groups then odd) shot
     /// order of `mrsim_acq::motion::slice_schedule`, as opposed to sequential.
     pub mb_interleaved: bool,
@@ -1097,10 +1142,98 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
         return Err("M0Type is \"Separate\" but the overlay has no [m0] repetition_time; the ASL sidecar's \
                     RepetitionTimePreparation describes the ASL series, not the M0 scan".to_string());
     }
-    let acq = overlay_acq(overlay.and_then(|o| o.acquisition.as_ref()))?;
+    let mut acq = overlay_acq(overlay.and_then(|o| o.acquisition.as_ref()))?;
     let seed = overlay.and_then(|o| o.seed).unwrap_or(0);
 
+    // Compat (P2 addendum, part A): pinned values checked against what was set explicitly.
+    let co = overlay.and_then(|o| o.compat.as_ref());
+    let asldro = co.and_then(|c| c.asldro).unwrap_or(false);
+    let grid_origin = match co.and_then(|c| c.grid_origin.as_deref()) {
+        Some(s) => GridOrigin::parse(s).map_err(|e| format!("overlay: compat.{e}"))?,
+        None if asldro => GridOrigin::VoxelCentre,
+        None => GridOrigin::Corner,
+    };
+    let compat = if asldro {
+        let ao = overlay.and_then(|o| o.acquisition.as_ref());
+        let explicit: [(&str, Option<f64>); 10] = [
+            ("oversample", ao.and_then(|a| a.oversample).map(|v| v as f64)),
+            ("partial_fourier", ao.and_then(|a| a.partial_fourier)),
+            ("n_coils", ao.and_then(|a| a.n_coils).map(|v| v as f64)),
+            ("ghost_offset", ao.and_then(|a| a.ghost_offset)),
+            ("n_spikes", ao.and_then(|a| a.n_spikes).map(|v| v as f64)),
+            ("eddy_strength", ao.and_then(|a| a.eddy_strength)),
+            ("eddy_quad", ao.and_then(|a| a.eddy_quad)),
+            ("eddy_phase", ao.and_then(|a| a.eddy_phase)),
+            ("signal_scale", ao.and_then(|a| a.signal_scale)),
+            ("noise_variance", ao.and_then(|a| a.noise_variance)),
+        ];
+        for (key, set) in explicit {
+            let pinned = COMPAT_PINNED.iter().find(|(k, _)| *k == key).unwrap().1;
+            if let Some(v) = set {
+                if v != pinned {
+                    return Err(format!(
+                        "overlay: acquisition.{key} = {v} under [compat] asldro = true, which pins it to {pinned}; \
+                         compat mode overrides nothing silently"));
+                }
+            }
+        }
+        if let Some(w) = ao.and_then(|a| a.window.as_deref()) {
+            if parse_window(w)? != KspaceWindow::None {
+                return Err(format!(
+                    "overlay: acquisition.window = {w:?} under [compat] asldro = true, which pins it to \"none\""));
+            }
+        }
+        let refuse = |what: String| -> Result<(), String> {
+            Err(format!("{what} under [compat] asldro = true: simasl cannot express it"))
+        };
+        if accel != 1 {
+            refuse(format!("asl.json: ParallelReductionFactorInPlane = {accel}, pinned to 1,"))?;
+        }
+        if mb != 1 {
+            refuse(format!("asl.json: MultibandAccelerationFactor = {mb}"))?;
+        }
+        if background_suppression {
+            refuse("asl.json: BackgroundSuppression = true".to_string())?;
+        }
+        if motion.as_ref().is_some_and(|m| m.within.is_some()) {
+            refuse("overlay: [motion.within_volume]".to_string())?;
+        }
+        if m0_type == M0Type::Separate {
+            refuse("asl.json: M0Type \"Separate\" (simasl's M0 is an m0scan row: use M0Type \"Included\")".to_string())?;
+        }
+        if slice_offsets.iter().any(|t| *t != 0.0) {
+            refuse(format!(
+                "asl.json: SliceTiming {timing:?} (unequal entries give each slice its own kinetic time)"))?;
+        }
+        acq.oversample = 1;
+        acq.partial_fourier = 1.0;
+        acq.n_coils = 1;
+        acq.ghost_offset = 0.0;
+        acq.n_spikes = 0;
+        acq.eddy_strength = 0.0;
+        acq.eddy_quad = 0.0;
+        acq.eddy_phase = 0.0;
+        acq.signal_scale = 1.0;
+        acq.noise_variance = 0.0;
+        acq.window = KspaceWindow::None;
+        let desired_snr = match co.and_then(|c| c.desired_snr) {
+            Some(v) => {
+                require_finite_nonneg(v, "overlay compat.desired_snr")?;
+                (v > 0.0).then_some(v)
+            }
+            None => None,
+        };
+        Some(CompatSpec { desired_snr })
+    } else {
+        if co.and_then(|c| c.desired_snr).is_some() {
+            return Err("overlay: compat.desired_snr is read only with [compat] asldro = true; without it the noise \
+                        is acquisition.noise_variance".to_string());
+        }
+        None
+    };
+
     Ok(Protocol {
+        compat, grid_origin,
         label_type, rows, m0_type, background_suppression, suppression, ir, motion, mb_interleaved,
         slice_offsets, field_strength, voxel_size_mm, reverse_phase, phase_encoding_direction: ped,
         echo_time_s, total_readout_time_s, accel, mb, alpha, lambda, t1b, t2_blood_s, contrast,
@@ -1170,7 +1303,9 @@ impl Protocol {
             signal_scale: a.signal_scale,
             reverse_phase: self.reverse_phase,
             do_distortions: true,
-            do_relaxation: true,
+            // Under compat the readout applies no relaxation: simasl's one exp(-TE/T2) per voxel
+            // is applied in the signal stage instead (P2 addendum, part A).
+            do_relaxation: self.compat.is_none(),
             noise_variance: a.noise_variance,
             partial_fourier: a.partial_fourier,
             pf_mode: a.pf_mode,
@@ -1759,5 +1894,111 @@ mod tests {
         assert_eq!(m.within.as_ref().unwrap(), &WithinVolume { dropout_rate: 0.2, severity: 0.5, jump_mm: [0.0; 3], jump_deg: [0.0; 3] });
         assert!(parse(&s, CTX, Some(&mo("[motion.within_volume]\ndropout_rate = 1.2\nseverity = 0.5\n")), None).unwrap_err().contains("dropout_rate"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------ P2
+
+    /// A compat-legal sidecar: simasl's default ASL series on a small grid.
+    fn compat_base() -> Value {
+        let mut s = base();
+        s["M0Type"] = json!("Included");
+        s["RepetitionTimePreparation"] = json!([10.0, 5.0, 5.0]);
+        s["SliceTiming"] = json!([0.0, 0.0, 0.0]);
+        s
+    }
+    const COMPAT_CTX: &str = "volume_type\nm0scan\ncontrol\nlabel\n";
+
+    #[test]
+    fn compat_pins_the_acquisition_with_an_otherwise_empty_overlay() {
+        let p = parse(&compat_base(), COMPAT_CTX, Some(&overlay("[compat]\nasldro = true\n")), None).unwrap();
+        assert_eq!(p.compat, Some(CompatSpec { desired_snr: None }));
+        assert_eq!(p.grid_origin, GridOrigin::VoxelCentre);
+        let a = &p.acq;
+        assert_eq!((a.oversample, a.n_coils, a.n_spikes), (1, 1, 0));
+        assert_eq!((a.partial_fourier, a.ghost_offset, a.signal_scale, a.noise_variance), (1.0, 0.0, 1.0, 0.0));
+        assert_eq!((a.eddy_strength, a.eddy_quad, a.eddy_phase), (0.0, 0.0, 0.0));
+        assert_eq!(a.window, KspaceWindow::None);
+        let acq = p.acquisition(8, 8).unwrap();
+        assert!(!acq.do_relaxation && acq.accel == 1 && acq.signal_scale == 1.0);
+        // explicit values equal to the pins are fine; SNR 0 is no noise
+        let ov = "[compat]\nasldro = true\ndesired_snr = 0.0\n[acquisition]\noversample = 1\nsignal_scale = 1.0\nwindow = \"none\"\n";
+        let p = parse(&compat_base(), COMPAT_CTX, Some(&overlay(ov)), None).unwrap();
+        assert_eq!(p.compat, Some(CompatSpec { desired_snr: None }));
+        let p = parse(&compat_base(), COMPAT_CTX, Some(&overlay("[compat]\nasldro = true\ndesired_snr = 50.0\n")), None).unwrap();
+        assert_eq!(p.compat, Some(CompatSpec { desired_snr: Some(50.0) }));
+        // without compat: nothing changes, relaxation stays on, the origin is the P1 corner
+        let p = parse(&compat_base(), COMPAT_CTX, None, None).unwrap();
+        assert!(p.compat.is_none() && p.grid_origin == GridOrigin::Corner && p.acq == OverlayAcq::default());
+        assert!(p.acquisition(8, 8).unwrap().do_relaxation);
+    }
+
+    #[test]
+    fn compat_rejects_each_conflicting_explicit_key_naming_both_values() {
+        for (key, bad, pinned) in [
+            ("oversample", "2", "1"), ("partial_fourier", "0.75", "1"), ("n_coils", "4", "1"),
+            ("ghost_offset", "0.1", "0"), ("n_spikes", "3", "0"), ("eddy_strength", "0.5", "0"),
+            ("eddy_quad", "0.5", "0"), ("eddy_phase", "0.5", "0"), ("signal_scale", "100.0", "1"),
+            ("noise_variance", "4.0", "0"),
+        ] {
+            let ov = format!("[compat]\nasldro = true\n[acquisition]\n{key} = {bad}\n");
+            let e = parse(&compat_base(), COMPAT_CTX, Some(&overlay(&ov)), None).unwrap_err();
+            assert!(e.contains(key) && e.contains(&format!("pins it to {pinned}")), "{key}: {e}");
+        }
+        let e = parse(&compat_base(), COMPAT_CTX, Some(&overlay("[compat]\nasldro = true\n[acquisition]\nwindow = \"hann\"\n")), None).unwrap_err();
+        assert!(e.contains("window") && e.contains("\"none\""), "{e}");
+    }
+
+    #[test]
+    fn compat_refuses_what_simasl_cannot_express() {
+        let ov = overlay("[compat]\nasldro = true\n");
+        let check = |s: &Value, ctx: &str, ov: &Overlay, want: &str| {
+            let e = parse(s, ctx, Some(ov), None).unwrap_err();
+            assert!(e.contains(want) && e.contains("simasl"), "{want}: {e}");
+        };
+        let mut s = compat_base();
+        s["ParallelReductionFactorInPlane"] = json!(2);
+        check(&s, COMPAT_CTX, &ov, "ParallelReductionFactorInPlane");
+        let mut s = compat_base();
+        s["MultibandAccelerationFactor"] = json!(3);
+        check(&s, COMPAT_CTX, &ov, "MultibandAccelerationFactor");
+        let mut s = compat_base();
+        s["BackgroundSuppression"] = json!(true);
+        s["BackgroundSuppressionNumberPulses"] = json!(0);
+        s["BackgroundSuppressionPulseTime"] = json!([]);
+        check(&s, COMPAT_CTX, &ov, "BackgroundSuppression");
+        let mut s = compat_base();
+        s["MultibandAccelerationFactor"] = json!(3);
+        s["SliceTiming"] = json!([0.0, 0.0, 0.0]);
+        let wv = overlay("[compat]\nasldro = true\n[motion.within_volume]\ndropout_rate = 0.2\nseverity = 0.5\n");
+        let e = parse(&s, COMPAT_CTX, Some(&wv), None).unwrap_err();
+        assert!(e.contains("simasl"), "{e}");
+        let mut s = compat_base();
+        s["M0Type"] = json!("Separate");
+        s["RepetitionTimePreparation"] = json!(5.0);
+        let sep = overlay("[compat]\nasldro = true\n[m0]\nrepetition_time = 10.0\n");
+        check(&s, "volume_type\ncontrol\nlabel\n", &sep, "Separate");
+        let mut s = compat_base();
+        s["SliceTiming"] = json!([0.0, 0.05, 0.10]);
+        check(&s, COMPAT_CTX, &ov, "SliceTiming");
+        // equal but nonzero entries are zero offsets
+        s["SliceTiming"] = json!([0.02, 0.02, 0.02]);
+        assert!(parse(&s, COMPAT_CTX, Some(&ov), None).unwrap().slice_offsets.iter().all(|t| *t == 0.0));
+        // between-volume motion stays allowed (benchmark D)
+        let mv = overlay("[compat]\nasldro = true\n[motion]\nmode = \"random\"\nrot_deg = [0, 0, 2]\n");
+        assert!(parse(&compat_base(), COMPAT_CTX, Some(&mv), None).is_ok());
+    }
+
+    #[test]
+    fn compat_keys_parse_and_default_per_the_table() {
+        let p = parse(&compat_base(), COMPAT_CTX, Some(&overlay("[compat]\ngrid_origin = \"voxel-centre\"\n")), None).unwrap();
+        assert!(p.compat.is_none() && p.grid_origin == GridOrigin::VoxelCentre);
+        let p = parse(&compat_base(), COMPAT_CTX, Some(&overlay("[compat]\nasldro = true\ngrid_origin = \"corner\"\n")), None).unwrap();
+        assert!(p.compat.is_some() && p.grid_origin == GridOrigin::Corner);
+        assert!(parse(&compat_base(), COMPAT_CTX, Some(&overlay("[compat]\ngrid_origin = \"centre\"\n")), None).unwrap_err().contains("grid_origin"));
+        assert!(parse(&compat_base(), COMPAT_CTX, Some(&overlay("[compat]\ndesired_snr = 50.0\n")), None).unwrap_err().contains("asldro"));
+        assert!(parse(&compat_base(), COMPAT_CTX, Some(&overlay("[compat]\nasldro = true\ndesired_snr = -1.0\n")), None).unwrap_err().contains("desired_snr"));
+        assert!(toml::from_str::<Overlay>("[compat]\nasldr = true\n").is_err());
+        let p = parse(&compat_base(), COMPAT_CTX, Some(&overlay("[compat]\nasldro = false\n")), None).unwrap();
+        assert!(p.compat.is_none() && p.grid_origin == GridOrigin::Corner);
     }
 }

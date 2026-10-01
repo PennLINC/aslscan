@@ -25,11 +25,23 @@ pub struct AxisWeights {
 /// `[j*d_dst, (j+1)*d_dst)`, both from the shared corner at 0. Overlaps below `1e-9 * d_dst` are
 /// dropped as floating-point noise.
 pub fn axis_weights(n_src: usize, d_src: f64, n_dst: usize, d_dst: f64) -> AxisWeights {
+    axis_weights_offset(n_src, d_src, n_dst, d_dst, 0.0)
+}
+
+/// [`axis_weights`] with the target grid's corner `offset` mm from the source's along the axis
+/// (target cells `[offset + j*d_dst, offset + (j+1)*d_dst)`). A target cell hanging past either
+/// source edge gets the partial weight of what it does cover, as at the far edge.
+pub fn axis_weights_offset(n_src: usize, d_src: f64, n_dst: usize, d_dst: f64, offset: f64) -> AxisWeights {
     assert!(d_src > 0.0 && d_dst > 0.0, "voxel sizes must be positive");
+    assert!(offset.is_finite(), "grid offset must be finite");
     let eps = 1e-9 * d_dst;
     let mut per_target = Vec::with_capacity(n_dst);
     for j in 0..n_dst {
-        let (lo, hi) = (j as f64 * d_dst, (j + 1) as f64 * d_dst);
+        let (lo, hi) = (offset + j as f64 * d_dst, offset + (j + 1) as f64 * d_dst);
+        if hi <= 0.0 {
+            per_target.push(Vec::new());
+            continue;
+        }
         let i0 = (lo / d_src).floor().max(0.0) as usize;
         let i1 = ((hi / d_src).ceil() as usize).min(n_src);
         let mut w = Vec::new();
@@ -57,10 +69,18 @@ pub struct Resampler {
 
 impl Resampler {
     pub fn new(src_dims: [usize; 3], src_vox: [f64; 3], dst_dims: [usize; 3], dst_vox: [f64; 3]) -> Self {
+        Self::with_offset(src_dims, src_vox, dst_dims, dst_vox, [0.0; 3])
+    }
+
+    /// A resampler whose target corner sits `offset` mm (per axis, along the index direction)
+    /// from the source corner; [`corner_offset`] gives it for two grids.
+    pub fn with_offset(src_dims: [usize; 3], src_vox: [f64; 3], dst_dims: [usize; 3], dst_vox: [f64; 3], offset: [f64; 3])
+        -> Self
+    {
         Resampler {
-            x: axis_weights(src_dims[0], src_vox[0], dst_dims[0], dst_vox[0]),
-            y: axis_weights(src_dims[1], src_vox[1], dst_dims[1], dst_vox[1]),
-            z: axis_weights(src_dims[2], src_vox[2], dst_dims[2], dst_vox[2]),
+            x: axis_weights_offset(src_dims[0], src_vox[0], dst_dims[0], dst_vox[0], offset[0]),
+            y: axis_weights_offset(src_dims[1], src_vox[1], dst_dims[1], dst_vox[1], offset[1]),
+            z: axis_weights_offset(src_dims[2], src_vox[2], dst_dims[2], dst_vox[2], offset[2]),
             src_dims,
             dst_dims,
         }
@@ -210,10 +230,60 @@ pub fn axis_aligned_voxels(g: &Grid) -> Result<[f64; 3], String> {
     Ok([m[0][0].abs(), m[1][1].abs(), m[2][2].abs()])
 }
 
+/// Where the acquisition grid sits on the phantom's field of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GridOrigin {
+    /// The grids share their outer corner (P1).
+    #[default]
+    Corner,
+    /// Acquisition voxel 0 is centred on phantom voxel 0, as simasl's
+    /// `transform_resample_affine` places it (P2 addendum, part A).
+    VoxelCentre,
+}
+
+impl GridOrigin {
+    pub fn parse(s: &str) -> Result<GridOrigin, String> {
+        match s {
+            "corner" => Ok(GridOrigin::Corner),
+            "voxel-centre" => Ok(GridOrigin::VoxelCentre),
+            other => Err(format!("grid_origin {other:?}: expected \"corner\" or \"voxel-centre\"")),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GridOrigin::Corner => "corner",
+            GridOrigin::VoxelCentre => "voxel-centre",
+        }
+    }
+}
+
+/// Per axis, how far `dst`'s outer corner sits from `src`'s, in mm along the index direction
+/// (both grids axis-aligned with the same axis directions). Zero for P1's corner-aligned grids.
+pub fn corner_offset(src: &Grid, dst: &Grid) -> Result<[f64; 3], String> {
+    let (sv, dv) = (axis_aligned_voxels(src)?, axis_aligned_voxels(dst)?);
+    let mut off = [0.0f64; 3];
+    for a in 0..3 {
+        let (s, d) = (src.voxel_to_world[a][a], dst.voxel_to_world[a][a]);
+        if s.signum() != d.signum() {
+            return Err(format!("grids disagree on the direction of axis {a}"));
+        }
+        let corner_s = src.voxel_to_world[a][3] - 0.5 * s;
+        let corner_d = dst.voxel_to_world[a][3] - 0.5 * d;
+        off[a] = (corner_d - corner_s) * s.signum();
+        // Exact zero for corner-aligned grids, so the P1 weights are reproduced bit for bit.
+        if off[a].abs() <= 1e-9 * sv[a].min(dv[a]) {
+            off[a] = 0.0;
+        }
+    }
+    Ok(off)
+}
+
 /// The acquisition grid for a phantom's field of view: `ceil(extent / voxel)` cells per axis
-/// (an in-plane `matrix_override` replaces the first two), corner-aligned with the phantom, with
-/// the phantom's axis directions. Voxel `j`'s centre sits at `corner + (j + 0.5) * voxel`.
-pub fn acquisition_grid(phantom: &Grid, voxel_mm: [f64; 3], matrix_override: Option<[usize; 2]>)
+/// (an in-plane `matrix_override` replaces the first two), with the phantom's axis directions,
+/// placed by `origin`. Under `Corner` voxel `j`'s centre sits at `corner + (j + 0.5) * voxel`;
+/// under `VoxelCentre` at `o + j * voxel`, `o` being phantom voxel 0's centre.
+pub fn acquisition_grid(phantom: &Grid, voxel_mm: [f64; 3], matrix_override: Option<[usize; 2]>, origin: GridOrigin)
     -> Result<Grid, String>
 {
     let pv = axis_aligned_voxels(phantom)?;
@@ -234,9 +304,12 @@ pub fn acquisition_grid(phantom: &Grid, voxel_mm: [f64; 3], matrix_override: Opt
     for a in 0..3 {
         let sign = if phantom.voxel_to_world[a][a] < 0.0 { -1.0 } else { 1.0 };
         m[a][a] = sign * voxel_mm[a];
-        // phantom voxel 0 is centred at o; its edge is o - 0.5 * p; the new voxel 0 is centred
-        // half a new voxel in from that edge.
-        m[a][3] = phantom.voxel_to_world[a][3] - 0.5 * phantom.voxel_to_world[a][a] + 0.5 * m[a][a];
+        m[a][3] = match origin {
+            // phantom voxel 0 is centred at o; its edge is o - 0.5 * p; the new voxel 0 is
+            // centred half a new voxel in from that edge.
+            GridOrigin::Corner => phantom.voxel_to_world[a][3] - 0.5 * phantom.voxel_to_world[a][a] + 0.5 * m[a][a],
+            GridOrigin::VoxelCentre => phantom.voxel_to_world[a][3],
+        };
     }
     Ok(Grid { dims, voxel_to_world: m })
 }
@@ -339,25 +412,90 @@ mod tests {
             dims: [24, 24, 6],
             voxel_to_world: [[1.0, 0.0, 0.0, -10.0], [0.0, 1.0, 0.0, 5.0], [0.0, 0.0, 1.0, 2.0], [0.0, 0.0, 0.0, 1.0]],
         };
-        let g = acquisition_grid(&ph, [3.0, 3.0, 3.0], None).unwrap();
+        let g = acquisition_grid(&ph, [3.0, 3.0, 3.0], None, GridOrigin::Corner).unwrap();
         assert_eq!(g.dims, [8, 8, 2]);
-        let g2 = acquisition_grid(&ph, [3.5, 3.5, 3.0], None).unwrap();
+        let g2 = acquisition_grid(&ph, [3.5, 3.5, 3.0], None, GridOrigin::Corner).unwrap();
         assert_eq!(g2.dims, [7, 7, 2]);
         // corner is at -10 - 0.5 = -10.5; new voxel 0 centre at corner + 1.75
         assert!((g2.voxel_to_world[0][3] - (-10.5 + 1.75)).abs() < 1e-12);
         assert!((g2.voxel_to_world[0][0] - 3.5).abs() < 1e-12);
-        let g3 = acquisition_grid(&ph, [3.0, 3.0, 3.0], Some([16, 12])).unwrap();
+        let g3 = acquisition_grid(&ph, [3.0, 3.0, 3.0], Some([16, 12]), GridOrigin::Corner).unwrap();
         assert_eq!(g3.dims, [16, 12, 2]);
         // a negative axis keeps its direction
         let mut flipped = ph.clone();
         flipped.voxel_to_world[0][0] = -1.0;
-        let g4 = acquisition_grid(&flipped, [2.0, 2.0, 2.0], None).unwrap();
+        let g4 = acquisition_grid(&flipped, [2.0, 2.0, 2.0], None, GridOrigin::Corner).unwrap();
         assert!((g4.voxel_to_world[0][0] + 2.0).abs() < 1e-12);
         assert!((g4.voxel_to_world[0][3] - (-10.0 + 0.5 - 1.0)).abs() < 1e-12);
         // oblique is refused
         let mut obl = ph.clone();
         obl.voxel_to_world[0][1] = 0.1;
-        assert!(acquisition_grid(&obl, [3.0, 3.0, 3.0], None).is_err());
+        assert!(acquisition_grid(&obl, [3.0, 3.0, 3.0], None, GridOrigin::Corner).is_err());
+    }
+
+    #[test]
+    fn voxel_centre_origin_centres_voxel_0_on_the_phantom_voxel_0() {
+        let ph = Grid {
+            dims: [24, 24, 6],
+            voxel_to_world: [[1.0, 0.0, 0.0, -10.0], [0.0, 1.0, 0.0, 5.0], [0.0, 0.0, 1.0, 2.0], [0.0, 0.0, 0.0, 1.0]],
+        };
+        let g = acquisition_grid(&ph, [3.0, 2.0, 1.5], None, GridOrigin::VoxelCentre).unwrap();
+        assert_eq!(g.dims, [8, 12, 4]);
+        for a in 0..3 {
+            assert_eq!(g.voxel_to_world[a][3], ph.voxel_to_world[a][3]);
+        }
+        // corner offsets: (0.5 p - 0.5 v) per axis
+        let off = corner_offset(&ph, &g).unwrap();
+        assert!(approx(off[0], -1.0) && approx(off[1], -0.5) && approx(off[2], -0.25), "{off:?}");
+        assert_eq!(corner_offset(&ph, &acquisition_grid(&ph, [3.0, 2.0, 1.5], None, GridOrigin::Corner).unwrap()).unwrap(), [0.0; 3]);
+        // a negative axis keeps its direction and still centres voxel 0 on voxel 0
+        let mut flipped = ph.clone();
+        flipped.voxel_to_world[0][0] = -1.0;
+        let g = acquisition_grid(&flipped, [3.0, 2.0, 1.5], None, GridOrigin::VoxelCentre).unwrap();
+        assert_eq!(g.voxel_to_world[0][0], -3.0);
+        assert_eq!(g.voxel_to_world[0][3], -10.0);
+        assert!(approx(corner_offset(&flipped, &g).unwrap()[0], -1.0));
+        assert_eq!(GridOrigin::parse("voxel-centre").unwrap(), GridOrigin::VoxelCentre);
+        assert_eq!(GridOrigin::parse("corner").unwrap(), GridOrigin::Corner);
+        assert!(GridOrigin::parse("center").is_err());
+    }
+
+    #[test]
+    fn simasl_matrix_reproduces_from_the_derived_voxel_size() {
+        // the ASLDRO phantoms: 197 x 233 x 189 at 1 mm; acq_matrix [64, 64, 12]
+        let ph = Grid {
+            dims: [197, 233, 189],
+            voxel_to_world: [[1.0, 0.0, 0.0, -98.0], [0.0, 1.0, 0.0, -134.0], [0.0, 0.0, 1.0, -72.0], [0.0, 0.0, 0.0, 1.0]],
+        };
+        for origin in [GridOrigin::Corner, GridOrigin::VoxelCentre] {
+            let g = acquisition_grid(&ph, [197.0 / 64.0, 233.0 / 64.0, 189.0 / 12.0], None, origin).unwrap();
+            assert_eq!(g.dims, [64, 64, 12]);
+            let g = acquisition_grid(&ph, [1.0, 1.0, 1.0], None, origin).unwrap();
+            assert_eq!(g.dims, [197, 233, 189]);
+        }
+    }
+
+    #[test]
+    fn offset_weights_give_partial_cells_at_the_near_edge() {
+        // target cells of 3 from -1: [-1, 2), [2, 5), [5, 8) over 6 unit source cells
+        let w = axis_weights_offset(6, 1.0, 3, 3.0, -1.0);
+        assert_eq!(w.per_target[0].iter().map(|p| p.0).collect::<Vec<_>>(), vec![0, 1]);
+        let s0: f64 = w.per_target[0].iter().map(|p| p.1).sum();
+        assert!(approx(s0, 2.0 / 3.0), "{s0}");
+        let s1: f64 = w.per_target[1].iter().map(|p| p.1).sum();
+        assert!(approx(s1, 1.0));
+        assert_eq!(w.per_target[2].iter().map(|p| p.0).collect::<Vec<_>>(), vec![5]);
+        // wholly before the source: empty
+        assert!(axis_weights_offset(6, 1.0, 1, 1.0, -2.0).per_target[0].is_empty());
+        // offset 0 is the P1 weights exactly
+        let (a, b) = (axis_weights(7, 1.0, 3, 2.5), axis_weights_offset(7, 1.0, 3, 2.5, 0.0));
+        for j in 0..3 {
+            assert_eq!(a.per_target[j], b.per_target[j]);
+        }
+        // the identity grid at offset 0 is the identity
+        let r = Resampler::with_offset([4, 3, 2], [1.0; 3], [4, 3, 2], [1.0; 3], [0.0; 3]);
+        let src: Vec<f32> = (0..24).map(|i| i as f32 * 0.37 + 1.0).collect();
+        assert_eq!(r.mean(&src), src);
     }
 
     #[test]
