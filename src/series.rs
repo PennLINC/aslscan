@@ -95,6 +95,19 @@ pub struct SeriesOutput {
     pub motion_seed: Option<u64>,
     pub events: Vec<MotionEvent>,
     pub dropped: Vec<DroppedShot>,
+    /// Under `[compat] asldro = true`: what the SNR resolved to.
+    pub compat: Option<CompatFacts>,
+}
+
+/// The compat noise resolution (P2 addendum, part A).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompatFacts {
+    pub desired_snr: Option<f64>,
+    /// Per-component image variance handed to the acquisition (0 without an SNR).
+    pub noise_variance: f64,
+    /// Mean |M0| over the nonzero voxels of the acquisition-grid M0 ground truth.
+    pub m0_reference_mean: f64,
+    pub m0_reference_voxels: usize,
 }
 
 /// Test hook: alter the row semantics to prove the linearity test is not slack.
@@ -219,6 +232,9 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
     let nvox_sim = snx * sny * nz;
     let nvox_acq = nx * ny * nz;
 
+    if p.compat.is_some() && ph.fieldmap.is_some() {
+        return Err("the phantom has a fieldmap under [compat] asldro = true: simasl cannot express it".to_string());
+    }
     let mut acq = p.acquisition(nx, ny)?;
     acq.do_distortions = ph.fieldmap.is_some();
     let fmap_sim: Vec<f32> = match &ph.fieldmap {
@@ -302,13 +318,24 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
     };
     let label_factors = p.suppression.as_ref().map(|spec| (0..n).map(|i| label_factor(&spec.for_row(i))).collect::<Vec<f64>>());
 
+    // ---- compat: simasl's one exp(-TE/T2) per phantom voxel, tissue and blood alike, with its
+    // zero-T2 guard (`np.divide(.., where=t2 != 0)` leaves exp(0) = 1); the readout's own
+    // relaxation is off (`Protocol::acquisition`) ----
+    let te_factor: Option<Vec<f64>> = p.compat.as_ref().map(|_| {
+        ph.t2.iter().map(|&t2| if t2 != 0.0 { (-p.echo_time_s / t2 as f64).exp() } else { 1.0 }).collect()
+    });
+    let te = |i: usize| -> f64 { te_factor.as_ref().map_or(1.0, |f| f[i]) };
+
     // ---- tissue signal per distinct (TR, equation), per compartment, on the sim grid ----
     let mut tissue_cache: HashMap<(u64, bool), Vec<Vec<f32>>> = HashMap::new();
     let mut tissue_for = |tr: f64, se: bool| -> Vec<Vec<f32>> {
         tissue_cache
             .entry((tr.to_bits(), se))
             .or_insert_with(|| {
-                let sig: Vec<f64> = (0..ph.nvox()).map(|i| tissue_steady(ph.m0[i] as f64, ph.t1[i] as f64, tr, se)).collect();
+                let sig: Vec<f64> = match &te_factor {
+                    None => (0..ph.nvox()).map(|i| tissue_steady(ph.m0[i] as f64, ph.t1[i] as f64, tr, se)).collect(),
+                    Some(f) => (0..ph.nvox()).map(|i| tissue_steady(ph.m0[i] as f64, ph.t1[i] as f64, tr, se) * f[i]).collect(),
+                };
                 masks
                     .iter()
                     .map(|m| {
@@ -360,7 +387,11 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
             };
             for (c, m) in masks.iter().enumerate() {
                 if sign != 0.0 {
-                    let sl = r.mean_slice(z, |i| if m[i] { blood_signal(sign * dm(i)) } else { 0.0 });
+                    let sl = if te_factor.is_some() {
+                        r.mean_slice(z, |i| if m[i] { blood_signal(sign * dm(i)) * te(i) } else { 0.0 })
+                    } else {
+                        r.mean_slice(z, |i| if m[i] { blood_signal(sign * dm(i)) } else { 0.0 })
+                    };
                     comps[c][z * dnx * dny..(z + 1) * dnx * dny].copy_from_slice(&sl);
                 }
             }
@@ -379,7 +410,9 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
     let mut gt_sim = if motion_on { vec![0.0f32; nvox_sim * n] } else { Vec::new() };
     let slab = snx * sny;
     for (v, row) in p.rows.iter().enumerate() {
-        let se = row.kind == RowKind::M0scan;
+        // An m0scan row is a plain spin-echo readout (P3), except under compat, where it takes
+        // the series' equation as simasl's does (P2 addendum, part A).
+        let se = row.kind == RowKind::M0scan && p.compat.is_none();
         let tissue = match (row.kind, &suppression[v]) {
             (RowKind::Deltam, _) => None,
             (_, Some(_)) => {
@@ -445,6 +478,22 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
         }
     }
 
+    // ---- compat noise: simasl's SNR against the mean |M0| over the nonzero voxels of the M0
+    // ground truth on the acquisition grid, as a per-component image variance ----
+    let m0_acq = r_acq.mean(&ph.m0);
+    let compat_facts = p.compat.as_ref().map(|c| {
+        let nz: Vec<f64> = m0_acq.iter().filter(|v| **v != 0.0).map(|v| v.abs() as f64).collect();
+        let m0_reference_mean = if nz.is_empty() { 0.0 } else { nz.iter().sum::<f64>() / nz.len() as f64 };
+        let noise_variance = match c.desired_snr {
+            Some(snr) => (acq.signal_scale * m0_reference_mean / snr).powi(2),
+            None => 0.0,
+        };
+        CompatFacts { desired_snr: c.desired_snr, noise_variance, m0_reference_mean, m0_reference_voxels: nz.len() }
+    });
+    if let Some(f) = &compat_facts {
+        acq.noise_variance = f.noise_variance;
+    }
+
     // ---- the one call ----
     let eddy_drive = vec![None; n];
     let prep_drive = vec![None; n];
@@ -485,7 +534,7 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
         att: r_acq.masked_mean(&ph.att, &perfused),
         t1: r_acq.mean(&ph.t1),
         t2: r_acq.mean(&ph.t2),
-        m0: r_acq.mean(&ph.m0),
+        m0: m0_acq,
         dseg: r_acq.majority(&ph.dseg),
         acq_t2_ms,
         acq_t2p_ms,
@@ -495,7 +544,7 @@ fn simulate_impl(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, o
         acq_grid, sim_grid, n_volumes: n, mag, phase: phase_out, m0, mode: mode_used,
         labels: ph.labels.clone(), n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(),
         seeds: (p.seed, m0_seed), acquisition: acq, ground_truth, label_factors, poses, motion_seed,
-        events, dropped,
+        events, dropped, compat: compat_facts,
     })
 }
 
@@ -898,5 +947,167 @@ mod tests {
         assert!(worst < 1e-6, "{worst}");
         // the moved ground truth excludes the events: identical to the static one
         assert_eq!(b.ground_truth.delta_m, *b.ground_truth.delta_m_static.as_ref().unwrap());
+    }
+
+    // ------------------------------------------------------------------ P2
+
+    /// A compat sidecar on the crop: `voxel` mm, all-zero slice timing for `nz` slices, simasl's
+    /// default rows `m0scan control label` and TRs `[10, 5, 5]`, TE 10 ms.
+    fn compat_sidecar(voxel: [f64; 3], nz: usize) -> Value {
+        let mut s = sidecar(voxel, nz);
+        s["SliceTiming"] = json!(vec![0.0; nz]);
+        s["M0Type"] = json!("Included");
+        s["RepetitionTimePreparation"] = json!([10.0, 5.0, 5.0]);
+        s["EchoTime"] = json!(0.01);
+        s["TotalReadoutTime"] = json!(0.001);
+        s
+    }
+
+    fn re_of(out: &SeriesOutput) -> Vec<f64> {
+        complex_from(&out.mag, &out.phase).into_iter().map(|z| z.0).collect()
+    }
+
+    /// The identity grid under compat: every acquired voxel is one phantom voxel, and the signed
+    /// real image is simasl's closed form `(tissue + mag_enc) * exp(-TE/T2)` per voxel.
+    fn check_compat_closed_form(contrast: &str) {
+        let ph = phantom();
+        let ov = format!("[compat]\nasldro = true\n{contrast}");
+        let p = protocol_from(&compat_sidecar([1.0, 1.0, 1.0], 6), "m0scan,control,label", &ov);
+        let out = simulate(&p, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        assert_eq!(out.acq_grid.dims, ph.grid.dims);
+        assert_eq!(out.acq_grid.voxel_to_world, ph.grid.voxel_to_world);
+        assert!(!out.acquisition.do_relaxation && out.acquisition.noise_variance == 0.0);
+        let ir = p.ir.as_ref().map(|s| s.params);
+        let re = re_of(&out);
+        let n = out.n_volumes;
+        let (mut worst, mut peak) = (0.0f64, 0.0f64);
+        for (v, row) in p.rows.iter().enumerate() {
+            let kin = p.kinetic(row);
+            for i in 0..ph.nvox() {
+                let fg = ph.dseg[i] > 0;
+                let (m0, t1) = (ph.m0[i] as f64, ph.t1[i] as f64);
+                let tissue = match ir {
+                    Some(q) => tissue_ir(m0, t1, row.tr, &q),
+                    None => tissue_se(m0, t1, row.tr),
+                };
+                let enc = if row.kind == RowKind::Label {
+                    -delta_m(&kin, ph.perfusion[i] as f64, ph.att[i] as f64, t1, m0, row.t)
+                } else {
+                    0.0
+                };
+                let blood = match ir {
+                    Some(q) => blood_ir(enc, &q),
+                    None => blood_se(enc),
+                };
+                let t2 = ph.t2[i] as f64;
+                let te = if t2 != 0.0 { (-0.01 / t2).exp() } else { 1.0 };
+                let want = if fg { (tissue + blood) * te } else { 0.0 };
+                worst = worst.max((re[i * n + v] - want).abs());
+                peak = peak.max(want.abs());
+            }
+        }
+        println!("compat closed form ({contrast:?}): worst {:.3e} of peak {peak:.3}", worst / peak);
+        assert!(worst <= 1e-5 * peak, "{worst} vs peak {peak}");
+    }
+
+    #[test]
+    fn compat_is_the_closed_form_per_voxel_under_spin_echo() {
+        check_compat_closed_form("");
+    }
+
+    #[test]
+    fn compat_is_the_closed_form_per_voxel_under_ir_m0scan_row_included() {
+        check_compat_closed_form("[signal]\nacq_contrast = \"ir\"\nexcitation_flip_angle = 60.0\n");
+    }
+
+    #[test]
+    fn outside_compat_the_m0scan_row_of_an_ir_series_stays_spin_echo() {
+        let ph = phantom();
+        let mut s = compat_sidecar([3.0, 3.0, 3.0], 2);
+        s["EchoTime"] = json!(0.012);
+        s["TotalReadoutTime"] = json!(0.012);
+        s["RepetitionTimePreparation"] = json!([10.0, 5.0]);
+        let se = protocol_from(&s, "m0scan,control", "");
+        let ir = protocol_from(&s, "m0scan,control", "[signal]\nacq_contrast = \"ir\"\n");
+        let a = simulate(&se, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        let b = simulate(&ir, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        let nvox = a.acq_grid.dims.iter().product::<usize>();
+        assert!((0..nvox).all(|v| a.mag[v * 2] == b.mag[v * 2]), "the m0scan row must not change");
+        assert!((0..nvox).any(|v| a.mag[v * 2 + 1] != b.mag[v * 2 + 1]), "the control row must");
+    }
+
+    #[test]
+    fn voxel_centre_grid_puts_a_point_source_where_the_affine_says() {
+        // 2 mm in-plane on the 1 mm crop: acquisition voxel j is centred on phantom voxel 2j and
+        // covers it fully (half the cell) and its two neighbours by a quarter each.
+        let mut ph = phantom();
+        let [nx, ny, _] = ph.grid.dims;
+        let (px, py, pz) = (10usize, 12usize, 3usize);
+        let at = |x: usize, y: usize, z: usize| x + nx * (y + ny * z);
+        assert!(ph.dseg[at(px, py, pz)] > 0, "the source must sit in the foreground");
+        ph.perfusion.iter_mut().for_each(|f| *f = 0.0);
+        let keep = ph.m0[at(px, py, pz)];
+        ph.m0.iter_mut().for_each(|m| *m = 0.0);
+        ph.m0[at(px, py, pz)] = keep;
+        let p = protocol_from(&compat_sidecar([2.0, 2.0, 1.0], 6), "m0scan,control,label", "[compat]\nasldro = true\n");
+        let out = simulate(&p, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        assert_eq!(out.acq_grid.dims, [12, 12, 6]);
+        let [ax, ay, _] = out.acq_grid.dims;
+        let re = re_of(&out);
+        let n = out.n_volumes;
+        let (best, _) = re.iter().enumerate().filter(|(i, _)| i % n == 1)
+            .fold((0usize, 0.0f64), |b, (i, v)| if v.abs() > b.1 { (i / n, v.abs()) } else { b });
+        assert_eq!(best, (px / 2) + ax * ((py / 2) + ay * pz), "the source landed in the wrong voxel");
+        // the world position of that acquisition voxel is the phantom voxel's
+        let (g, h) = (&out.acq_grid.voxel_to_world, &ph.grid.voxel_to_world);
+        for (a, (q, r)) in [(px / 2, px), (py / 2, py), (pz, pz)].into_iter().enumerate() {
+            assert!((g[a][a] * q as f64 + g[a][3] - (h[a][a] * r as f64 + h[a][3])).abs() < 1e-12);
+        }
+        // and it carries a quarter of the source (half in x, half in y), nothing elsewhere
+        let te = (-0.01 / ph.t2[at(px, py, pz)] as f64).exp();
+        let want = 0.25 * tissue_se(keep as f64, ph.t1[at(px, py, pz)] as f64, 5.0) * te;
+        assert!((re[best * n + 1] - want).abs() < 1e-5 * want, "{} vs {want}", re[best * n + 1]);
+        let rest = re.iter().enumerate().filter(|(i, _)| i % n == 1 && i / n != best).fold(0.0f64, |m, (_, v)| m.max(v.abs()));
+        assert!(rest < 1e-5 * want, "signal leaked: {rest}");
+    }
+
+    #[test]
+    fn compat_snr_resolves_to_the_reference_variance_and_is_realized() {
+        let ph = phantom();
+        let s = compat_sidecar([1.0, 1.0, 1.0], 6);
+        let clean = protocol_from(&s, "m0scan,control,label", "[compat]\nasldro = true\n");
+        let noisy = protocol_from(&s, "m0scan,control,label", "seed = 4\n[compat]\nasldro = true\ndesired_snr = 50.0\n");
+        let a = simulate(&clean, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        let b = simulate(&noisy, &ph, T2Mode::Auto, &no_phase()).unwrap();
+        let fa = a.compat.as_ref().unwrap();
+        assert_eq!((fa.desired_snr, fa.noise_variance), (None, 0.0));
+        let f = b.compat.as_ref().unwrap();
+        let nz: Vec<f64> = b.ground_truth.m0.iter().filter(|v| **v != 0.0).map(|v| v.abs() as f64).collect();
+        let mean = nz.iter().sum::<f64>() / nz.len() as f64;
+        assert_eq!(f.m0_reference_voxels, nz.len());
+        assert!((f.m0_reference_mean - mean).abs() <= 1e-12 * mean);
+        let want = (mean / 50.0).powi(2);
+        assert!((f.noise_variance - want).abs() <= 1e-12 * want && b.acquisition.noise_variance == f.noise_variance);
+        // the realized per-component variance (noisy - clean) over 3 volumes x 3456 voxels
+        let (za, zb) = (complex_from(&a.mag, &a.phase), complex_from(&b.mag, &b.phase));
+        let (mut sr, mut si) = (0.0f64, 0.0f64);
+        for (x, y) in za.iter().zip(&zb) {
+            sr += (y.0 - x.0).powi(2);
+            si += (y.1 - x.1).powi(2);
+        }
+        let k = za.len() as f64;
+        println!("compat SNR 50: predicted variance {want:.4e}, realized re {:.4e} im {:.4e}", sr / k, si / k);
+        for got in [sr / k, si / k] {
+            assert!((got / want - 1.0).abs() < 0.08, "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn compat_refuses_a_fieldmap_phantom() {
+        let mut ph = phantom();
+        ph.fieldmap = Some(vec![0.0; ph.nvox()]);
+        let p = protocol_from(&compat_sidecar([1.0, 1.0, 1.0], 6), "m0scan,control,label", "[compat]\nasldro = true\n");
+        let e = simulate(&p, &ph, T2Mode::Auto, &no_phase()).unwrap_err();
+        assert!(e.contains("fieldmap") && e.contains("simasl"), "{e}");
     }
 }
