@@ -157,7 +157,17 @@ pub fn delta_m_iv(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t
     let Some((f, m0b, t1pp)) = t1pp(k, f_ml_100g_min, t1t, m0, tau_ex) else { return 0.0 };
     match k.label_type {
         LabelType::Casl | LabelType::Pcasl => gkm_body(k, f, m0b, dt, t1pp, t),
-        LabelType::Pasl => pasl_stable(k, f, m0b, dt, t1pp, t),
+        LabelType::Pasl => {
+            // delta_m's quotient guard: where its own kk = 1/T1b - 1/T1' is exactly zero it is
+            // zero, and the part must be too (T1'' moves kk off zero, which would leave a
+            // positive part of a zero whole)
+            let (_, _, t1p) = gkm_constants(k, f_ml_100g_min, t1t, m0);
+            let kk = (if k.t1b != 0.0 { 1.0 / k.t1b } else { 0.0 }) - div0(1.0, t1p);
+            if kk == 0.0 {
+                return 0.0;
+            }
+            pasl_stable(k, f, m0b, dt, t1pp, t)
+        }
     }
 }
 
@@ -316,6 +326,14 @@ mod tests {
         assert_eq!(kk, 0.0, "the test premise: k must be exactly zero");
         assert_eq!(delta_m(&k, F, DT, T1T, M0, 1.2), 0.0);
         assert_eq!(delta_m(&k, F, DT, T1T, M0, 2.0), 0.0);
+        // and the intravascular part follows the whole: zero, not a positive part of a zero
+        // (final review: 0.00098 at exchange_time 0.5, every sub-bolus too)
+        for tau_ex in [0.5, 3.0] {
+            for t in [1.2, 2.0] {
+                assert_eq!(delta_m_iv(&k, F, DT, T1T, M0, t, tau_ex), 0.0, "tau_ex {tau_ex} t {t}");
+                assert_eq!(delta_m_iv_sub(&k, F, DT, T1T, M0, t, 0.1, 0.4, tau_ex), 0.0);
+            }
+        }
     }
 
     #[test]

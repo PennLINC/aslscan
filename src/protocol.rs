@@ -236,6 +236,11 @@ pub struct CompatSpec {
 
 /// The largest accepted `[vascular_crushing] arterial_velocity` (cm/s).
 pub const MAX_ARTERIAL_VELOCITY: f64 = 1000.0;
+/// The smallest accepted `[kinetic] exchange_time` (s).
+pub const MIN_EXCHANGE_TIME: f64 = 1e-6;
+/// The accepted range of `[physio]` cardiac and respiratory frequencies (Hz): periods of 0.1 to
+/// 100 s, so a period is finite and a series holds a bounded number of them.
+pub const PHYSIO_FREQUENCY_RANGE: (f64, f64) = (0.01, 10.0);
 
 /// The acquisition values `asldro = true` pins, as `(overlay key, value)`: what simasl's
 /// acquisition can express (no readout effects, one coil, full sampling, unit scale, and the
@@ -1418,7 +1423,10 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
     };
     // Part A.
     let exchange_time = match ko.and_then(|k| k.exchange_time) {
-        Some(v) => Some(require_finite_positive(v, "overlay kinetic.exchange_time")?),
+        // below a microsecond 1/exchange_time can overflow, and T1'' collapse to a guarded
+        // zero that would read as the slow-exchange limit
+        Some(v) if v.is_finite() && v >= MIN_EXCHANGE_TIME => Some(v),
+        Some(v) => return Err(format!("overlay: kinetic.exchange_time = {v} must be at least {MIN_EXCHANGE_TIME} s")),
         None => None,
     };
     // 7. Physiological noise.
@@ -1441,6 +1449,12 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                 respiratory_cv: po.respiratory_cv.unwrap_or(d.respiratory_cv),
                 drift_time: require_finite_positive(po.drift_time.unwrap_or(d.drift_time), "overlay physio.drift_time")?,
             };
+            let (lo, hi) = PHYSIO_FREQUENCY_RANGE;
+            for (what, f) in [("cardiac_frequency", params.cardiac_frequency), ("respiratory_frequency", params.respiratory_frequency)] {
+                if !(lo..=hi).contains(&f) {
+                    return Err(format!("overlay: physio.{what} = {f} must be in [{lo}, {hi}] Hz"));
+                }
+            }
             for (what, cv) in [("cardiac_cv", params.cardiac_cv), ("respiratory_cv", params.respiratory_cv)] {
                 if !(cv.is_finite() && (0.0..=0.3).contains(&cv)) {
                     return Err(format!("overlay: physio.{what} = {cv} must be in [0, 0.3] (so every period is positive)"));
@@ -2578,6 +2592,18 @@ mod tests {
         assert!(p4(&s, "[physio]\ntissue_cardiac = 0.01\ncardiac_cv = 0.4\n", None).unwrap_err().contains("cardiac_cv"));
         assert!(p4(&s, "[physio]\ntissue_cardiac = 0.01\ndrift_time = 0.0\n", None).unwrap_err().contains("drift_time"));
         assert!(p4(&s, "[physio]\ntissue_cardiac = 0.01\nrespiratory_frequency = -1.0\n", None).unwrap_err().contains("respiratory_frequency"));
+        // frequencies whose period is infinite (the final review's 1e-320: NaN output) or so
+        // short that a series holds unboundedly many are refused; the range ends are accepted
+        for (f, ok) in [("1e-320", false), ("0.009", false), ("0.01", true), ("10.0", true), ("10.5", false), ("1e300", false)] {
+            let r = p4(&s, &format!("[physio]\ntissue_cardiac = 0.01\ncardiac_frequency = {f}\n"), None);
+            assert_eq!(r.is_ok(), ok, "{f}: {:?}", r.as_ref().err());
+        }
+        // exchange times whose reciprocal overflows are refused (the review's 1e-320 read as
+        // slow exchange); a microsecond is accepted
+        for (x, ok) in [("1e-320", false), ("9e-7", false), ("1e-6", true)] {
+            let r = p4(&s, &format!("[kinetic]\nexchange_time = {x}\n"), None);
+            assert_eq!(r.is_ok(), ok, "{x}: {:?}", r.as_ref().err());
+        }
         // bounded periodic amplitudes
         assert!(p4(&s, "[physio]\ntissue_cardiac = 0.6\ntissue_respiratory = -0.4\n", None).unwrap_err().contains("change sign"));
         assert!(p4(&s, "[physio]\nlabel_cardiac = 1.5\n", None).unwrap_err().contains("label"));
