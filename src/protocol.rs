@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use mrsim_acq::kspace::{Acquisition, KspaceWindow, PartialFourierMode};
+use mrsim_acq::kspace::{Acquisition, EchoFormation, KspaceWindow, PartialFourierMode};
 use mrsim_acq::motion::{load_motion_tsv, MotionMode};
 use serde::Deserialize;
 use serde_json::Value;
@@ -1711,6 +1711,7 @@ impl Protocol {
             accel: self.accel,
             acs_lines: a.acs_lines,
             seed: self.seed,
+            echo: EchoFormation::Spin,
         };
         mrsim_acq::kspace::validate_acquisition_timing(&acq, nx, ny).map_err(|inner| {
             format!(
