@@ -331,14 +331,47 @@ impl Phantom {
     /// passes and `Voxel` otherwise; `Class` is an error when it fails, naming the label, the
     /// voxel and the map.
     pub fn relaxation(&self, mode: T2Mode) -> Result<(Relaxation, T2Mode), String> {
+        self.relaxation_for(mode, false)
+    }
+
+    /// The T1 constancy test that a 3D echo train with refocusing below 180 degrees adds (P5
+    /// addendum, part B, "Echo amplitudes"): its stimulated echoes depend on T1, so a label whose
+    /// T1 varies has no single echo amplitude. Foreground voxels only, bitwise, as for T2.
+    fn t1_constancy(&self) -> Result<(), ConstancyFailure> {
+        for (l, _) in &self.labels {
+            let mut first: Option<f32> = None;
+            for (i, &lab) in self.dseg.iter().enumerate() {
+                if lab != *l {
+                    continue;
+                }
+                match first {
+                    None => first = Some(self.t1[i]),
+                    Some(f) if f.to_bits() != self.t1[i].to_bits() => return Err((*l, i, "T1map")),
+                    Some(_) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Phantom::relaxation`], with `needs_t1` adding T1 to the constancy test (a 3D echo train
+    /// refocused below 180 degrees). `false` is the 2D rule, unchanged.
+    pub fn relaxation_for(&self, mode: T2Mode, needs_t1: bool) -> Result<(Relaxation, T2Mode), String> {
         let voxel = || Relaxation::Voxel { t2_ms: self.t2_ms(), t2p_ms: self.t2prime_ms() };
+        let constancy = || -> Result<(Vec<f32>, Vec<f32>), ConstancyFailure> {
+            let c = self.constancy()?;
+            if needs_t1 {
+                self.t1_constancy()?;
+            }
+            Ok(c)
+        };
         match mode {
             T2Mode::Voxel => Ok((voxel(), T2Mode::Voxel)),
-            T2Mode::Auto => match self.constancy() {
+            T2Mode::Auto => match constancy() {
                 Ok((t2_ms, t2p_ms)) => Ok((Relaxation::Class { t2_ms, t2p_ms }, T2Mode::Class)),
                 Err(_) => Ok((voxel(), T2Mode::Voxel)),
             },
-            T2Mode::Class => match self.constancy() {
+            T2Mode::Class => match constancy() {
                 Ok((t2_ms, t2p_ms)) => Ok((Relaxation::Class { t2_ms, t2p_ms }, T2Mode::Class)),
                 Err((l, i, map)) => Err(format!(
                     "--t2-mode class: {map} is not constant within label {l} (first differing voxel {i}); \
@@ -529,6 +562,14 @@ mod tests {
         let d = scratch("t1_pert");
         perturb(&d, "T1map", &ph, |v| v[gm] = 1.5);
         assert_eq!(load(&d).unwrap().relaxation(T2Mode::Auto).unwrap().1, T2Mode::Class);
+        // ...except for a 3D echo train refocused below 180 degrees, whose stimulated echoes
+        // depend on T1 (P5 part B): auto falls back to voxel, an explicit class names the map
+        let p = load(&d).unwrap();
+        assert_eq!(p.relaxation_for(T2Mode::Auto, true).unwrap().1, T2Mode::Voxel);
+        let e = p.relaxation_for(T2Mode::Class, true).unwrap_err();
+        assert!(e.contains("label 1") && e.contains("T1map"), "{e}");
+        // and the unperturbed crop stays class under the T1 rule
+        assert_eq!(ph.relaxation_for(T2Mode::Auto, true).unwrap().1, T2Mode::Class);
     }
 
     #[test]

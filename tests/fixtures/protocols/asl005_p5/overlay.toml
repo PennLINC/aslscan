@@ -1,0 +1,17 @@
+# The asl005 acceptance case (P5 plan, Tasks 7 and 10): the real asl005 sidecar and context
+# (../asl005), on the 3 T phantom cropped to 120 mm in z (tools/hrgt_to_bids.py --crop 0:197
+# 8:225 40:160). A 64 x 64 x 30 grid with four interleaved ky segments: the line spacing from
+# DwellTime (0.2048 ms, a lower bound), ESP 13.3824 ms, the train ending at 4.2031 s within
+# 4.95 s. The sidecar has no PhaseEncodingDirection, which GRASE requires.
+seed = 5
+
+[acquisition]
+matrix = [64, 64]
+
+[readout]
+ky_segments = 4
+kz_segments = 1
+phase_encoding_direction = "j-"
+
+[m0]
+repetition_time = 6.0

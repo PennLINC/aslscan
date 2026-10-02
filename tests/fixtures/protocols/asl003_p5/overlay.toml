@@ -1,0 +1,20 @@
+# The asl003 acceptance case (P5 plan, Tasks 7 and 10): the derivative sidecar beside this file
+# (asl003 with its four delays below the 0.7 s bolus cutoff removed, see SOURCES.md), on the 3 T
+# phantom cropped to 192 x 80 x 180 mm (tools/hrgt_to_bids.py --crop 2:194 76:156 5:185). A
+# 24 x 20 matrix with two interleaved ky segments: ten 1 ms lines per echo (the sidecar's
+# EffectiveEchoSpacing 0.5 ms x 2), ESP 12.42 ms, the train ending at 3.378 s within 3.5 s.
+# PASL pulses before the bolus need the bolus-position model with a global region.
+seed = 3
+
+[acquisition]
+matrix = [24, 20]
+
+[readout]
+ky_segments = 2
+
+[background_suppression]
+model = "bolus-position"
+pulse_region = "global"
+
+[m0]
+repetition_time = 5.0
