@@ -169,6 +169,9 @@ pub struct ReadoutOverlay {
     pub spiral_readout_time: Option<f64>,
     /// Spiral dwell time (s); otherwise the sidecar's `DwellTime`.
     pub dwell_time: Option<f64>,
+    /// How much denser than the Nyquist spacing a spiral's turns are (at least 1; default
+    /// [`DEFAULT_RADIAL_OVERSAMPLING`]).
+    pub radial_oversampling: Option<f64>,
 }
 
 /// `[macrovascular]` (P4, part B): per-label values keyed by `dseg.json` names.
@@ -278,6 +281,10 @@ pub const MIN_EXCHANGE_TIME: f64 = 1e-6;
 /// The accepted range of `[physio]` cardiac and respiratory frequencies (Hz): periods of 0.1 to
 /// 100 s, so a period is finite and a series holds a bounded number of them.
 pub const PHYSIO_FREQUENCY_RANGE: (f64, f64) = (0.01, 10.0);
+
+/// A spiral's default radial oversampling (P5 part C, amended): its turns 1/1.2 cycle/FOV apart,
+/// the margin at which the reconstruction recovers every in-band image direction.
+pub const DEFAULT_RADIAL_OVERSAMPLING: f64 = 1.2;
 
 /// The acquisition values `asldro = true` pins, as `(overlay key, value)`: what simasl's
 /// acquisition can express (no readout effects, one coil, full sampling, unit scale, and the
@@ -480,6 +487,7 @@ pub struct ReadoutSpec {
     /// Spirals (part C): interleaves and the readout duration (ms), both required.
     pub interleaves: Option<(usize, Source)>,
     pub spiral_readout_ms: Option<(f64, Source)>,
+    pub radial_oversampling: Option<(f64, Source)>,
 }
 
 /// The readout completed with the acquisition grid (P5 plan, Task 7): the echo train, the line
@@ -518,6 +526,8 @@ pub struct SpiralResolution {
     pub n_turns: f64,
     /// The constant-angular-velocity centre region the sampling bound requires (ms).
     pub tau_c_ms: f64,
+    /// The turns' density over the Nyquist spacing, and its source.
+    pub radial_oversampling: (f64, Source),
 }
 
 /// The resolved gradient-echo excitation (P5 addendum, part A) with its source.
@@ -1412,10 +1422,11 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
             let grase_only = [("ky_segments", r.ky_segments.is_some()), ("line_spacing", r.line_spacing.is_some()),
                               ("readout_samples", r.readout_samples.is_some())];
             let spiral_only = [("interleaves", r.interleaves.is_some()),
-                               ("spiral_readout_time", r.spiral_readout_time.is_some()), ("dwell_time", r.dwell_time.is_some())];
+                               ("spiral_readout_time", r.spiral_readout_time.is_some()), ("dwell_time", r.dwell_time.is_some()),
+                               ("radial_oversampling", r.radial_oversampling.is_some())];
             let (wrong, other) = match kind {
-                ReadoutKind::Grase => (&spiral_only, "spiral"),
-                ReadoutKind::Spiral => (&grase_only, "GRASE"),
+                ReadoutKind::Grase => (&spiral_only[..], "spiral"),
+                ReadoutKind::Spiral => (&grase_only[..], "GRASE"),
             };
             if let Some((key, _)) = wrong.iter().find(|(_, on)| *on) {
                 return Err(format!("overlay: readout.{key} is a {other} key; the readout is {}", kind.as_str()));
@@ -1470,6 +1481,16 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                     };
                     (Some((il, Source::Overlay)), Some((t, Source::Overlay)), Some(dwell))
                 }
+            };
+            // the spiral's radial margin over Nyquist (P5 part C, amended): at exactly Nyquist some
+            // image directions are not recoverable
+            let radial_oversampling = match (kind, r.radial_oversampling) {
+                (ReadoutKind::Grase, _) => None,
+                (ReadoutKind::Spiral, Some(v)) if v.is_finite() && v >= 1.0 => Some((v, Source::Overlay)),
+                (ReadoutKind::Spiral, Some(v)) => {
+                    return Err(format!("overlay: readout.radial_oversampling {v} must be at least 1"))
+                }
+                (ReadoutKind::Spiral, None) => Some((DEFAULT_RADIAL_OVERSAMPLING, Source::Default)),
             };
             // NumberShots: absent means 1 for GRASE; a spiral's interleaves are shots by
             // construction, so absent it is interleaves x kz_segments, and given it must agree
@@ -1540,6 +1561,7 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                 dwell_time_s,
                 interleaves,
                 spiral_readout_ms,
+                radial_oversampling,
             })
         }
     };
@@ -2289,8 +2311,8 @@ fn resolve_spiral(p: &Protocol, r: &ReadoutSpec, acq_dims: [usize; 3]) -> Result
              segments; crop the phantom or change kz_segments"));
     }
     let etl = nz / kz_segments;
-    let (Some((interleaves, _)), Some((readout_ms, _)), Some((dwell_s, dwell_source))) =
-        (r.interleaves, r.spiral_readout_ms, r.dwell_time_s) else {
+    let (Some((interleaves, _)), Some((readout_ms, _)), Some((dwell_s, dwell_source)), Some(radial_oversampling)) =
+        (r.interleaves, r.spiral_readout_ms, r.dwell_time_s, r.radial_oversampling) else {
         unreachable!("a parsed spiral carries its interleaves, readout time and dwell time")
     };
     let dwell_ms = dwell_s * 1000.0;
@@ -2310,7 +2332,7 @@ fn resolve_spiral(p: &Protocol, r: &ReadoutSpec, acq_dims: [usize; 3]) -> Result
         None => spiral_esp_from_echo_time(te_ms, e_c),
     };
     let train = EchoTrain { esp_ms, ..probe };
-    let readout = Readout3d::Spiral { interleaves, readout_ms, dwell_ms };
+    let readout = Readout3d::Spiral { interleaves, readout_ms, dwell_ms, radial_oversampling: radial_oversampling.0 };
     let table = spiral_lines(&train, &readout, nx, ny, nz)?;
     debug_assert_eq!(table.n_shots, r.number_shots.0);
     let mut seen: Vec<(u64, u64)> = Vec::new();
@@ -2327,7 +2349,8 @@ fn resolve_spiral(p: &Protocol, r: &ReadoutSpec, acq_dims: [usize; 3]) -> Result
         n_shots: table.n_shots, train, readout, epi: 0, etl, t_line_ms: 0.0, t_line_source: "", effective_spacing_s: None,
         esp_ms, e_c, t_kyc_ms: 0.0,
         spiral: Some(SpiralResolution {
-            interleaves, readout_ms, dwell_ms, dwell_source, samples_per_interleaf: tj.n_samples(), k_max: tj.k_max,
+            interleaves, readout_ms, dwell_ms, dwell_source, radial_oversampling, samples_per_interleaf: tj.n_samples(),
+            k_max: tj.k_max,
             n_turns: tj.n_turns, tau_c_ms: tj.tau_c_ms,
         }),
     })
@@ -3340,8 +3363,9 @@ mod tests {
             let sp = res.spiral.as_ref().unwrap();
             assert_eq!((res.etl, res.e_c, res.n_shots, sp.interleaves, sp.samples_per_interleaf), (20, 1, 8, 8, 1000));
             assert!((res.esp_ms - 10.528).abs() < 1e-9 && (sp.dwell_ms - 0.004).abs() < 1e-15, "{res:?}");
-            assert!(sp.tau_c_ms > 0.0 && sp.tau_c_ms < 0.02, "{}", sp.tau_c_ms);
-            assert_eq!(res.readout, Readout3d::Spiral { interleaves: 8, readout_ms: 4.0, dwell_ms: sp.dwell_ms });
+            assert!(sp.tau_c_ms > 0.0 && sp.tau_c_ms < 0.1, "{}", sp.tau_c_ms);
+            assert_eq!(res.readout, Readout3d::Spiral { interleaves: 8, readout_ms: 4.0, dwell_ms: sp.dwell_ms, radial_oversampling: 1.2 });
+            assert_eq!(sp.radial_oversampling, (1.2, Source::Default));
             // a rectangular matrix
             assert!(resolve_readout(&p, [64, 48, 20]).unwrap_err().contains("square"));
             // a dwell time past the sampling bound (4.97 us here)
@@ -3396,6 +3420,10 @@ mod tests {
             assert!(parse(&s, &c, Some(&ov), None).unwrap_err().contains("no spiral meaning"), "{knob}");
         }
         assert!(parse(&s, &c, Some(&with("ky_segments = 2\n")), None).unwrap_err().contains("GRASE key"));
+        // the radial oversampling: at least 1, the overlay's when given
+        assert!(parse(&s, &c, Some(&with("radial_oversampling = 0.9\n")), None).unwrap_err().contains("at least 1"));
+        assert_eq!(parse(&s, &c, Some(&with("radial_oversampling = 1.5\n")), None).unwrap().readout.unwrap().radial_oversampling,
+                   Some((1.5, Source::Overlay)));
     }
 
     /// A small GRASE sidecar for the refusal and resolution rules.
@@ -3447,6 +3475,7 @@ mod tests {
         // refocusing range; keys of the other readout; [readout] with 2D
         assert!(err(&grase(), "[readout]\nrefocusing_flip_angle = 190\n").contains("(0, 180]"));
         assert!(err(&grase(), "[readout]\ninterleaves = 8\n").contains("spiral key"));
+        assert!(err(&grase(), "[readout]\nradial_oversampling = 1.2\n").contains("spiral key"));
         assert!(parse(&base(), CTX, Some(&overlay("[readout]\nky_segments = 2\n[m0]\nrepetition_time = 8.0\n")), None)
             .unwrap_err().contains("2D"));
         // GRASE needs a phase-encode direction; the overlay supplies one; spirals refuse it

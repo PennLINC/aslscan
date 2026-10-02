@@ -245,6 +245,8 @@ mod writer {
                                  constant linear velocity outside",
                         "ReadoutTimeMs": sp.readout_ms, "DwellTimeMs": sp.dwell_ms, "DwellTimeSource": sp.dwell_source.as_str(),
                         "SamplesPerInterleaf": sp.samples_per_interleaf, "KMax": sp.k_max, "Turns": sp.n_turns,
+                        "RadialOversampling": { "Value": sp.radial_oversampling.0, "Source": sp.radial_oversampling.1.as_str(),
+                                                "Meaning": "the turns are 1/RadialOversampling cycle/FOV apart across the interleaves" },
                         "CentreRegionMs": sp.tau_c_ms,
                         "SamplingBound": "k-space speed x dwell time <= 1 cycle/FOV on the continuous trajectory",
                     },
