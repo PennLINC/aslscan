@@ -31,6 +31,11 @@ PARENT=$(cd "$HERE/.." && pwd)
 LIVE_M=$PARENT/mrsim-acq
 BASE=$PARENT/p5-base
 OUT=$HERE/work/regress
+# one run at a time: runs share work/regress and the base and snapshot target directories, and a
+# second run clears the first's outputs mid-comparison
+mkdir -p "$HERE/work"
+exec 9>"$HERE/work/regress.lock"
+flock -n 9 || { echo "another regress_identity.sh run holds $HERE/work/regress.lock"; exit 1; }
 rm -rf "$OUT"; mkdir -p "$OUT/inputs"
 
 common() { realpath "$(git -C "$1" rev-parse --path-format=absolute --git-common-dir)"; }
