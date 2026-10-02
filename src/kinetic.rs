@@ -548,7 +548,8 @@ mod tests {
 
     /// `x` and its representable neighbours.
     fn around(x: f64) -> [f64; 3] {
-        [f64::from_bits(x.to_bits() - 1), x, f64::from_bits(x.to_bits() + 1)]
+        // wrapping: below 0.0 the neighbour is a NaN pattern, which the partition filters out
+        [f64::from_bits(x.to_bits().wrapping_sub(1)), x, f64::from_bits(x.to_bits().wrapping_add(1))]
     }
 
     #[test]
