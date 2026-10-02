@@ -200,6 +200,55 @@ mod writer {
             if out.mode == T2Mode::Voxel && r3.train.refocusing_deg != 180.0 {
                 approx.push("voxel mode: a mixed cell's T1 is the M0-weighted rate mean, as for T2 (not a mixture of echo trains)");
             }
+            if let Some(sp) = &r3.spiral {
+                approx.push("the spiral's sampling bound is on k-space speed (one cycle/FOV per dwell time), not a gradient or slew limit");
+                approx.push("an ideal trajectory: no gradient delays or eddy currents");
+                let segs = out.spiral_segmentation.as_deref().unwrap_or(&[]);
+                let fold = |voxel: bool| {
+                    let s: Vec<_> = segs.iter().filter(|g| g.voxel == voxel).collect();
+                    (!s.is_empty()).then(|| json!({
+                        "Segments": s.iter().map(|g| g.l).max(), "ChebyshevDegree": s.iter().map(|g| g.m).max(),
+                        "CoefficientSum": s.iter().map(|g| g.b_sum).fold(0.0, f64::max),
+                        "CertifiedBound": s.iter().map(|g| g.bound).fold(0.0, f64::max),
+                        "PerSlice": s.iter().map(|g| json!([g.l, g.m, g.bound])).collect::<Vec<_>>(),
+                    }))
+                };
+                block["Readout"] = json!({
+                    "Type": rs.kind.0.as_str(), "TypeSource": rs.kind.1.as_str(),
+                    "NumberShots": r3.n_shots, "Interleaves": sp.interleaves, "KzSegments": rs.kz_segments.0,
+                    "EchoTrainLength": r3.etl,
+                    "EchoSpacingMs": r3.esp_ms,
+                    "EchoSpacingSource": if rs.echo_spacing_ms.is_some() { "overlay readout.echo_spacing" }
+                                         else { "EchoTime, the k-space-centre time: each spiral starts at its echo, so CentreEcho x ESP" },
+                    "KzOrder": match rs.kz_order.0 { mrsim_acq::readout::KzOrder::Centric => "centric", _ => "linear" },
+                    "CentreEcho": r3.e_c,
+                    "RefocusingFlipAngle": { "Value": rs.refocusing_flip_deg.0, "Source": rs.refocusing_flip_deg.1.as_str() },
+                    "FlipAngleInterpretation": "the sidecar's FlipAngle is the echo train's refocusing angle; the excitation is 90 degrees",
+                    "RefocusingTimeMs": { "Value": rs.refocusing_time_ms.0, "Source": rs.refocusing_time_ms.1.as_str() },
+                    "ExcitationTimes": p.rows.iter().map(|r| r.t).collect::<Vec<f64>>(),
+                    "ShotOrder": "s = interleaf * KzSegments + kz_segment, one RepetitionTimePreparation apart",
+                    "VolumeDuration": r3.n_shots as f64 * tr0,
+                    "Trajectory": {
+                        "Kind": "Archimedean constant-density spiral-out, constant angular velocity inside CentreRegionMs, \
+                                 constant linear velocity outside",
+                        "ReadoutTimeMs": sp.readout_ms, "DwellTimeMs": sp.dwell_ms, "DwellTimeSource": sp.dwell_source.as_str(),
+                        "SamplesPerInterleaf": sp.samples_per_interleaf, "KMax": sp.k_max, "Turns": sp.n_turns,
+                        "CentreRegionMs": sp.tau_c_ms,
+                        "SamplingBound": "k-space speed x dwell time <= 1 cycle/FOV on the continuous trajectory",
+                    },
+                    "TimeSegmentation": {
+                        "Method": "least-squares interpolators on a tensor Chebyshev grid of the rate rectangle, \
+                                   certified for every rate in it",
+                        "Target": spiral_bound_target(),
+                        "Class": fold(false), "Voxel": fold(true),
+                    },
+                    "Reconstruction": spiral_reconstruction_block(),
+                    "SeedSalt": format!("{:#x}", mrsim_acq::kspace3d::SEED_SALT_3D),
+                    "Noise": "per complex sample as Cartesian; the image noise after the least squares is measured, \
+                              not asserted (about the Cartesian 3D value in the tests)",
+                    "Approximations": approx,
+                });
+            } else {
             block["Readout"] = json!({
                 "Type": rs.kind.0.as_str(), "TypeSource": rs.kind.1.as_str(),
                 "NumberShots": r3.n_shots, "KySegments": rs.ky_segments.0, "KzSegments": rs.kz_segments.0,
@@ -222,14 +271,21 @@ mod writer {
                           (linear Cartesian reconstruction; measured, not asserted, under GRAPPA)",
                 "Approximations": approx,
             });
+            }
             if let Some(amps) = &out.echo_amplitudes {
-                let table = mrsim_acq::readout::grase_lines(&r3.train, &r3.readout, ny, nz).map_err(|e| e.to_string());
+                // the echo reading each partition
+                let echo_of: Option<Vec<usize>> = if r3.spiral.is_some() {
+                    mrsim_acq::readout::spiral_lines(&r3.train, &r3.readout, ny, ny, nz).ok().map(|t| t.echo)
+                } else {
+                    mrsim_acq::readout::grase_lines(&r3.train, &r3.readout, ny, nz).ok()
+                        .map(|t| (0..nz).map(|q| t.line(q, 0).echo).collect())
+                };
                 let mut labels = Map::new();
                 let mut kz = Map::new();
                 for (name, a) in amps {
                     labels.insert(name.clone(), json!(a));
-                    if let Ok(t) = &table {
-                        kz.insert(name.clone(), json!((0..nz).map(|q| a[t.line(q, 0).echo - 1]).collect::<Vec<f64>>()));
+                    if let Some(e) = &echo_of {
+                        kz.insert(name.clone(), json!(e.iter().map(|&x| a[x - 1]).collect::<Vec<f64>>()));
                     }
                 }
                 block["EchoAmplitudes"] = json!({
@@ -460,11 +516,16 @@ mod writer {
         // P5 part B: a 3D readout's standard keys as resolved (the effective spacing BIDS defines,
         // TotalReadoutTime = it x (ny - 1), the direction, the shots, the refocusing angle)
         if let (Some(r3), Some(rs)) = (&out.readout, &p.readout) {
-            let ny = out.acq_grid.dims[1];
-            let ees = r3.effective_spacing_s.unwrap_or(r3.t_line_ms / 1000.0 / rs.ky_segments.0 as f64);
-            effective.push(("EffectiveEchoSpacing", json!(ees)));
-            effective.push(("TotalReadoutTime", json!(ees * (ny as f64 - 1.0))));
-            effective.push(("PhaseEncodingDirection", json!(p.phase_encoding_direction)));
+            if let Some(sp) = &r3.spiral {
+                // a spiral has no phase-encode readout (its EES, TRT and PED were refused)
+                effective.push(("DwellTime", json!(sp.dwell_ms / 1000.0)));
+            } else {
+                let ny = out.acq_grid.dims[1];
+                let ees = r3.effective_spacing_s.unwrap_or(r3.t_line_ms / 1000.0 / rs.ky_segments.0 as f64);
+                effective.push(("EffectiveEchoSpacing", json!(ees)));
+                effective.push(("TotalReadoutTime", json!(ees * (ny as f64 - 1.0))));
+                effective.push(("PhaseEncodingDirection", json!(p.phase_encoding_direction)));
+            }
             effective.push(("NumberShots", json!(r3.n_shots)));
             effective.push(("FlipAngle", json!(rs.refocusing_flip_deg.0)));
         }
@@ -532,11 +593,15 @@ mod writer {
                 (None, None) => (90.0, "se", "a plain spin-echo readout at its own repetition time: no suppression, no inversion, no motion"),
             };
             if let (Some(r3), Some(rs)) = (&out.readout, &p.readout) {
-                let ny = out.acq_grid.dims[1];
-                let ees = r3.effective_spacing_s.unwrap_or(r3.t_line_ms / 1000.0 / rs.ky_segments.0 as f64);
-                m0side.insert("EffectiveEchoSpacing".to_string(), json!(ees));
-                m0side.insert("TotalReadoutTime".to_string(), json!(ees * (ny as f64 - 1.0)));
-                m0side.insert("PhaseEncodingDirection".to_string(), json!(p.phase_encoding_direction));
+                if let Some(sp) = &r3.spiral {
+                    m0side.insert("DwellTime".to_string(), json!(sp.dwell_ms / 1000.0));
+                } else {
+                    let ny = out.acq_grid.dims[1];
+                    let ees = r3.effective_spacing_s.unwrap_or(r3.t_line_ms / 1000.0 / rs.ky_segments.0 as f64);
+                    m0side.insert("EffectiveEchoSpacing".to_string(), json!(ees));
+                    m0side.insert("TotalReadoutTime".to_string(), json!(ees * (ny as f64 - 1.0)));
+                    m0side.insert("PhaseEncodingDirection".to_string(), json!(p.phase_encoding_direction));
+                }
                 m0side.insert("NumberShots".to_string(), json!(r3.n_shots));
             }
             let mut m0_replaced = Map::new();
@@ -686,6 +751,36 @@ mod writer {
             }
         }
         Ok(())
+    }
+
+    /// The spiral path's certified-bound target (P5 part C); spirals need the `kspace` feature, and
+    /// `resolve_readout` refuses them without it.
+    #[cfg(feature = "kspace")]
+    fn spiral_bound_target() -> f64 {
+        mrsim_acq::tseg::BOUND_TARGET
+    }
+    #[cfg(not(feature = "kspace"))]
+    fn spiral_bound_target() -> f64 {
+        unreachable!("spiral readouts are refused without the kspace feature")
+    }
+
+    /// The spiral reconstruction's fixed parameters, as the sidecar records them (P5 part C).
+    #[cfg(feature = "kspace")]
+    fn spiral_reconstruction_block() -> Value {
+        use mrsim_acq::grid_recon as gr;
+        json!({
+            "Method": "density-weighted least squares per coil and partition, a fixed Chebyshev semi-iteration (linear in \
+                       the data), then the Roemer combine",
+            "Iterations": gr::LS_ITERATIONS, "IntervalRatio": gr::LS_KAPPA,
+            "PowerIterations": gr::POWER_ITERATIONS, "EigenvalueMargin": gr::LAMBDA_MARGIN,
+            "DensityCompensation": "Pipe-Menon, operator form, normalized so a constant object grids to its Cartesian value \
+                                    at the image centre",
+            "DensityIterations": gr::DCF_ITERATIONS,
+        })
+    }
+    #[cfg(not(feature = "kspace"))]
+    fn spiral_reconstruction_block() -> Value {
+        unreachable!("spiral readouts are refused without the kspace feature")
     }
 }
 

@@ -779,3 +779,88 @@ fn linearity_holds_for_grase_with_every_part_on() {
                           &grase_all("deltam", RowOverride::None));
     assert!(bad > 1e2, "{bad}");
 }
+
+// ---- P5 part C: the stack of spirals ----
+
+/// A small spiral protocol on the crop: 2 x 2 x 3 mm (12 x 12 x 2), two interleaves of a 4 ms
+/// spiral sampled every 20 us (two shots), refocusing at 150 degrees, with every P4 part,
+/// physiological noise and a shot dropout event on, as [`grase_all`].
+#[cfg(feature = "kspace")]
+fn spiral_all(rows: &str, ov: RowOverride) -> Vec<(f64, f64)> {
+    image_of(&spiral_protocol(rows), ov)
+}
+
+fn spiral_protocol(rows: &str) -> Protocol {
+    let s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": true, "BackgroundSuppressionNumberPulses": 2,
+        "BackgroundSuppressionPulseTime": [1.5, 3.2], "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
+        "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "3D", "PulseSequenceType": "spiral", "FlipAngle": 150,
+        "VascularCrushing": true, "VascularCrushingVENC": 4.0
+    });
+    let ov_toml: Overlay = toml::from_str(
+        "seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n\
+         [readout]\ninterleaves = 2\nspiral_readout_time = 4.0\ndwell_time = 2e-5\n\
+         [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n\
+         [kinetic]\nexchange_time = 0.4\n\
+         [macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
+         arterial_transit_time = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n\
+         [vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n\
+         [physio]\ntissue_cardiac = 0.05\nlabel_cardiac = 0.05\nlabel_drift = 0.02\n\
+         [motion]\nwithin_volume = { dropout_rate = 1.0, severity = 0.3, jump_mm = [0.4, 0.0, 0.0], jump_deg = [0.0, 0.0, 1.0] }\n"
+    ).unwrap();
+    let ctx = format!("volume_type\n{}\n", rows.split(',').collect::<Vec<_>>().join("\n"));
+    parse(&s, &ctx, Some(&ov_toml), crop().params.as_ref()).unwrap()
+}
+
+/// P5 acceptance (plan, Task 14): the linearity identity holds through the spiral path (its
+/// reconstruction is linear), with its negative control.
+#[cfg(feature = "kspace")]
+#[test]
+fn linearity_holds_for_spirals_with_every_part_on() {
+    let worst = residual_of(&spiral_all("control", RowOverride::None), &spiral_all("label", RowOverride::None),
+                            &spiral_all("deltam", RowOverride::None));
+    println!("linearity, spiral with every P4 part, physio and a shot event: worst residual / tolerance = {worst:.3}");
+    assert!(worst <= 1.0, "{worst}");
+    let bad = residual_of(&spiral_all("control", RowOverride::None), &spiral_all("label", RowOverride::FlipLabelSign),
+                          &spiral_all("deltam", RowOverride::None));
+    assert!(bad > 1e2, "{bad}");
+}
+
+/// The spiral sidecar records the trajectory, the certified segmentation and the reconstruction,
+/// and none of the phase-encode keys.
+#[cfg(feature = "kspace")]
+#[test]
+fn spiral_sidecars() {
+    let p = spiral_protocol("control,label");
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let r3 = out.readout.as_ref().unwrap();
+    assert_eq!((r3.n_shots, r3.spiral.as_ref().unwrap().interleaves), (2, 2));
+    let segs = out.spiral_segmentation.as_ref().unwrap();
+    assert!(!segs.is_empty() && segs.iter().all(|g| g.bound < 1e-7));
+    let dir = std::env::temp_dir().join(format!("aslscan-spiral-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("sub-01/perf/sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    let ro = &side["AslscanSimulation"]["Readout"];
+    assert_eq!(ro["Type"], json!("spiral"));
+    assert_eq!(ro["Interleaves"], json!(2));
+    assert_eq!(ro["Trajectory"]["SamplesPerInterleaf"], json!(200));
+    assert!(ro["TimeSegmentation"]["Class"]["CertifiedBound"].as_f64().unwrap() < 1e-7);
+    assert_eq!(ro["Reconstruction"]["Iterations"], json!(mrsim_acq::grid_recon::LS_ITERATIONS));
+    assert_eq!(side["NumberShots"], json!(2));
+    assert_eq!(side["DwellTime"], json!(2e-5));
+    for key in ["PhaseEncodingDirection", "TotalReadoutTime", "EffectiveEchoSpacing"] {
+        assert!(side.get(key).is_none(), "{key}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without the `kspace` feature a spiral is an error naming it, before anything is simulated.
+#[cfg(not(feature = "kspace"))]
+#[test]
+fn spirals_need_the_kspace_feature() {
+    let e = simulate_with(&spiral_protocol("control"), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap_err();
+    assert!(e.contains("kspace"), "{e}");
+}

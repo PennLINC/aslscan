@@ -128,7 +128,16 @@ fn run() -> Result<(), String> {
         "simulated: acquisition {:?}, simulation {:?}, T2 mode {}, {} compartments, {:.1?}",
         out.acq_grid.dims, out.sim_grid.dims, out.mode.as_str(), out.n_compartments, t1.elapsed(),
     );
-    if let Some(r) = &out.readout {
+    if let (Some(r), Some(sp)) = (&out.readout, out.readout.as_ref().and_then(|r| r.spiral.as_ref())) {
+        let segs = out.spiral_segmentation.as_deref().unwrap_or(&[]);
+        println!(
+            "readout: 3D spiral train, {} shot(s), {} echoes of {:.4} ms, {} interleaves of {} samples over {} ms \
+             (dwell {} ms, centre region {:.4} ms), refocusing {} degrees; segmentation L <= {}, bound <= {:.1e}",
+            r.n_shots, r.etl, r.esp_ms, sp.interleaves, sp.samples_per_interleaf, sp.readout_ms, sp.dwell_ms, sp.tau_c_ms,
+            r.train.refocusing_deg, segs.iter().map(|g| g.l).max().unwrap_or(0),
+            segs.iter().map(|g| g.bound).fold(0.0, f64::max),
+        );
+    } else if let Some(r) = &out.readout {
         println!(
             "readout: 3D {} train, {} shot(s), {} echoes of {:.4} ms, {} lines of {:.4} ms per echo ({}), refocusing {} degrees",
             p.readout.as_ref().map_or("?", |s| s.kind.0.as_str()), r.n_shots, r.etl, r.esp_ms, r.epi, r.t_line_ms,

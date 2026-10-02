@@ -141,6 +141,9 @@ pub struct SeriesOutput {
     /// P5 part B: per label (and the blood), its name and the EPG echo amplitudes of the train,
     /// from the label's T1 and T2 (in voxel mode the first voxel's, indicative).
     pub echo_amplitudes: Option<Vec<(String, Vec<f64>)>>,
+    /// P5 part C: a spiral's certified time segmentations, per slice and mode, as the acquisition
+    /// used them (`None` unless a spiral).
+    pub spiral_segmentation: Option<Vec<mrsim_acq::kspace3d::SpiralSegmentation>>,
 }
 
 /// The compat noise resolution (P2 addendum, part A).
@@ -1124,6 +1127,18 @@ fn simulate_core(
             }
             LineWeights { n_shots, n_compartments: ncomp, w }
         });
+    // P5 part C: a spiral's time segmentation, certified per slice before the acquisition runs it
+    // (an uncertifiable rate rectangle is an error here, not a panic there)
+    #[cfg(feature = "kspace")]
+    let spiral_segmentation = match &res3d {
+        Some(r3) if r3.spiral.is_some() => Some(mrsim_acq::kspace3d::spiral_segmentation(
+            sim_grid.dims, acq_grid.dims, &t2_vols, t1_vols.as_deref(), &fmap_sim, Some(&ti_vols), &acq, &r3.train,
+            &r3.readout,
+        )?),
+        _ => None,
+    };
+    #[cfg(not(feature = "kspace"))]
+    let spiral_segmentation = None;
     let (mag, phase_out) = match &res3d {
         None => simulate_acquisition_oversampled(
             sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, &fmap_sim, Some(&ti_vols), &acq,
@@ -1216,6 +1231,7 @@ fn simulate_core(
         crush_survival: p4.crush.clone(), physio: p4.physio.as_ref().map(|_| physio_lines),
         readout: res3d.clone(),
         echo_amplitudes,
+        spiral_segmentation,
         ge_rule: ge_flip.map(|fa| match (p.compat.is_some(), fa == 90.0, ge_propagated.is_some(), p.suppression.is_some()) {
             (true, ..) => "simasl's coherent steady state per volume (compat)",
             (_, true, ..) => "90 degrees: the slab is saturated, each row independent (P3's timeline, sin(a) = 1)",

@@ -19,3 +19,6 @@ Only the JSON sidecar and aslcontext.tsv are kept; no image data.
   refuses for PASL (`protocol.rs`, the PASL cutoff rule; lifting it is not P5 work). Nothing else
   changes: `RepetitionTimePreparation` is a scalar, and `EffectiveEchoSpacing`, `NumberShots`,
   `FlipAngle` and the suppression pulse times are kept.
+- `asl001_p5/overlay.toml`: an overlay for the unchanged `asl001/` sidecar and context (P5 plan,
+  Task 14): the in-plane matrix and the spiral's interleaves, readout time and dwell time, which
+  the sidecar does not carry and which have no defensible default.

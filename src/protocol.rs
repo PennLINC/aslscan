@@ -15,7 +15,10 @@ use std::path::Path;
 
 use mrsim_acq::kspace::{Acquisition, EchoFormation, KspaceWindow, PartialFourierMode};
 use mrsim_acq::motion::{load_motion_tsv, MotionMode};
-use mrsim_acq::readout::{centre_echo, check_grase_timing, esp_from_echo_time, grase_block, grase_lines, EchoTrain, KzOrder, Readout3d};
+use mrsim_acq::readout::{
+    centre_echo, check_grase_timing, check_spiral_timing, esp_from_echo_time, grase_block, grase_lines, spiral_esp_from_echo_time,
+    spiral_lines, EchoTrain, KzOrder, Readout3d,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -160,11 +163,11 @@ pub struct ReadoutOverlay {
     pub readout_samples: Option<usize>,
     /// `"j"` or `"j-"`, GRASE; over the sidecar's.
     pub phase_encoding_direction: Option<String>,
-    /// Spiral interleaves (milestone C).
+    /// Spiral interleaves (shots per kz segment), required for a spiral.
     pub interleaves: Option<usize>,
-    /// Spiral readout duration (ms, milestone C).
+    /// Spiral readout duration (ms), required for a spiral.
     pub spiral_readout_time: Option<f64>,
-    /// Spiral dwell time (s, milestone C); otherwise the sidecar's `DwellTime`.
+    /// Spiral dwell time (s); otherwise the sidecar's `DwellTime`.
     pub dwell_time: Option<f64>,
 }
 
@@ -471,7 +474,12 @@ pub struct ReadoutSpec {
     pub readout_samples: Option<usize>,
     pub effective_echo_spacing_s: Option<f64>,
     pub total_readout_time_s: Option<f64>,
-    pub dwell_time_s: Option<f64>,
+    /// The dwell time (s): GRASE's line-spacing fallback (sidecar only); a spiral's sampling
+    /// interval (overlay over sidecar).
+    pub dwell_time_s: Option<(f64, Source)>,
+    /// Spirals (part C): interleaves and the readout duration (ms), both required.
+    pub interleaves: Option<(usize, Source)>,
+    pub spiral_readout_ms: Option<(f64, Source)>,
 }
 
 /// The readout completed with the acquisition grid (P5 plan, Task 7): the echo train, the line
@@ -489,9 +497,27 @@ pub struct ReadoutResolution {
     /// BIDS's effective spacing (s), when one is defined.
     pub effective_spacing_s: Option<f64>,
     pub esp_ms: f64,
-    /// The echo reading the kz centre, and the centre line's time from its echo (ms).
+    /// The echo reading the kz centre, and the centre line's time from its echo (ms; zero for a
+    /// spiral, which starts at its echo).
     pub e_c: usize,
     pub t_kyc_ms: f64,
+    /// A spiral's in-plane design (part C); `None` for GRASE. For a spiral the GRASE-only fields
+    /// above (`epi`, `t_line_ms`, `t_line_source`, `effective_spacing_s`) are zero or empty.
+    pub spiral: Option<SpiralResolution>,
+}
+
+/// A spiral readout as resolved (P5 addendum, part C, "Trajectory" and "Inputs").
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpiralResolution {
+    pub interleaves: usize,
+    pub readout_ms: f64,
+    pub dwell_ms: f64,
+    pub dwell_source: Source,
+    pub samples_per_interleaf: usize,
+    pub k_max: f64,
+    pub n_turns: f64,
+    /// The constant-angular-velocity centre region the sampling bound requires (ms).
+    pub tau_c_ms: f64,
 }
 
 /// The resolved gradient-echo excitation (P5 addendum, part A) with its source.
@@ -1405,10 +1431,13 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                     return Err(format!("asl.json: PartialFourierDirection {d:?}: partial Fourier along kz is deferred"));
                 }
             }
-            let number_shots = match sidecar.get("NumberShots") {
-                None | Some(Value::Null) => (1usize, Source::Default),
+            let pos = |v: Option<f64>, what: &str| -> Result<Option<f64>, String> {
+                v.map(|x| require_finite_positive(x, what)).transpose()
+            };
+            let side_shots = match sidecar.get("NumberShots") {
+                None | Some(Value::Null) => None,
                 Some(Value::Number(x)) if x.as_f64().is_some_and(|v| v >= 1.0 && v.fract() == 0.0) =>
-                    (x.as_f64().unwrap() as usize, Source::Sidecar),
+                    Some(x.as_f64().unwrap() as usize),
                 Some(other) => return Err(format!(
                     "asl.json: NumberShots {other}: a positive integer is supported (the before/after-centre array \
                      form is not)")),
@@ -1418,9 +1447,50 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                 Some(v) => (v, Source::Overlay),
                 None => (1, Source::Default),
             };
+            // spirals (part C): interleaves and the readout duration have no defensible default;
+            // the dwell time is the overlay's, else the sidecar's DwellTime
+            let side_dwell = pos(opt_num(sidecar, "DwellTime")?, "asl.json: DwellTime")?;
+            let (interleaves, spiral_readout_ms, dwell_time_s) = match kind {
+                ReadoutKind::Grase => (None, None, side_dwell.map(|d| (d, Source::Sidecar))),
+                ReadoutKind::Spiral => {
+                    let il = match r.interleaves {
+                        Some(0) => return Err("overlay: readout.interleaves must be at least 1".to_string()),
+                        Some(v) => v,
+                        None => return Err("a spiral readout needs [readout] interleaves (no default: product spirals \
+                                            differ between vendors and releases)".to_string()),
+                    };
+                    let t = pos(r.spiral_readout_time, "overlay readout.spiral_readout_time")?.ok_or(
+                        "a spiral readout needs [readout] spiral_readout_time (ms; no default: product spirals differ \
+                         between vendors and releases)".to_string())?;
+                    let dwell = match (pos(r.dwell_time, "overlay readout.dwell_time")?, side_dwell) {
+                        (Some(v), _) => (v, Source::Overlay),
+                        (None, Some(v)) => (v, Source::Sidecar),
+                        (None, None) => return Err("a spiral readout needs its dwell time: the sidecar has no DwellTime; \
+                                                    give [readout] dwell_time (s)".to_string()),
+                    };
+                    (Some((il, Source::Overlay)), Some((t, Source::Overlay)), Some(dwell))
+                }
+            };
+            // NumberShots: absent means 1 for GRASE; a spiral's interleaves are shots by
+            // construction, so absent it is interleaves x kz_segments, and given it must agree
+            let number_shots = match (kind, side_shots) {
+                (ReadoutKind::Spiral, s) => {
+                    let n = interleaves.map_or(1, |v| v.0) * kz_segments.0;
+                    if let Some(s) = s {
+                        if s != n {
+                            return Err(format!("asl.json: NumberShots {s}, but a spiral of {} interleaves x {} kz segments \
+                                                has {n} shots", n / kz_segments.0, kz_segments.0));
+                        }
+                    }
+                    (n, if s.is_some() { Source::Sidecar } else { Source::Default })
+                }
+                (_, Some(s)) => (s, Source::Sidecar),
+                (_, None) => (1usize, Source::Default),
+            };
             let ky_segments = match r.ky_segments {
                 Some(0) => return Err("overlay: readout.ky_segments must be at least 1".to_string()),
                 Some(v) => (v, Source::Overlay),
+                None if kind == ReadoutKind::Spiral => (1, Source::Default),
                 None if number_shots.0 % kz_segments.0 == 0 => (number_shots.0 / kz_segments.0, Source::Default),
                 None => return Err(format!(
                     "NumberShots {} does not divide into {} kz segments", number_shots.0, kz_segments.0)),
@@ -1435,9 +1505,6 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                 Some("centric") => (KzOrder::Centric, Source::Overlay),
                 Some("linear") => (KzOrder::Linear, Source::Overlay),
                 Some(other) => return Err(format!("overlay: readout.kz_order {other:?}: expected \"centric\" or \"linear\"")),
-            };
-            let pos = |v: Option<f64>, what: &str| -> Result<Option<f64>, String> {
-                v.map(|x| require_finite_positive(x, what)).transpose()
             };
             let refocusing_time_ms = match pos(r.refocusing_time, "overlay readout.refocusing_time")? {
                 Some(v) => (v, Source::Overlay),
@@ -1470,7 +1537,9 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                 readout_samples,
                 effective_echo_spacing_s: pos(opt_num(sidecar, "EffectiveEchoSpacing")?, "asl.json: EffectiveEchoSpacing")?,
                 total_readout_time_s: (total_readout_time_s > 0.0).then_some(total_readout_time_s),
-                dwell_time_s: pos(opt_num(sidecar, "DwellTime")?, "asl.json: DwellTime")?,
+                dwell_time_s,
+                interleaves,
+                spiral_readout_ms,
             })
         }
     };
@@ -1842,6 +1911,21 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
             }
         }
     }
+    if readout_kind.is_some_and(|k| k.0 == ReadoutKind::Spiral) {
+        // GRAPPA, partial Fourier, Nyquist ghosting and spikes are Cartesian phase-encode effects
+        // with no spiral meaning in this model (P5 part C)
+        for (key, on) in [("partial_fourier", acq.partial_fourier != 1.0), ("ghost_offset", acq.ghost_offset != 0.0),
+                          ("n_spikes", acq.n_spikes != 0)] {
+            if on {
+                return Err(format!("overlay: acquisition.{key} with a spiral readout: a Cartesian phase-encode effect \
+                                    with no spiral meaning in this model"));
+            }
+        }
+        if accel != 1 {
+            return Err(format!("asl.json: ParallelReductionFactorInPlane {accel} with a spiral readout: GRAPPA has no \
+                                spiral meaning in this model"));
+        }
+    }
 
     // Compat (P2 addendum, part A): pinned values checked against what was set explicitly.
     let co = overlay.and_then(|o| o.compat.as_ref());
@@ -2085,7 +2169,7 @@ pub fn resolve_readout(p: &Protocol, acq_dims: [usize; 3]) -> Result<Option<Read
     let Some(r) = &p.readout else { return Ok(None) };
     let [nx, ny, nz] = acq_dims;
     if r.kind.0 == ReadoutKind::Spiral {
-        return Err("the stack-of-spirals readout is P5's milestone C and is not yet available".to_string());
+        return resolve_spiral(p, r, acq_dims).map(Some);
     }
     let (ky_segments, kz_segments) = (r.ky_segments.0, r.kz_segments.0);
     if ny % ky_segments != 0 {
@@ -2125,7 +2209,7 @@ pub fn resolve_readout(p: &Protocol, acq_dims: [usize; 3]) -> Result<Option<Read
             (v, "overlay readout.line_spacing")
         }
         (None, Some(e), _) => (e * 1000.0 * ky_segments as f64, "effective echo spacing x ky segments"),
-        (None, None, Some(d)) => {
+        (None, None, Some((d, _))) => {
             let samples = r.readout_samples.unwrap_or(nx);
             (samples as f64 * d * 1000.0, "DwellTime x readout samples (a lower bound: no ramps, no receiver oversampling)")
         }
@@ -2169,8 +2253,72 @@ pub fn resolve_readout(p: &Protocol, acq_dims: [usize; 3]) -> Result<Option<Read
     }
     Ok(Some(ReadoutResolution {
         n_shots: table.n_shots, train, readout, epi, etl, t_line_ms, t_line_source, effective_spacing_s: effective, esp_ms,
-        e_c, t_kyc_ms,
+        e_c, t_kyc_ms, spiral: None,
     }))
+}
+
+/// [`resolve_readout`] for the stack of spirals (P5 addendum, part C): a square matrix, the kz
+/// division, `ESP = EchoTime / e_c` (each spiral starts at its echo, so the k-space centre is read
+/// at `e_c ESP`), the trajectory with its sampling bound, and the timing checks on the actual
+/// intervals for every excitation and the separate M0.
+fn resolve_spiral(p: &Protocol, r: &ReadoutSpec, acq_dims: [usize; 3]) -> Result<ReadoutResolution, String> {
+    let [nx, ny, nz] = acq_dims;
+    if !cfg!(feature = "kspace") {
+        return Err("a spiral readout needs aslscan built with the `kspace` feature (the time-segmented NUFFT forward)"
+            .to_string());
+    }
+    if nx != ny {
+        return Err(format!("a spiral readout needs a square in-plane matrix, not {nx} x {ny}: set [acquisition] matrix"));
+    }
+    let kz_segments = r.kz_segments.0;
+    if nz % kz_segments != 0 {
+        return Err(format!(
+            "{nz} partitions (the phantom's extent at the slab's voxel size) do not divide into {kz_segments} kz \
+             segments; crop the phantom or change kz_segments"));
+    }
+    let etl = nz / kz_segments;
+    let (Some((interleaves, _)), Some((readout_ms, _)), Some((dwell_s, dwell_source))) =
+        (r.interleaves, r.spiral_readout_ms, r.dwell_time_s) else {
+        unreachable!("a parsed spiral carries its interleaves, readout time and dwell time")
+    };
+    let dwell_ms = dwell_s * 1000.0;
+    let probe = EchoTrain { etl, esp_ms: 1.0, refocusing_deg: r.refocusing_flip_deg.0, kz_order: r.kz_order.0, kz_segments,
+                            refocusing_time_ms: r.refocusing_time_ms.0 };
+    let e_c = centre_echo(&probe, nz)?;
+    let te_ms = p.echo_time_s * 1000.0;
+    let esp_ms = match r.echo_spacing_ms {
+        Some(esp) => {
+            if (e_c as f64 * esp - te_ms).abs() > 1e-3 {
+                return Err(format!(
+                    "[readout] echo_spacing {esp} ms puts the k-space centre (the start of echo {e_c}'s spiral) at {} ms, \
+                     but EchoTime is {te_ms} ms", e_c as f64 * esp));
+            }
+            esp
+        }
+        None => spiral_esp_from_echo_time(te_ms, e_c),
+    };
+    let train = EchoTrain { esp_ms, ..probe };
+    let readout = Readout3d::Spiral { interleaves, readout_ms, dwell_ms };
+    let table = spiral_lines(&train, &readout, nx, ny, nz)?;
+    debug_assert_eq!(table.n_shots, r.number_shots.0);
+    let mut seen: Vec<(u64, u64)> = Vec::new();
+    let excitations = p.rows.iter().map(|row| (row.t, row.tr)).chain(p.m0_repetition_time_s.map(|tr| (0.0, tr)));
+    for (t_exc, tr) in excitations {
+        if seen.contains(&(t_exc.to_bits(), tr.to_bits())) {
+            continue;
+        }
+        seen.push((t_exc.to_bits(), tr.to_bits()));
+        check_spiral_timing(&train, &table, t_exc * 1000.0, tr * 1000.0)?;
+    }
+    let tj = &table.traj;
+    Ok(ReadoutResolution {
+        n_shots: table.n_shots, train, readout, epi: 0, etl, t_line_ms: 0.0, t_line_source: "", effective_spacing_s: None,
+        esp_ms, e_c, t_kyc_ms: 0.0,
+        spiral: Some(SpiralResolution {
+            interleaves, readout_ms, dwell_ms, dwell_source, samples_per_interleaf: tj.n_samples(), k_max: tj.k_max,
+            n_turns: tj.n_turns, tau_c_ms: tj.tau_c_ms,
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -2477,8 +2625,8 @@ mod tests {
         let e = p.acquisition(58, 58).unwrap_err();
         assert!(e.contains("EchoTime"), "{e}");
         // The 3D datasets (P5): asl003 as given fails on its PASL delays before the bolus cutoff;
-        // asl005 on its missing phase-encode direction (GRASE needs one); asl001 parses (a spiral)
-        // and resolve_readout refuses it until milestone C.
+        // asl005 on its missing phase-encode direction (GRASE needs one); asl001 (a spiral) on its
+        // missing interleaves, which have no default (asl001_p5 supplies them).
         let (s, c) = fixture("asl003");
         let e = parse(&s, &c, Some(&m0_overlay()), None).unwrap_err();
         assert!(e.contains("cutoff"), "asl003: {e}");
@@ -2486,9 +2634,8 @@ mod tests {
         let e = parse(&s, &c, Some(&m0_overlay()), None).unwrap_err();
         assert!(e.contains("phase_encoding_direction"), "asl005: {e}");
         let (s, c) = fixture("asl001");
-        let p = parse(&s, &c, Some(&m0_overlay()), None).unwrap();
-        assert_eq!(p.readout.as_ref().unwrap().kind, (ReadoutKind::Spiral, Source::Sidecar));
-        assert!(resolve_readout(&p, [64, 64, 20]).unwrap_err().contains("milestone C"));
+        let e = parse(&s, &c, Some(&m0_overlay()), None).unwrap_err();
+        assert!(e.contains("interleaves"), "asl001: {e}");
         // asl003 as a 2D variant: PASL Q2TIPS with a 20-entry PLD array whose first entries
         // (0.3 s) precede the 0.7 s bolus cutoff, which the PASL check must refuse...
         let (mut s, c) = fixture("asl003");
@@ -3161,6 +3308,77 @@ mod tests {
         assert!(e.contains("[acquisition] matrix") && e.contains("20"), "{e}");
         // 2D protocols resolve to nothing
         assert!(resolve_readout(&parse(&base(), CTX, Some(&m0_overlay()), None).unwrap(), [64, 64, 3]).unwrap().is_none());
+    }
+
+    /// asl001 (a GE 3D spiral) with its overlay resolves to the reviewed numbers (P5 part C, plan
+    /// Task 14), and the spiral rules refuse what they must.
+    #[test]
+    fn the_spiral_acceptance_fixture_resolves_and_the_spiral_rules_hold() {
+        let (s, c) = fixture("asl001");
+        let p = parse(&s, &c, Some(&overlay_file("asl001_p5")), None).unwrap();
+        let r = p.readout.as_ref().unwrap();
+        assert_eq!((r.kind, r.number_shots, r.interleaves), ((ReadoutKind::Spiral, Source::Sidecar), (8, Source::Default),
+                                                             Some((8, Source::Overlay))));
+        assert_eq!(r.dwell_time_s, Some((4e-6, Source::Overlay)));
+        assert_eq!(r.refocusing_flip_deg, (111.0, Source::Sidecar));
+        // a volume is eight shots, each a repetition: 39.088 s
+        assert!((p.row_start[1] - 8.0 * 4.886).abs() < 1e-9, "{}", p.row_start[1]);
+        if cfg!(feature = "kspace") {
+            let res = resolve_readout(&p, [64, 64, 20]).unwrap().unwrap();
+            let sp = res.spiral.as_ref().unwrap();
+            assert_eq!((res.etl, res.e_c, res.n_shots, sp.interleaves, sp.samples_per_interleaf), (20, 1, 8, 8, 1000));
+            assert!((res.esp_ms - 10.528).abs() < 1e-9 && (sp.dwell_ms - 0.004).abs() < 1e-15, "{res:?}");
+            assert!(sp.tau_c_ms > 0.0 && sp.tau_c_ms < 0.02, "{}", sp.tau_c_ms);
+            assert_eq!(res.readout, Readout3d::Spiral { interleaves: 8, readout_ms: 4.0, dwell_ms: sp.dwell_ms });
+            // a rectangular matrix
+            assert!(resolve_readout(&p, [64, 48, 20]).unwrap_err().contains("square"));
+            // a dwell time past the sampling bound (4.97 us here)
+            let ov = |extra: &str| {
+                let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols/asl001_p5/overlay.toml")).unwrap();
+                overlay(&base.replace("dwell_time = 4e-6\n", extra))
+            };
+            let p6 = parse(&s, &c, Some(&ov("dwell_time = 6e-6\n")), None).unwrap();
+            assert!(resolve_readout(&p6, [64, 64, 20]).unwrap_err().contains("dwell time must be below"));
+            // an 8 ms spiral would run through the next refocusing pulse at this echo spacing
+            let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols/asl001_p5/overlay.toml")).unwrap();
+            let ov8 = overlay(&base.replace("interleaves = 8\nspiral_readout_time = 4.0", "interleaves = 4\nspiral_readout_time = 8.0"));
+            let p8 = parse(&s, &c, Some(&ov8), None).unwrap();
+            assert!(resolve_readout(&p8, [64, 64, 20]).unwrap_err().contains("next refocusing pulse"));
+        } else {
+            assert!(resolve_readout(&p, [64, 64, 20]).unwrap_err().contains("kspace"));
+        }
+        // the parse rules: required values, NumberShots, refused keys and effects
+        let with = |extra: &str| {
+            let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols/asl001_p5/overlay.toml")).unwrap();
+            overlay(&format!("{base}{extra}"))
+        };
+        let strip = |key: &str| {
+            let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols/asl001_p5/overlay.toml")).unwrap();
+            overlay(&base.lines().filter(|l| !l.starts_with(key)).collect::<Vec<_>>().join("\n"))
+        };
+        assert!(parse(&s, &c, Some(&strip("spiral_readout_time")), None).unwrap_err().contains("spiral_readout_time"));
+        assert!(parse(&s, &c, Some(&strip("dwell_time")), None).unwrap_err().contains("DwellTime"));
+        let mut s2 = s.clone();
+        s2["DwellTime"] = json!(4e-6);
+        assert_eq!(parse(&s2, &c, Some(&strip("dwell_time")), None).unwrap().readout.unwrap().dwell_time_s, Some((4e-6, Source::Sidecar)));
+        s2["NumberShots"] = json!(4);
+        assert!(parse(&s2, &c, Some(&with("")), None).unwrap_err().contains("NumberShots 4"));
+        s2["NumberShots"] = json!(8);
+        assert_eq!(parse(&s2, &c, Some(&with("")), None).unwrap().readout.unwrap().number_shots, (8, Source::Sidecar));
+        for (key, val) in [("PhaseEncodingDirection", json!("j-")), ("TotalReadoutTime", json!(0.03)), ("EffectiveEchoSpacing", json!(0.0005))] {
+            let mut s3 = s.clone();
+            s3[key] = val;
+            assert!(parse(&s3, &c, Some(&with("")), None).is_err(), "{key}");
+        }
+        let mut s3 = s.clone();
+        s3["ParallelReductionFactorInPlane"] = json!(2);
+        assert!(parse(&s3, &c, Some(&with("")), None).unwrap_err().contains("GRAPPA"));
+        for knob in ["partial_fourier = 0.75", "ghost_offset = 0.1", "n_spikes = 2"] {
+            let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols/asl001_p5/overlay.toml")).unwrap();
+            let ov = overlay(&base.replace("matrix = [64, 64]", &format!("matrix = [64, 64]\n{knob}")));
+            assert!(parse(&s, &c, Some(&ov), None).unwrap_err().contains("no spiral meaning"), "{knob}");
+        }
+        assert!(parse(&s, &c, Some(&with("ky_segments = 2\n")), None).unwrap_err().contains("GRASE key"));
     }
 
     /// A small GRASE sidecar for the refusal and resolution rules.

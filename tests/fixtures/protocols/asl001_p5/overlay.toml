@@ -1,0 +1,15 @@
+# The asl001 acceptance case (P5 plan, Task 14): the real asl001 sidecar and context (../asl001),
+# a GE 3D spiral PCASL, on the 3 T phantom cropped to 160 mm in z (tools/hrgt_to_bids.py --crop
+# 0:197 0:233 15:175). A 64 x 64 x 20 grid of 8 interleaves of a 4 ms spiral sampled every 4 us,
+# eight shots (the interleaves; NumberShots absent), ESP = EchoTime = 10.528 ms, the train ending
+# at 3.68956 s within 4.886 s, refocusing at the sidecar's FlipAngle, 111 degrees. The interleave
+# count, readout time and dwell time are not in the sidecar and have no defensible default.
+seed = 1
+
+[acquisition]
+matrix = [64, 64]
+
+[readout]
+interleaves = 8
+spiral_readout_time = 4.0
+dwell_time = 4e-6
