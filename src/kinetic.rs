@@ -158,15 +158,13 @@ pub fn delta_m_iv(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t
     match k.label_type {
         LabelType::Casl | LabelType::Pcasl => gkm_body(k, f, m0b, dt, t1pp, t),
         LabelType::Pasl => {
-            // delta_m's quotient guard: where its own kk = 1/T1b - 1/T1' is exactly zero it is
-            // zero, and the part must be too (T1'' moves kk off zero, which would leave a
-            // positive part of a zero whole)
-            let (_, _, t1p) = gkm_constants(k, f_ml_100g_min, t1t, m0);
-            let kk = (if k.t1b != 0.0 { 1.0 / k.t1b } else { 0.0 }) - div0(1.0, t1p);
-            if kk == 0.0 {
-                return 0.0;
-            }
-            pasl_stable(k, f, m0b, dt, t1pp, t)
+            // The part never exceeds the whole delta_m computes. Where delta_m's own
+            // kk = 1/T1b - 1/T1' is zero (its quotient guard) or within rounding of it (its
+            // difference of exponentials cancels), delta_m is zero or noise; it stays as simasl
+            // computes it, and T1'' moves kk off zero, so unclamped the part would be a positive
+            // share of a zero whole and the extravascular rest negative.
+            let iv = pasl_stable(k, f, m0b, dt, t1pp, t);
+            iv.min(delta_m(k, f_ml_100g_min, dt, t1t, m0, t)).max(0.0)
         }
     }
 }
@@ -332,6 +330,35 @@ mod tests {
             for t in [1.2, 2.0] {
                 assert_eq!(delta_m_iv(&k, F, DT, T1T, M0, t, tau_ex), 0.0, "tau_ex {tau_ex} t {t}");
                 assert_eq!(delta_m_iv_sub(&k, F, DT, T1T, M0, t, 0.1, 0.4, tau_ex), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn pasl_intravascular_part_never_exceeds_a_cancelled_whole() {
+        // Near kk = 0 but not at it, delta_m's difference of exponentials cancels to zero or
+        // noise (re-review: T1b = 2.9032258064516134 with T1t = 3 gives kk ~ -5.6e-17,
+        // delta_m = 0 and an unclamped part of 0.0013). The part stays within [0, delta_m]
+        // for the whole and every sub-bolus, a few ULPs and a little further either side.
+        let (t1t, m0, t1b0) = (3.0, 1.0, 2.9032258064516134);
+        let k0 = Kinetic { label_type: LabelType::Pasl, tau: 0.7, alpha: 0.85, lambda: 0.9, t1b: t1b0 };
+        assert_eq!(delta_m(&k0, F, DT, t1t, m0, 2.0), 0.0, "the test premise: the whole cancels to zero");
+        assert_eq!(delta_m_iv(&k0, F, DT, t1t, m0, 2.0, 0.5), 0.0);
+        let mut steps: Vec<f64> = (-20..=20).map(|j| j as f64).collect();
+        steps.extend([-1e6, -1e3, 1e3, 1e6]);
+        for s in steps {
+            let k = Kinetic { t1b: f64::from_bits((t1b0.to_bits() as i64 + s as i64) as u64), ..k0 };
+            for tau_ex in [0.05, 0.5, 3.0] {
+                for t in [1.0, 1.4, 2.0, 3.0] {
+                    let dm = delta_m(&k, F, DT, t1t, m0, t);
+                    let iv = delta_m_iv(&k, F, DT, t1t, m0, t, tau_ex);
+                    assert!(iv >= 0.0 && iv <= dm.max(0.0), "t1b {} tau_ex {tau_ex} t {t}: iv {iv} dm {dm}", k.t1b);
+                    for (a, b) in [(0.0, 0.3), (0.3, 0.7), (0.1, 0.4)] {
+                        let dm = delta_m_sub(&k, F, DT, t1t, m0, t, a, b);
+                        let iv = delta_m_iv_sub(&k, F, DT, t1t, m0, t, a, b, tau_ex);
+                        assert!(iv >= 0.0 && iv <= dm.max(0.0), "sub {a}..{b} t {t}: iv {iv} dm {dm}");
+                    }
+                }
             }
         }
     }
