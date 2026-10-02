@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use mrsim_acq::grid::Grid;
 use mrsim_acq::io::hires_grid;
 use mrsim_acq::kspace::{simulate_acquisition_oversampled, Acquisition, T2Volume};
+use mrsim_acq::kspace3d::{simulate_acquisition_3d, LineWeights, ShotSet};
 use mrsim_acq::motion::{
     apply_motion, apply_multiband_motion, resolve_poses, slice_schedule, DropoutLaw, DroppedShot, MotionEvent, Pose,
 };
@@ -40,7 +41,7 @@ use crate::physio::Physio;
 use crate::longitudinal::{label_factor, tissue_mz, tissue_mz_ge, tissue_mz_ge_sequence, Prep};
 use crate::mrsignal::{blood_ge, blood_ir, blood_se, tissue_ge_simasl, tissue_ge_spoiled, tissue_ir, tissue_se, Contrast};
 use crate::phantom::{Phantom, Relaxation, T2Mode};
-use crate::protocol::{M0Type, Protocol, QuantitySource, Row, RowKind, SuppressionModel, WithinVolume};
+use crate::protocol::{resolve_readout, M0Type, Protocol, QuantitySource, ReadoutResolution, Row, RowKind, SuppressionModel, WithinVolume};
 use crate::resample::{acquisition_grid, axis_aligned_voxels, corner_offset, Resampler};
 use crate::rng::SplitMix64;
 
@@ -88,6 +89,7 @@ pub struct GroundTruth {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysioLine {
     pub volume: usize,
+    /// The slice (2D), or the shot (3D, P5 part D: one line per volume and shot).
     pub slice: usize,
     /// s on the series clock
     pub time: f64,
@@ -134,6 +136,8 @@ pub struct SeriesOutput {
     pub physio: Option<Vec<PhysioLine>>,
     /// P5 part A: which gradient-echo steady state the tissue took (`None` unless `"ge"`).
     pub ge_rule: Option<&'static str>,
+    /// P5 part B: the 3D readout as resolved with the grid (`None` for 2D).
+    pub readout: Option<ReadoutResolution>,
 }
 
 /// The compat noise resolution (P2 addendum, part A).
@@ -164,6 +168,10 @@ pub enum RowOverride {
     /// invisible to the linearity identity, because `I_L` and `I_B` then carry the same
     /// mis-wired term and still subtract to it. Only a row-dependent wiring error breaks it.
     BloodIntoTissue0,
+    /// P5: in 3D with physiological noise and exchange, the `label` row's extravascular part lands
+    /// in the tissue compartment instead of its own group, where it takes the tissue's per-shot
+    /// factor rather than the label's (the identity must break).
+    ExtravascularIntoTissue,
 }
 
 /// Per-row blood sign under the row semantics (and the test overrides).
@@ -174,7 +182,8 @@ fn blood_sign(kind: RowKind, ov: RowOverride) -> f64 {
         RowKind::Control | RowKind::M0scan => 0.0,
     };
     match ov {
-        RowOverride::None | RowOverride::BloodIntoTissue0 | RowOverride::ExtravascularIntoBlood => base,
+        RowOverride::None | RowOverride::BloodIntoTissue0 | RowOverride::ExtravascularIntoBlood
+        | RowOverride::ExtravascularIntoTissue => base,
         RowOverride::FlipLabelSign => if kind == RowKind::Label { 1.0 } else { base },
         RowOverride::SwapControlLabel => match kind {
             RowKind::Control => -1.0,
@@ -351,7 +360,10 @@ impl P4 {
         };
 
         let physio = p.physio.map(|params| {
-            let horizon = p.row_start.last().copied().unwrap_or(0.0) + p.rows.last().map_or(0.0, |r| r.tr) + 1.0;
+            // through the last shot of the last volume (P5 part D: a 3D volume is NumberShots
+            // repetitions), one repetition past it
+            let shots = p.readout.as_ref().map_or(1, |r| r.number_shots.0) as f64;
+            let horizon = p.row_start.last().copied().unwrap_or(0.0) + shots * p.rows.last().map_or(0.0, |r| r.tr) + 1.0;
             Physio::new(params, p.seed, horizon)
         });
         let label_physio = (0..n)
@@ -411,11 +423,15 @@ fn simulate_core(
     let sim_grid = hires_grid(&acq_grid, o);
     let [nx, ny, nz] = acq_grid.dims;
     let [snx, sny, _] = sim_grid.dims;
-    if p.slice_offsets.len() != nz {
+    // P5 part B: a 3D readout is completed with the grid here, before anything is simulated, and
+    // has no slice timing (every partition shares the slab excitation)
+    let res3d = resolve_readout(p, acq_grid.dims)?;
+    if res3d.is_none() && p.slice_offsets.len() != nz {
         return Err(format!(
             "SliceTiming has {} entries but the acquisition grid has {nz} slices (phantom extent {:.1} mm at \
              {} mm slices)", p.slice_offsets.len(), ph.grid.dims[2] as f64 * pv[2], p.voxel_size_mm[2]));
     }
+    let slice_offsets: Vec<f64> = if res3d.is_some() { vec![0.0; nz] } else { p.slice_offsets.clone() };
     let dv = p.voxel_size_mm;
     let sim_vox = [dv[0] / o as f64, dv[1] / o as f64, dv[2]];
     let off = corner_offset(&ph.grid, &acq_grid)?;
@@ -435,7 +451,9 @@ fn simulate_core(
     };
 
     // ---- relaxation and compartment layout ----
-    let (relax, mode_used) = ph.relaxation(mode)?;
+    // a 3D train refocused below 180 degrees has stimulated echoes, which depend on T1 (P5 part B)
+    let needs_t1 = res3d.as_ref().is_some_and(|r| r.train.refocusing_deg != 180.0) && acq.do_relaxation;
+    let (relax, mode_used) = ph.relaxation_for(mode, needs_t1)?;
     let t2_blood_ms = p.t2_blood_ms();
     // Label masks: compartment i is label i (class) or everything foreground (voxel).
     let masks: Vec<Vec<bool>> = match &relax {
@@ -445,7 +463,12 @@ fn simulate_core(
     let k = masks.len();
     // P4, part B: K arterial compartments (class) or one (voxel) after the blood.
     let macro_on = p.macrovascular.is_some();
-    let ncomp = if macro_on { 3 * k } else { 2 * k };
+    // P5 part D: in 3D the physiological factors are per-shot line weights per compartment, so the
+    // extravascular label (P4 part A), which P4 puts into the tissue compartment, gets its own group
+    // after the others: the tissue's factor is not the label's
+    let ev_group = res3d.is_some() && p.physio.is_some() && p.exchange_time.is_some();
+    let ev_base = if macro_on { 3 * k } else { 2 * k };
+    let ncomp = if ev_group { ev_base + k } else { ev_base };
     let t2_arterial_ms = p.macrovascular.as_ref().map(|m| (m.t2_arterial.0 * 1000.0) as f32);
     // Owned map storage so the T2Volume slices below can borrow it.
     let (acq_t2_ms, acq_t2p_ms): (Option<Vec<f32>>, Option<Vec<f32>>) = match &relax {
@@ -470,6 +493,13 @@ fn simulate_core(
                     tiv.push(T2Volume::Uniform(tp));
                 }
             }
+            if ev_group {
+                // the extravascular label relaxes as the tissue it is in
+                for i in 0..k {
+                    t2v.push(T2Volume::Uniform(t2_ms[i]));
+                    tiv.push(T2Volume::Uniform(t2p_ms[i]));
+                }
+            }
             (t2v, tiv)
         }
         Relaxation::Voxel { .. } => {
@@ -481,9 +511,39 @@ fn simulate_core(
                 t2v.push(T2Volume::Uniform(t2a));
                 tiv.push(T2Volume::Map(tpm));
             }
+            if ev_group {
+                t2v.push(T2Volume::Map(t2m));
+                tiv.push(T2Volume::Map(tpm));
+            }
             (t2v, tiv)
         }
     };
+    // P5 part B: T1 for the echo amplitudes, only when the refocusing is below 180 degrees: per label
+    // (class), or the M0-weighted rate mean on the simulation grid with an infinite background,
+    // like the T2 maps (voxel); the blood and arterial compartments take the arterial blood T1
+    let t1b_ms = (p.t1b.0 * 1000.0) as f32;
+    let acq_t1_ms: Option<Vec<f32>> = (needs_t1 && matches!(relax, Relaxation::Voxel { .. })).then(|| {
+        let t1_ms: Vec<f32> = ph.dseg.iter().zip(&ph.t1).map(|(&l, &t)| if l > 0 { t * 1000.0 } else { f32::INFINITY }).collect();
+        r_sim.rate_mean(&t1_ms, &ph.m0)
+    });
+    let t1_vols: Option<Vec<T2Volume>> = needs_t1.then(|| {
+        let tissue: Vec<T2Volume> = match &relax {
+            Relaxation::Class { .. } => ph.labels.iter().map(|(l, _)| {
+                let i = ph.dseg.iter().position(|d| d == l).expect("labels come from dseg");
+                T2Volume::Uniform(ph.t1[i] * 1000.0)
+            }).collect(),
+            Relaxation::Voxel { .. } => vec![T2Volume::Map(acq_t1_ms.as_deref().unwrap())],
+        };
+        let mut v = tissue.clone();
+        v.extend(std::iter::repeat_n(T2Volume::Uniform(t1b_ms), k));
+        if macro_on {
+            v.extend(std::iter::repeat_n(T2Volume::Uniform(t1b_ms), k));
+        }
+        if ev_group {
+            v.extend(tissue);
+        }
+        v
+    });
 
     // ---- the signal equations in use ----
     let ir = p.ir.as_ref().map(|s| s.params);
@@ -580,7 +640,7 @@ fn simulate_core(
     let mut tissue_slice_for = |row: usize, z: usize| -> Vec<Vec<f32>> {
         let r = &p.rows[row];
         let s = suppression[row].as_ref().expect("suppressed rows only");
-        let t_read = r.t + p.slice_offsets[z];
+        let t_read = r.t + slice_offsets[z];
         slice_cache
             .entry((r.tr.to_bits(), t_read.to_bits(), pulse_set[row], z))
             .or_insert_with(|| {
@@ -625,7 +685,7 @@ fn simulate_core(
             for z in 0..nz {
                 let preps: Vec<Prep> = p.rows.iter().enumerate().map(|(v, r)| Prep {
                     tr: r.tr,
-                    t_read: if r.kind == RowKind::M0scan { r.tr } else { r.t + p.slice_offsets[z] },
+                    t_read: if r.kind == RowKind::M0scan { r.tr } else { r.t + slice_offsets[z] },
                     s: suppression[v].as_ref(),
                 }).collect();
                 // the sequence per phantom voxel of this slice's slab, computed once
@@ -668,7 +728,7 @@ fn simulate_core(
         }
         let kin = p.kinetic(row);
         for z in 0..dnz {
-            let t = row.t + p.slice_offsets[z];
+            let t = row.t + slice_offsets[z];
             // delta_m per phantom voxel of this slice's slab, computed on demand
             let dm = |i: usize| -> f64 {
                 if ph.dseg[i] > 0 {
@@ -711,6 +771,9 @@ fn simulate_core(
     let mut gt_sup = alloc(bolus_region.is_some());
     let mut gt_art = alloc(macro_on);
     let mut physio_lines: Vec<PhysioLine> = Vec::new();
+    // P5 part D: per (volume, shot) physiological factors (tissue, label) of a 3D series
+    let n_shots = res3d.as_ref().map_or(1, |r| r.n_shots);
+    let mut shot_physio: Vec<Vec<(f64, f64)>> = vec![vec![(1.0, 1.0); n_shots]; n];
     let [pnx, pny, _] = ph.grid.dims;
     let pslab = pnx * pny;
     for (v, row) in p.rows.iter().enumerate() {
@@ -735,10 +798,33 @@ fn simulate_core(
         };
         // P4, part E: the tissue factor per slice at its readout (after the cache, so rows that
         // share a cache key but not a time get their own factor).
-        if let Some(phys) = &p4.physio {
+        if let (Some(phys), Some(_)) = (&p4.physio, &res3d) {
+            // P5 part D: per shot, kept out of the images and applied as line weights; the shot
+            // labels over its own window and excites at its own time
+            for (s, sp) in shot_physio[v].iter_mut().enumerate() {
+                let start = p.row_start[v] + s as f64 * row.tr;
+                let time = start + row.t;
+                let tf = phys.tissue_factor(time);
+                let (lf, means) = match p.label_type {
+                    LabelType::Pasl => phys.label_factor_at(start),
+                    _ => phys.label_factor_window(start, start + row.tau),
+                };
+                let win = match p.label_type {
+                    LabelType::Pasl => (start, start),
+                    _ => (start, start + row.tau),
+                };
+                *sp = (tf, lf);
+                physio_lines.push(PhysioLine {
+                    volume: v, slice: s, time,
+                    cardiac_phase: phys.cardiac.phase(time), respiratory_phase: phys.respiratory.phase(time),
+                    drift: phys.drift.value(time), tissue_factor: tf,
+                    label_window: win, label_means: means, label_factor: lf,
+                });
+            }
+        } else if let Some(phys) = &p4.physio {
             let (lf, win, means) = p4.label_physio[v];
             for z in 0..nz {
-                let time = p.row_start[v] + row.t + p.slice_offsets[z];
+                let time = p.row_start[v] + row.t + slice_offsets[z];
                 let tf = phys.tissue_factor(time);
                 if let Some(comps) = tissue.as_mut() {
                     for comp in comps.iter_mut() {
@@ -796,20 +882,30 @@ fn simulate_core(
         // ground truth only for label and deltam rows
         if p4.label_path && (wants_gt || blood_sign(row.kind, ov) != 0.0) {
             let kin = p.kinetic(row);
-            let sign0 = blood_sign(row.kind, ov) * factor * p4.label_physio[v].0;
+            // in 3D the physiological label factor is a per-shot line weight instead (P5 part D)
+            let lf_row = if res3d.is_some() { 1.0 } else { p4.label_physio[v].0 };
+            let sign0 = blood_sign(row.kind, ov) * factor * lf_row;
             let bolus = bolus_region.map(|region| {
                 let s = p.suppression.as_ref().unwrap().for_row(v);
                 (region, s.pulse_times, s.epsilon)
             });
             let mut partitions: HashMap<u64, Vec<(f64, f64, f64)>> = HashMap::new();
             let blood_target = |c: usize| if ov == RowOverride::BloodIntoTissue0 && row.kind == RowKind::Label { 0 } else { k + c };
-            let ev_target = |c: usize| if ov == RowOverride::ExtravascularIntoBlood && row.kind == RowKind::Label { k + c } else { c };
+            let ev_target = |c: usize| {
+                if ov == RowOverride::ExtravascularIntoBlood && row.kind == RowKind::Label {
+                    k + c
+                } else if ev_group && !(ov == RowOverride::ExtravascularIntoTissue && row.kind == RowKind::Label) {
+                    ev_base + c
+                } else {
+                    c
+                }
+            };
             for z in 0..nz {
                 let zs = r_sim.z_slab(z);
                 let (Some(zlo), Some(zhi)) = (zs.first().map(|p| p.0), zs.last().map(|p| p.0)) else { continue };
                 let base = pslab * zlo;
                 let len = pslab * (zhi - zlo + 1);
-                let t = row.t + p.slice_offsets[z];
+                let t = row.t + slice_offsets[z];
                 let mut bl = vec![0.0f64; len];
                 let mut ev = if p.exchange_time.is_some() { vec![0.0f64; len] } else { Vec::new() };
                 let mut art = if macro_on { vec![0.0f64; len] } else { Vec::new() };
@@ -926,12 +1022,63 @@ fn simulate_core(
                 *gt = Some(block_mean_inplane(&moved, sim_grid.dims, o, n));
             }
         }
-        let n_shots = slice_schedule(nz, p.mb, p.mb_interleaved).len();
-        events = draw_events(m.within.as_ref(), n, n_shots, seed);
-        if !events.is_empty() {
-            dropped = apply_multiband_motion(
-                &mut images, sim_grid.dims, n, v2w, p.mb, p.mb_interleaved, &DropoutLaw::Uniform, &events,
-            );
+        if res3d.is_some() {
+            // P5 part D: a shot is a readout segment; the events are drawn per shot as in 2D, but
+            // act through per-shot images and shot gains below, not on slice groups
+            events = draw_events(m.within.as_ref(), n, n_shots, seed);
+        } else {
+            let n_shots = slice_schedule(nz, p.mb, p.mb_interleaved).len();
+            events = draw_events(m.within.as_ref(), n, n_shots, seed);
+            if !events.is_empty() {
+                dropped = apply_multiband_motion(
+                    &mut images, sim_grid.dims, n, v2w, p.mb, p.mb_interleaved, &DropoutLaw::Uniform, &events,
+                );
+            }
+        }
+    }
+    // P5 part D: a 3D volume's shots. Each event's jump persists for the later shots of its volume
+    // (as apply_multiband_motion composes them); the shots sharing a pose other than the volume's
+    // see the volume's images moved by it. Each event shot's lines are attenuated by
+    // 1 - severity (DropoutLaw::Uniform), a shot gain.
+    let mut shot_gain = vec![vec![1.0f64; n_shots]; n];
+    let mut shot_sets: Vec<Vec<ShotSet>> = vec![Vec::new(); n];
+    if res3d.is_some() && !events.is_empty() {
+        let v2w = sim_grid.voxel_to_world;
+        for (g, sets) in shot_sets.iter_mut().enumerate() {
+            let evs: Vec<&MotionEvent> = events.iter().filter(|e| e.volume == g && e.shot < n_shots).collect();
+            if evs.is_empty() {
+                continue;
+            }
+            let mut cum = Pose::IDENTITY;
+            let mut pose_of = vec![Pose::IDENTITY; n_shots];
+            for (s, pose) in pose_of.iter_mut().enumerate() {
+                for e in evs.iter().filter(|e| e.shot == s) {
+                    for i in 0..3 {
+                        cum.trans_mm[i] += e.jump_mm[i];
+                        cum.rot_deg[i] += e.jump_deg[i];
+                    }
+                }
+                *pose = cum;
+            }
+            let mut distinct: Vec<Pose> = Vec::new();
+            for &q in &pose_of {
+                if q != Pose::IDENTITY && !distinct.contains(&q) {
+                    distinct.push(q);
+                }
+            }
+            for q in distinct {
+                let shots: Vec<usize> = (0..n_shots).filter(|&s| pose_of[s] == q).collect();
+                let moved: Vec<Vec<f32>> = images.iter().map(|img| {
+                    let vol: Vec<f32> = (0..nvox_sim).map(|vox| img[vox * n + g]).collect();
+                    mrsim_acq::motion::resample_by_pose(&vol, sim_grid.dims, v2w, q)
+                }).collect();
+                sets.push(ShotSet { shots, images: moved });
+            }
+            for e in &evs {
+                let atten = DropoutLaw::Uniform.attenuation(g, e.severity);
+                shot_gain[g][e.shot] *= atten as f64;
+                dropped.push(DroppedShot { volume: g, shot: e.shot, slices: Vec::new(), attenuation: atten });
+            }
         }
     }
 
@@ -958,10 +1105,33 @@ fn simulate_core(
     // ---- the one call ----
     let eddy_drive = vec![None; n];
     let prep_drive = vec![None; n];
-    let (mag, phase_out) = simulate_acquisition_oversampled(
-        sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, &fmap_sim, Some(&ti_vols), &acq,
-        &eddy_drive, &prep_drive, phase, p.seed, None, None,
-    );
+    // P5 part D: per (volume, shot, compartment) line weights, present when physiology or a dropout
+    // event is: the tissue's factor on the tissue group, the label's on the blood, arterial and
+    // extravascular-label groups, times the shot gain
+    let line_weights = (res3d.is_some() && (p4.physio.is_some() || shot_gain.iter().flatten().any(|g| *g != 1.0)))
+        .then(|| {
+            let mut w = Vec::with_capacity(n * n_shots * ncomp);
+            for g in 0..n {
+                for s in 0..n_shots {
+                    let (tf, lf) = shot_physio[g][s];
+                    for c in 0..ncomp {
+                        w.push(if c < k { tf } else { lf } * shot_gain[g][s]);
+                    }
+                }
+            }
+            LineWeights { n_shots, n_compartments: ncomp, w }
+        });
+    let (mag, phase_out) = match &res3d {
+        None => simulate_acquisition_oversampled(
+            sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, &fmap_sim, Some(&ti_vols), &acq,
+            &eddy_drive, &prep_drive, phase, p.seed, None, None,
+        ),
+        Some(r3) => simulate_acquisition_3d(
+            sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, t1_vols.as_deref(), &fmap_sim, Some(&ti_vols), &acq,
+            &r3.train, &r3.readout, line_weights.as_ref(), shot_sets.iter().any(|s| !s.is_empty()).then_some(&shot_sets[..]),
+            phase, p.seed,
+        ),
+    };
     drop(images);
 
     // ---- the separate M0 scan: a plain spin-echo readout at its own TR ----
@@ -976,10 +1146,17 @@ fn simulate_core(
             for c in 0..k {
                 imgs[c].copy_from_slice(&tissue[c]);
             }
-            Some(simulate_acquisition_oversampled(
-                sim_grid.dims, acq_grid.dims, 1, &imgs, &t2_vols, &fmap_sim, Some(&ti_vols), &acq,
-                &[None], &[None], phase, seed, None, None,
-            ))
+            Some(match &res3d {
+                None => simulate_acquisition_oversampled(
+                    sim_grid.dims, acq_grid.dims, 1, &imgs, &t2_vols, &fmap_sim, Some(&ti_vols), &acq,
+                    &[None], &[None], phase, seed, None, None,
+                ),
+                // the same readout and train, no labeling, no physiology, no motion (P5 part B)
+                Some(r3) => simulate_acquisition_3d(
+                    sim_grid.dims, acq_grid.dims, 1, &imgs, &t2_vols, t1_vols.as_deref(), &fmap_sim, Some(&ti_vols),
+                    &acq, &r3.train, &r3.readout, None, None, phase, seed,
+                ),
+            })
         }
         None => None,
     };
@@ -1020,6 +1197,7 @@ fn simulate_core(
         seeds: (p.seed, m0_seed), acquisition: acq, ground_truth, label_factors, poses, motion_seed,
         events, dropped, compat: compat_facts,
         crush_survival: p4.crush.clone(), physio: p4.physio.as_ref().map(|_| physio_lines),
+        readout: res3d.clone(),
         ge_rule: ge_flip.map(|fa| match (p.compat.is_some(), fa == 90.0, ge_propagated.is_some(), p.suppression.is_some()) {
             (true, ..) => "simasl's coherent steady state per volume (compat)",
             (_, true, ..) => "90 degrees: the slab is saturated, each row independent (P3's timeline, sin(a) = 1)",

@@ -568,3 +568,118 @@ fn gradient_echo_sidecars_name_the_contrast() {
     assert!(sim["GradientEcho"]["SteadyState"].as_str().unwrap().contains("fixed point"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- P5 part B and D: the 3D series ----
+
+/// A small GRASE protocol on the crop: 2 x 2 x 3 mm (12 x 12 x 2), two shots in two interleaved
+/// ky segments of six 1 ms lines, refocusing at 150 degrees (stimulated echoes, so T1 enters).
+fn grase(rows: &str, suppression: bool, extra: &str) -> Protocol {
+    let mut s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": suppression, "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
+        "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "3D", "PulseSequenceType": "3Dgrase", "PhaseEncodingDirection": "j-",
+        "EffectiveEchoSpacing": 0.0005, "NumberShots": 2, "FlipAngle": 150
+    });
+    if suppression {
+        s["BackgroundSuppressionNumberPulses"] = json!(2);
+        s["BackgroundSuppressionPulseTime"] = json!([2.0, 3.2]);
+    }
+    let ov: Overlay = toml::from_str(&format!(
+        "seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n{extra}"
+    )).unwrap();
+    let ctx = format!("volume_type\n{}\n", rows.split(',').collect::<Vec<_>>().join("\n"));
+    parse(&s, &ctx, Some(&ov), crop().params.as_ref()).unwrap()
+}
+
+/// The 2D twin of [`grase`]: the same timing with every slice excited at once (SliceTiming all
+/// zero), so the kinetics and tissue the 3D series computes must be these exactly.
+fn twin_2d(rows: &str, suppression: bool) -> Protocol {
+    let mut s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": suppression, "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
+        "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.0], "PhaseEncodingDirection": "j-",
+        "TotalReadoutTime": 0.006
+    });
+    if suppression {
+        s["BackgroundSuppressionNumberPulses"] = json!(2);
+        s["BackgroundSuppressionPulseTime"] = json!([2.0, 3.2]);
+    }
+    let ov: Overlay = toml::from_str("seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n").unwrap();
+    let ctx = format!("volume_type\n{}\n", rows.split(',').collect::<Vec<_>>().join("\n"));
+    parse(&s, &ctx, Some(&ov), crop().params.as_ref()).unwrap()
+}
+
+#[test]
+fn three_d_kinetics_and_tissue_are_the_2d_ones_at_zero_slice_offset() {
+    for suppression in [false, true] {
+        let rows = "control,label,deltam";
+        let (a, _) = aslscan::series::simulate_compartments(&grase(rows, suppression, ""), &crop(), T2Mode::Auto, &phase(),
+                                                             RowOverride::None).unwrap();
+        let (b, _) = aslscan::series::simulate_compartments(&twin_2d(rows, suppression), &crop(), T2Mode::Auto, &phase(),
+                                                             RowOverride::None).unwrap();
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x, y, "suppression {suppression}");
+        }
+    }
+}
+
+const PHYSIO_EXCHANGE: &str = "[kinetic]\nexchange_time = 0.4\n[physio]\ntissue_cardiac = 0.2\nlabel_cardiac = -0.2\nlabel_drift = 0.05\n";
+
+fn grase_image(rows: &str, ov: RowOverride) -> Vec<(f64, f64)> {
+    image_of(&grase(rows, true, PHYSIO_EXCHANGE), ov)
+}
+
+/// The linearity identity in 3D with suppression, exchange and physiological noise: the three
+/// one-row runs share their shots' factors (same clock), the tissue's on the tissue group and the
+/// label's on the blood and extravascular-label groups.
+#[test]
+fn linearity_holds_for_grase_with_physio_and_exchange() {
+    let out = simulate_with(&grase("label", true, PHYSIO_EXCHANGE), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert_eq!(out.n_compartments, 9, "tissue, blood and extravascular-label groups of three labels");
+    let worst = residual_of(&grase_image("control", RowOverride::None), &grase_image("label", RowOverride::None),
+                            &grase_image("deltam", RowOverride::None));
+    println!("linearity, GRASE with physio and exchange: worst residual / tolerance = {worst:.3}");
+    assert!(worst <= 1.0, "{worst}");
+}
+
+#[test]
+fn linearity_fails_for_grase_when_the_extravascular_label_takes_the_tissue_factor() {
+    let worst = residual_of(&grase_image("control", RowOverride::None), &grase_image("label", RowOverride::ExtravascularIntoTissue),
+                            &grase_image("deltam", RowOverride::None));
+    println!("GRASE, extravascular label in the tissue group: residual / tolerance = {worst:.1}");
+    assert!(worst > 1e1, "{worst}");
+}
+
+/// The physiological processes run through the last shot of the last volume: one line per
+/// (volume, shot), at each shot's excitation, and the drift at the last shots is not the clamped
+/// end of the generated grid.
+#[test]
+fn grase_physio_is_per_shot_through_the_last_shot() {
+    let p = grase("control,label,control,label", false, "[physio]\ntissue_drift = 0.05\n");
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let lines = out.physio.as_ref().unwrap();
+    assert_eq!(lines.len(), 4 * 2);
+    for (i, l) in lines.iter().enumerate() {
+        assert_eq!((l.volume, l.slice), (i / 2, i % 2));
+        let want = p.row_start[l.volume] + l.slice as f64 * 4.0 + 3.6;
+        assert!((l.time - want).abs() < 1e-12, "{} vs {want}", l.time);
+    }
+    let last: Vec<f64> = lines.iter().rev().take(3).map(|l| l.drift).collect();
+    assert!(last[0] != last[1] && last[1] != last[2], "{last:?}");
+}
+
+/// A dropout event with zero jumps in a two-shot GRASE series attenuates its shot's lines
+/// (a shot gain), so the volume differs from the same series without the event, and the event is
+/// recorded with its shot and no slices.
+#[test]
+fn grase_shot_dropout_reaches_the_acquisition() {
+    let wv = "[motion]\nwithin_volume = { dropout_rate = 1.0, severity = 0.5, jump_mm = [0.0, 0.0, 0.0], jump_deg = [0.0, 0.0, 0.0] }\n";
+    let with = simulate_with(&grase("control", false, wv), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let without = simulate_with(&grase("control", false, ""), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert!(!with.events.is_empty() && with.dropped.iter().all(|d| d.slices.is_empty()));
+    let d = with.mag.iter().zip(&without.mag).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(d > 0.0);
+}
