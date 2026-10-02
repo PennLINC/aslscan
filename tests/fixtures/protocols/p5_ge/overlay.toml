@@ -1,0 +1,13 @@
+# Gradient echo at 60 degrees with background suppression (P5 plan, Task 6): two delays, so the
+# rows differ and the longitudinal state is carried row to row. For the crop phantom.
+seed = 12
+
+[acquisition]
+oversample = 2
+signal_scale = 100.0
+
+[signal]
+acq_contrast = "ge"
+
+[m0]
+repetition_time = 6.0

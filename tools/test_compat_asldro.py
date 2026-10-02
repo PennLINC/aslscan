@@ -149,11 +149,14 @@ def test_a_flipped_or_oblique_source_affine_is_refused():
         ca.translate(ca.asl_series([64, 64, 12]), SHAPE, two_mm, META)
 
 
-def test_unequal_echo_times_and_gradient_echo_are_refused():
+def test_unequal_echo_times_are_refused_and_gradient_echo_translates():
     with pytest.raises(SystemExit):
         ca.translate(ca.asl_series([64, 64, 12], echo_time=[0.01, 0.02, 0.01]), SHAPE, AFFINE, META)
+    _, _, ov = ca.translate(ca.asl_series([64, 64, 12], acq_contrast="ge", excitation_flip_angle=60.0),
+                            SHAPE, AFFINE, META)
+    assert 'acq_contrast = "ge"' in ov and "excitation_flip_angle = 60.0" in ov
     with pytest.raises(SystemExit):
-        ca.translate(ca.asl_series([64, 64, 12], acq_contrast="ge"), SHAPE, AFFINE, META)
+        ca.translate(ca.asl_series([64, 64, 12], acq_contrast="xx"), SHAPE, AFFINE, META)
 
 
 def test_pure_mask_on_a_two_label_slab():

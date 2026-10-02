@@ -386,8 +386,12 @@ def translate(series, gt_shape, gt_affine, gt_meta, parameter_override=None, tra
         ov += ["[signal]", 'acq_contrast = "ir"', f"inversion_time = {float(series['inversion_time'])}",
                f"excitation_flip_angle = {float(series['excitation_flip_angle'])}",
                f"inversion_flip_angle = {float(series['inversion_flip_angle'])}"]
+    elif contrast == "ge":
+        # P5 part A: under compat aslscan takes simasl's gradient-echo form and exp(-TE/T2*)
+        ov += ["[signal]", 'acq_contrast = "ge"',
+               f"excitation_flip_angle = {float(series['excitation_flip_angle'])}"]
     elif contrast != "se":
-        raise SystemExit(f"acq_contrast {contrast!r}: aslscan simulates se and ir (gradient echo is P5)")
+        raise SystemExit(f"acq_contrast {contrast!r}: aslscan simulates se, ir and ge")
     if trajectory:
         ov += ["[motion]", 'mode = "trajectory"', f'trajectory = "{trajectory}"']
     return side, "volume_type\n" + "\n".join(ctx) + "\n", "\n".join(ov) + "\n"
@@ -584,6 +588,12 @@ class Bench:
         n = 3
         return self.exact("E", asl_series(self.identity_matrix(), acq_contrast="ir", inversion_time=1.0,
                                           excitation_flip_angle=60.0, inversion_flip_angle=180.0,
+                                          repetition_time=[10.0] + [5.0] * (n - 1)))
+
+    def bench_g(self):
+        # P5 part A: gradient echo at 60 degrees, the M0 volume at its own TR
+        n = 3
+        return self.exact("G", asl_series(self.identity_matrix(), acq_contrast="ge", excitation_flip_angle=60.0,
                                           repetition_time=[10.0] + [5.0] * (n - 1)))
 
     # ---- B: [64, 64, 12], pure mask at 1e-3; all-voxel numbers and ground truth reported ----
@@ -802,7 +812,7 @@ def markdown(bench, tag, res):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("bench", choices=["A", "B", "C", "D", "D-grid", "E", "all"])
+    ap.add_argument("bench", choices=["A", "B", "C", "D", "D-grid", "E", "G", "all"])
     ap.add_argument("--phantom", choices=sorted(PHANTOMS) + ["synth"], default="3t",
                     help="synth: three tissue blocks on the 3 T grid, where the B and D pure masks exist")
     ap.add_argument("--crop", action="store_true", help="the checked-in crop's window of the 3 T ground truth")
@@ -811,9 +821,9 @@ def main():
     if a.crop and a.phantom != "3t":
         raise SystemExit("--crop is a window of the 3 T ground truth")
     b = Bench(a, a.phantom, crop=a.crop)
-    benches = ["A", "B", "C", "D", "D-grid", "E"] if a.bench == "all" else [a.bench]
-    if a.crop and any(x not in ("A", "E") for x in benches):
-        raise SystemExit("on the crop only A and E apply (the others need the full field of view)")
+    benches = ["A", "B", "C", "D", "D-grid", "E", "G"] if a.bench == "all" else [a.bench]
+    if a.crop and any(x not in ("A", "E", "G") for x in benches):
+        raise SystemExit("on the crop only A, E and G apply (the others need the full field of view)")
     runs = [(b, name) for name in benches]
     if a.bench == "all" and not b.gated:
         # B and D are report-only on the anatomy; their gates are the synthetic blocks', and

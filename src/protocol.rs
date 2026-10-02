@@ -403,6 +403,14 @@ pub struct IrSpec {
     pub inversion_flip: Source,
 }
 
+/// The resolved gradient-echo excitation (P5 addendum, part A) with its source.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeSpec {
+    /// Signed degrees in `[-180, 180]` (BIDS's `FlipAngle` folded as IR's is).
+    pub flip_deg: f64,
+    pub flip: Source,
+}
+
 /// Within-volume (multiband shot) motion events.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WithinVolume {
@@ -432,6 +440,8 @@ pub struct Protocol {
     pub suppression: Option<SuppressionSpec>,
     /// `Some` when `contrast` is inversion recovery.
     pub ir: Option<IrSpec>,
+    /// `Some` when `contrast` is gradient echo.
+    pub ge: Option<GeSpec>,
     /// `Some` when the overlay asks for motion (a mode other than `off`, or shot events).
     pub motion: Option<MotionSpec>,
     /// `Some` under `[compat] asldro = true` (P2).
@@ -1088,7 +1098,7 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
         }
         None => None,
     };
-    let ir = match contrast {
+    let (ir, ge) = match contrast {
         Contrast::SpinEcho => {
             for (what, fa) in [("asl.json: FlipAngle", side_fa), ("overlay: signal.excitation_flip_angle", so.and_then(|s| s.excitation_flip_angle))] {
                 if let Some(fa) = fa {
@@ -1107,7 +1117,7 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
             if so.and_then(|s| s.inversion_flip_angle).is_some() {
                 return Err("overlay: signal.inversion_flip_angle is undefined for acq_contrast \"se\"".to_string());
             }
-            None
+            (None, None)
         }
         Contrast::InversionRecovery => {
             if background_suppression {
@@ -1141,10 +1151,30 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                          time {ti} s (simasl's IR constraint)", r.tr, echo_time_s));
                 }
             }
-            Some(IrSpec {
+            (Some(IrSpec {
                 params: IrParams { inversion_time: ti, excitation_flip_deg: fa, inversion_flip_deg: fi },
                 inversion_time: ti_src, excitation_flip: fa_src, inversion_flip: fi_src,
-            })
+            }), None)
+        }
+        // Gradient echo (P5 addendum, part A): the excitation angle is overlay over sidecar over
+        // 90; no inversion is simulated, so its fields are refused as under "se".
+        Contrast::GradientEcho => {
+            if side_ti.is_some() || so.and_then(|s| s.inversion_time).is_some() {
+                return Err("InversionTime with acq_contrast \"ge\": no inversion is simulated, and echoing the \
+                            field would describe a preparation that did not happen".to_string());
+            }
+            if so.and_then(|s| s.inversion_flip_angle).is_some() {
+                return Err("overlay: signal.inversion_flip_angle is undefined for acq_contrast \"ge\"".to_string());
+            }
+            let (fa, fa_src) = match (so.and_then(|s| s.excitation_flip_angle), side_fa) {
+                (Some(v), _) => (v, Source::Overlay),
+                (None, Some(v)) => (v, Source::Sidecar),
+                (None, None) => (90.0, Source::Default),
+            };
+            if !(fa.is_finite() && (-180.0..=180.0).contains(&fa)) {
+                return Err(format!("excitation flip angle must be in [-180, 180] degrees, got {fa}"));
+            }
+            (None, Some(GeSpec { flip_deg: fa, flip: fa_src }))
         }
     };
 
@@ -1609,7 +1639,7 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
 
     Ok(Protocol {
         compat, grid_origin, exchange_time, macrovascular, crushing, physio, row_start,
-        label_type, rows, m0_type, background_suppression, suppression, ir, motion, mb_interleaved,
+        label_type, rows, m0_type, background_suppression, suppression, ir, ge, motion, mb_interleaved,
         slice_offsets, field_strength, voxel_size_mm, reverse_phase, phase_encoding_direction: ped,
         echo_time_s, total_readout_time_s, accel, mb, alpha, lambda, t1b, t2_blood_s, contrast,
         m0_repetition_time_s, seed, acq, input_sidecar: sidecar.clone(),
@@ -1711,7 +1741,7 @@ impl Protocol {
             accel: self.accel,
             acs_lines: a.acs_lines,
             seed: self.seed,
-            echo: EchoFormation::Spin,
+            echo: if self.contrast == Contrast::GradientEcho { EchoFormation::Gradient } else { EchoFormation::Spin },
         };
         mrsim_acq::kspace::validate_acquisition_timing(&acq, nx, ny).map_err(|inner| {
             format!(
@@ -1981,9 +2011,9 @@ mod tests {
         // field-strength mismatch with the phantom
         let ph15 = PhantomParams { field_strength: Some(1.5), ..Default::default() };
         assert!(parse(&base(), CTX, Some(&m0_overlay()), Some(&ph15)).unwrap_err().contains("field"));
-        // ge / ir rejected through the overlay
+        // ge parses through the overlay (P5 part A; its own test below)
         let ov = overlay("[signal]\nacq_contrast = \"ge\"\n[m0]\nrepetition_time = 8.0\n");
-        assert!(parse(&base(), CTX, Some(&ov), None).unwrap_err().contains("P5"));
+        assert_eq!(parse(&base(), CTX, Some(&ov), None).unwrap().contrast, Contrast::GradientEcho);
         // unknown overlay keys are refused rather than ignored
         assert!(toml::from_str::<Overlay>("[kinetic]\nlabel_eficiency = 0.8\n").is_err());
     }
@@ -2147,6 +2177,34 @@ mod tests {
         let ov = overlay("[m0]\nrepetition_time = 0.05\n");
         let e = parse(&base(), CTX, Some(&ov), None).unwrap_err();
         assert!(e.contains("m0.repetition_time") && e.contains("0.1"), "{e}");
+    }
+
+    /// P5 part A: gradient echo's excitation angle (overlay over sidecar over 90, signed as IR's),
+    /// its refusals, and the echo formation it hands the acquisition stage.
+    #[test]
+    fn gradient_echo_inputs_and_rules() {
+        let ge = |extra: &str| overlay(&format!("[signal]\nacq_contrast = \"ge\"\n{extra}[m0]\nrepetition_time = 8.0\n"));
+        let p = parse(&base(), CTX, Some(&ge("")), None).unwrap();
+        assert_eq!(p.contrast, Contrast::GradientEcho);
+        assert_eq!(p.ge, Some(GeSpec { flip_deg: 90.0, flip: Source::Default }));
+        assert!(p.ir.is_none());
+        assert_eq!(p.acquisition(64, 64).unwrap().echo, EchoFormation::Gradient);
+        let mut s = base();
+        s["FlipAngle"] = json!(60);
+        assert_eq!(parse(&s, CTX, Some(&ge("")), None).unwrap().ge, Some(GeSpec { flip_deg: 60.0, flip: Source::Sidecar }));
+        assert_eq!(parse(&s, CTX, Some(&ge("excitation_flip_angle = 30\n")), None).unwrap().ge,
+                   Some(GeSpec { flip_deg: 30.0, flip: Source::Overlay }));
+        s["FlipAngle"] = json!(330);
+        assert_eq!(parse(&s, CTX, Some(&ge("")), None).unwrap().ge.unwrap().flip_deg, -30.0);
+        // no inversion is simulated
+        let mut ti = base();
+        ti["InversionTime"] = json!(0.5);
+        assert!(parse(&ti, CTX, Some(&ge("")), None).unwrap_err().contains("InversionTime"));
+        assert!(parse(&base(), CTX, Some(&ge("inversion_time = 0.5\n")), None).unwrap_err().contains("InversionTime"));
+        assert!(parse(&base(), CTX, Some(&ge("inversion_flip_angle = 120\n")), None).unwrap_err().contains("inversion_flip_angle"));
+        assert!(parse(&base(), CTX, Some(&ge("excitation_flip_angle = 200\n")), None).unwrap_err().contains("[-180, 180]"));
+        // the spin echo keeps its own echo formation
+        assert_eq!(parse(&base(), CTX, Some(&m0_overlay()), None).unwrap().acquisition(64, 64).unwrap().echo, EchoFormation::Spin);
     }
 
     #[test]

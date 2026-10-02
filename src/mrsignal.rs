@@ -1,5 +1,11 @@
-//! Post-excitation magnetization for the spin-echo and inversion-recovery contrasts, per voxel.
-//! Seconds throughout.
+//! Post-excitation magnetization for the spin-echo, inversion-recovery and gradient-echo
+//! contrasts, per voxel. Seconds throughout.
+//!
+//! Gradient echo (P5 addendum, part A) has two tissue forms: the model's spoiled steady state,
+//! and simasl's form, which keeps transverse coherence through `exp(-TR/T2)` and is used under
+//! compat only (the two differ by percent at long T2). Its transverse factor is `exp(-TE/T2*)`,
+//! which the acquisition stage applies (`EchoFormation::Gradient`), so it too is divided out of
+//! the fixtures (`tests/fixtures/mrsignal_ge.txt`).
 //!
 //! This departs from simasl's `MriSignalFilter` (`src/asldro/filters/mri_signal_filter.py`) in
 //! exactly one way, on purpose: **no transverse relaxation**. simasl folds `exp(-TE/T2)` into
@@ -24,6 +30,9 @@
 pub enum Contrast {
     SpinEcho,
     InversionRecovery,
+    /// P5 addendum, part A: a gradient-echo EPI readout (the acquisition stage forms the echo
+    /// with `EchoFormation::Gradient`).
+    GradientEcho,
 }
 
 impl Contrast {
@@ -31,21 +40,18 @@ impl Contrast {
         match self {
             Contrast::SpinEcho => "se",
             Contrast::InversionRecovery => "ir",
+            Contrast::GradientEcho => "ge",
         }
     }
 }
 
-/// Parse the overlay's `acq_contrast` (case-insensitive, as simasl lower-cases it). `"se"` and
-/// `"ir"` are accepted. `"ge"` needs a gradient-echo echo-formation model in the acquisition
-/// stage (unrefocused off-resonance phase, monotonic T2* decay) and waits for P5.
+/// Parse the overlay's `acq_contrast` (case-insensitive, as simasl lower-cases it).
 pub fn parse_contrast(s: &str) -> Result<Contrast, String> {
     match s.to_ascii_lowercase().as_str() {
         "se" => Ok(Contrast::SpinEcho),
         "ir" => Ok(Contrast::InversionRecovery),
-        "ge" => Err("acq_contrast \"ge\": spin-echo and inversion-recovery readouts only; gradient echo \
-                     needs a different echo-formation model and arrives with P5"
-            .to_string()),
-        other => Err(format!("acq_contrast {other:?}: expected \"se\" or \"ir\"")),
+        "ge" => Ok(Contrast::GradientEcho),
+        other => Err(format!("acq_contrast {other:?}: expected \"se\", \"ir\" or \"ge\"")),
     }
 }
 
@@ -101,6 +107,45 @@ pub fn blood_ir(delta_m: f64, p: &IrParams) -> f64 {
     p.excitation_flip_deg.to_radians().sin() * delta_m
 }
 
+/// `exp(-tr/t)` with simasl's zero-time guard (`np.divide(where=t != 0)`: a zero time gives a zero
+/// exponent, `exp(0) = 1`).
+fn guarded_decay(tr: f64, t: f64) -> f64 {
+    (-(if t != 0.0 { tr / t } else { 0.0 })).exp()
+}
+
+/// The gradient-echo tissue signal of the model (P5 addendum, part A): the spoiled steady state
+/// `sin(fa) m0 (1 - E1) / (1 - cos(fa) E1)`, `E1 = exp(-TR/T1)`, transverse factor left to the
+/// acquisition stage, with simasl's zero-T1 guard and its zero-denominator guard. EPI spoils
+/// between repetitions, so no transverse coherence is carried; [`tissue_ge_simasl`] is the
+/// oracle's form, used under compat only.
+pub fn tissue_ge_spoiled(m0: f64, t1: f64, tr: f64, flip_deg: f64) -> f64 {
+    let fa = flip_deg.to_radians();
+    let e1 = guarded_decay(tr, t1);
+    let numerator = m0 * (1.0 - e1);
+    let denominator = 1.0 - fa.cos() * e1;
+    let quotient = if denominator != 0.0 { numerator / denominator } else { 0.0 };
+    fa.sin() * quotient
+}
+
+/// simasl's gradient-echo signal (`mri_signal_filter.py:188-225`), transverse factor
+/// `exp(-TE/T2*)` left to the acquisition stage:
+/// `sin(fa) m0 (1 - E1) / (1 - cos(fa) E1 - E2 (E1 - cos(fa)))`, `E2 = exp(-TR/T2)`, which keeps
+/// transverse coherence across repetitions. Both exponentials take simasl's zero-time guard (so a
+/// zero T2 gives `E2 = 1`), and a zero denominator gives 0. Compat only (`[compat] asldro`).
+pub fn tissue_ge_simasl(m0: f64, t1: f64, t2: f64, tr: f64, flip_deg: f64) -> f64 {
+    let fa = flip_deg.to_radians();
+    let (e1, e2) = (guarded_decay(tr, t1), guarded_decay(tr, t2));
+    let numerator = m0 * (1.0 - e1);
+    let denominator = 1.0 - fa.cos() * e1 - e2 * (e1 - fa.cos());
+    let quotient = if denominator != 0.0 { numerator / denominator } else { 0.0 };
+    fa.sin() * quotient
+}
+
+/// The blood compartment under gradient echo: `sin(fa) * delta_m`, as simasl applies to `mag_enc`.
+pub fn blood_ge(delta_m: f64, flip_deg: f64) -> f64 {
+    flip_deg.to_radians().sin() * delta_m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,10 +163,10 @@ mod tests {
     }
 
     #[test]
-    fn ge_is_rejected_naming_the_restriction_and_ir_parses() {
-        let ge = parse_contrast("ge").unwrap_err();
-        assert!(ge.contains("gradient echo") && ge.contains("P5"), "{ge}");
-        assert!(parse_contrast("bogus").is_err());
+    fn every_contrast_parses() {
+        assert_eq!(parse_contrast("ge").unwrap(), Contrast::GradientEcho);
+        assert_eq!(parse_contrast("GE").unwrap().as_str(), "ge");
+        assert!(parse_contrast("bogus").unwrap_err().contains("\"ge\""));
         assert_eq!(parse_contrast("se").unwrap(), Contrast::SpinEcho);
         assert_eq!(parse_contrast("SE").unwrap(), Contrast::SpinEcho);
         assert_eq!(parse_contrast("ir").unwrap(), Contrast::InversionRecovery);
@@ -166,8 +211,8 @@ mod tests {
         assert_eq!(tissue_ir(74.622, 0.0, 4.0, &p0), 0.0);
     }
 
-    /// One fixture case: (scalars, t1, m0, want).
-    type Case = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>);
+    /// One fixture case: (scalars, t1, m0, want, t2).
+    type Case = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>);
 
     /// Parse a fixture file: `case`, `scalars ...`, then named float rows.
     fn read_fixture(name: &str) -> Vec<Case> {
@@ -188,10 +233,10 @@ mod tests {
                 floats(l)
             };
             let t1 = take("t1");
-            let _t2 = take("t2"); // divided out by the generator; recorded for the reader
+            let t2 = take("t2"); // simasl's gradient-echo steady state reads it; recorded for all
             let m0 = take("m0");
             let want = take("signal_no_te");
-            cases.push((scalars, t1, m0, want));
+            cases.push((scalars, t1, m0, want, t2));
         }
         cases
     }
@@ -201,7 +246,7 @@ mod tests {
     fn matches_simasl_spin_echo_with_the_transverse_factor_divided_out() {
         let cases = read_fixture("mrsignal.txt");
         assert!(cases.len() >= 4, "too few cases: {}", cases.len());
-        for (ci, (scalars, t1, m0, want)) in cases.iter().enumerate() {
+        for (ci, (scalars, t1, m0, want, _)) in cases.iter().enumerate() {
             let tr = scalars[1];
             for i in 0..want.len() {
                 let got = tissue_se(m0[i], t1[i], tr);
@@ -216,7 +261,7 @@ mod tests {
         let cases = read_fixture("mrsignal_ir.txt");
         assert!(cases.len() >= 16, "too few cases: {}", cases.len());
         let mut saw_no_inversion = false;
-        for (ci, (scalars, t1, m0, want)) in cases.iter().enumerate() {
+        for (ci, (scalars, t1, m0, want, _)) in cases.iter().enumerate() {
             let (tr, ti, fa, fa_inv) = (scalars[1], scalars[2], scalars[3], scalars[4]);
             saw_no_inversion |= fa_inv == 0.0;
             let p = IrParams { inversion_time: ti, excitation_flip_deg: fa, inversion_flip_deg: fa_inv };
@@ -227,5 +272,51 @@ mod tests {
             }
         }
         assert!(saw_no_inversion, "the fixture must include an fa_inv = 0 case");
+    }
+
+    /// simasl's gradient-echo fixtures with exp(-TE/T2*) divided out: its own form at 1e-12
+    /// everywhere, and the model's spoiled form wherever simasl's E2 = exp(-TR/T2) is below 1e-16
+    /// (TR 10 s, nonzero T2), where the two must agree.
+    #[test]
+    fn matches_simasl_gradient_echo_with_the_transverse_factor_divided_out() {
+        let cases = read_fixture("mrsignal_ge.txt");
+        assert!(cases.len() >= 16, "too few cases: {}", cases.len());
+        let mut spoiled_checked = 0usize;
+        for (ci, (scalars, t1, m0, want, t2)) in cases.iter().enumerate() {
+            let (tr, fa) = (scalars[1], scalars[2]);
+            for i in 0..want.len() {
+                let tol = 1e-12 * want[i].abs().max(1e-300);
+                let got = tissue_ge_simasl(m0[i], t1[i], t2[i], tr, fa);
+                assert!((got - want[i]).abs() <= tol, "case {ci} voxel {i}: {got:.17e} vs {:.17e}", want[i]);
+                if t2[i] > 0.0 && (-tr / t2[i]).exp() < 1e-16 {
+                    let spoiled = tissue_ge_spoiled(m0[i], t1[i], tr, fa);
+                    assert!((spoiled - want[i]).abs() <= tol, "spoiled, case {ci} voxel {i}: {spoiled:.17e} vs {:.17e}", want[i]);
+                    spoiled_checked += 1;
+                }
+            }
+        }
+        assert!(spoiled_checked > 100, "the spoiled form must be checked on many voxels: {spoiled_checked}");
+    }
+
+    #[test]
+    fn gradient_echo_closed_forms_and_guards() {
+        let (m0, t1, tr) = (74.622f64, 1.33f64, 4.0f64);
+        let e = (-tr / t1).exp();
+        for fa in [90.0f64, 60.0, 30.0, -30.0] {
+            let r = fa.to_radians();
+            let want = r.sin() * m0 * (1.0 - e) / (1.0 - r.cos() * e);
+            let got = tissue_ge_spoiled(m0, t1, tr, fa);
+            assert!((got - want).abs() <= 1e-12 * want.abs(), "{fa}: {got} vs {want}");
+        }
+        // at 90 degrees the spoiled gradient echo is the spin echo's saturation recovery
+        assert!((tissue_ge_spoiled(m0, t1, tr, 90.0) - tissue_se(m0, t1, tr)).abs() <= 1e-12 * m0);
+        // a long T2 makes simasl's coherent form differ (the review's 3.7 percent at T2 = 2 s)
+        let (s, c) = (tissue_ge_spoiled(m0, 3.0, 4.0, 60.0), tissue_ge_simasl(m0, 3.0, 2.0, 4.0, 60.0));
+        assert!((c / s - 1.0).abs() > 0.03, "{s} vs {c}");
+        // guards: zero T1 is zero signal; zero T2 gives simasl's E2 = 1
+        assert_eq!(tissue_ge_spoiled(m0, 0.0, tr, 60.0), 0.0);
+        assert_eq!(tissue_ge_simasl(m0, 0.0, 0.1, tr, 60.0), 0.0);
+        assert_eq!(blood_ge(-0.37, 90.0), -0.37 * 90f64.to_radians().sin());
+        assert!((blood_ge(2.0, 30.0) - 1.0).abs() < 1e-12);
     }
 }

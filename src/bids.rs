@@ -184,6 +184,24 @@ mod writer {
             block["Grid"]["Origin"] = json!(p.grid_origin.as_str());
         }
         p4_blocks(&mut block, p, out);
+        // P5 part A: written only under gradient echo, so other outputs keep their bytes
+        if let Some(g) = &p.ge {
+            block["GradientEcho"] = json!({
+                "ExcitationFlipAngle": { "Value": g.flip_deg, "Source": g.flip.as_str() },
+                "EchoFormation": "gradient echo: T2' decays from the RF (T2* = 1/(1/T2 + 1/T2')), and the static \
+                                  2 pi fmap TE joins the object phase",
+                "TissueModel": if p.compat.is_some() {
+                    "simasl's steady state, keeping transverse coherence through exp(-TR/T2) (compat)"
+                } else {
+                    "spoiled steady state: sin(a) M0 (1 - E1) / (1 - cos(a) E1), or the suppression timeline's \
+                     fixed point, or the state carried row to row when the rows' preparations differ"
+                },
+                "SteadyState": out.ge_rule,
+                "BloodModel": "sin(FlipAngle) * delta_m",
+                "M0": "the same excitation and readout without labeling",
+            });
+            block["M0ScanContrast"] = json!("ge");
+        }
         if let (Some(_), Some(f)) = (&p.compat, &out.compat) {
             let mut pinned: Map<String, Value> = COMPAT_PINNED.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
             pinned.insert("window".to_string(), json!("none"));
@@ -369,6 +387,9 @@ mod writer {
             effective.push(("InversionTime", json!(ir.params.inversion_time)));
             effective.push(("FlipAngle", json!(ir.params.excitation_flip_deg.rem_euclid(360.0))));
         }
+        if let Some(g) = &p.ge {
+            effective.push(("FlipAngle", json!(g.flip_deg.rem_euclid(360.0))));
+        }
         if let Some(s) = &p.suppression {
             // BIDS carries the first PLD's pulse times; an overlay override must be what is
             // published, with the input kept under InputValuesReplaced.
@@ -420,17 +441,24 @@ mod writer {
                 format!("bids::{}", names.rel("_part-phase_asl.nii.gz")),
             ]));
             // The M0 scan is simulated with the 90-degree spin-echo equation whatever the ASL
-            // series' excitation angle; its FlipAngle says so, the input kept as replaced.
+            // series' excitation angle, except under gradient echo, whose M0 is the same
+            // excitation and readout (P5 part A); its FlipAngle says which, the input kept as
+            // replaced.
+            let (m0_flip, m0_contrast, m0_note) = match &p.ge {
+                Some(g) => (g.flip_deg.rem_euclid(360.0), "ge",
+                            "the series' gradient-echo readout at its own repetition time: no suppression, no motion"),
+                None => (90.0, "se", "a plain spin-echo readout at its own repetition time: no suppression, no inversion, no motion"),
+            };
             let mut m0_replaced = Map::new();
             if let Some(old) = m0side.get("FlipAngle") {
-                if !same_number(old, &json!(90.0)) {
+                if !same_number(old, &json!(m0_flip)) {
                     m0_replaced.insert("FlipAngle".to_string(), old.clone());
                 }
             }
-            m0side.insert("FlipAngle".to_string(), json!(90.0));
+            m0side.insert("FlipAngle".to_string(), json!(m0_flip));
             let mut m0sim = json!({
-                "Seed": out.seeds.1, "Magnitude": true, "Contrast": "se",
-                "Note": "a plain spin-echo readout at its own repetition time: no suppression, no inversion, no motion",
+                "Seed": out.seeds.1, "Magnitude": true, "Contrast": m0_contrast,
+                "Note": m0_note,
                 "InputValuesReplaced": m0_replaced,
             });
             if p.physio.is_some() {

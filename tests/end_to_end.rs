@@ -494,3 +494,77 @@ fn asl002_shaped_suppression_meets_the_acceptance_numbers() {
     println!("default efficiency: worst deviation from 0.81 x the unsuppressed difference {worst:.3e}");
     assert!(worst < 1e-4, "default efficiency must scale the difference by 0.81: {worst}");
 }
+
+/// P5 part A: gradient echo at 60 degrees with suppression. The three one-row runs share the
+/// preparation, so the tissue (the suppression timeline's fixed point, times sin(a)) cancels in
+/// C - L and the blood carries sin(a) delta_m in L and B.
+fn ge_run(rows: &str, ov: RowOverride) -> Vec<(f64, f64)> {
+    image_of(&protocol_with(rows, 0.0, true, "[signal]\nacq_contrast = \"ge\"\nexcitation_flip_angle = 60\n"), ov)
+}
+
+#[test]
+fn linearity_holds_under_gradient_echo() {
+    let worst = residual_of(&ge_run("control", RowOverride::None), &ge_run("label", RowOverride::None),
+                            &ge_run("deltam", RowOverride::None));
+    println!("linearity under gradient echo: worst residual / tolerance = {worst:.3}");
+    assert!(worst <= 1.0, "{worst}");
+}
+
+#[test]
+fn linearity_fails_under_gradient_echo_for_a_flipped_label_sign() {
+    let worst = residual_of(&ge_run("control", RowOverride::None), &ge_run("label", RowOverride::FlipLabelSign),
+                            &ge_run("deltam", RowOverride::None));
+    assert!(worst > 1e3, "{worst}");
+}
+
+/// Rows whose preparations differ (two delays) take the propagated state: the first row is its
+/// own steady state (a one-row run of it agrees), the second is not (it carries the first's
+/// state, so it differs from a one-row run of itself).
+#[test]
+fn a_gradient_echo_series_with_differing_rows_carries_its_state() {
+    let mk = |pld: serde_json::Value, rows: &str| {
+        let mut s = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": pld,
+            "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
+            "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+            "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05], "PhaseEncodingDirection": "j-",
+            "TotalReadoutTime": 0.012
+        });
+        s["LabelingDuration"] = json!(1.8);
+        let ov: Overlay = toml::from_str("seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n\
+                                          [signal]\nacq_contrast = \"ge\"\nexcitation_flip_angle = 30\n").unwrap();
+        let ctx = format!("volume_type\n{}\n", rows.split(',').collect::<Vec<_>>().join("\n"));
+        parse(&s, &ctx, Some(&ov), crop().params.as_ref()).unwrap()
+    };
+    let two = simulate_with(&mk(json!([0.5, 1.8]), "control,control"), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert!(two.ge_rule.unwrap().contains("propagated"), "{:?}", two.ge_rule);
+    let first = simulate_with(&mk(json!(0.5), "control"), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let second = simulate_with(&mk(json!(1.8), "control"), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert!(first.ge_rule.unwrap().contains("closed form"), "{:?}", first.ge_rule);
+    let vol = |o: &aslscan::series::SeriesOutput, v: usize| -> Vec<f64> {
+        (0..o.mag.len() / o.n_volumes).map(|i| o.mag[i * o.n_volumes + v] as f64).collect()
+    };
+    let (a0, a1, b, c) = (vol(&two, 0), vol(&two, 1), vol(&first, 0), vol(&second, 0));
+    let peak = b.iter().fold(0.0f64, |m, x| m.max(*x));
+    let d0 = a0.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+    let d1 = a1.iter().zip(&c).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+    assert!(d0 <= 1e-5 * peak, "the first row is its own steady state: {d0:e} of {peak:e}");
+    assert!(d1 > 1e-3 * peak, "the second row carries the first's state: {d1:e} of {peak:e}");
+}
+
+#[test]
+fn gradient_echo_sidecars_name_the_contrast() {
+    let p = protocol_with("control,label", 0.0, true, "[signal]\nacq_contrast = \"ge\"\nexcitation_flip_angle = -30\n");
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-ge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("sub-01/perf/sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    assert_eq!(side["FlipAngle"], json!(330.0));
+    let sim = &side["AslscanSimulation"];
+    assert_eq!(sim["Resolved"]["AcqContrast"], json!("ge"));
+    assert_eq!(sim["M0ScanContrast"], json!("ge"));
+    assert_eq!(sim["GradientEcho"]["ExcitationFlipAngle"]["Value"], json!(-30.0));
+    assert!(sim["GradientEcho"]["SteadyState"].as_str().unwrap().contains("fixed point"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

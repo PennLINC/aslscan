@@ -37,8 +37,8 @@ use crate::bolus::{arterial_factor, entry_offset, subbolus_factors, Region};
 use crate::crushing::survival;
 use crate::kinetic::{arterial_dm, delta_m, delta_m_iv, delta_m_iv_sub, delta_m_sub, LabelType};
 use crate::physio::Physio;
-use crate::longitudinal::{label_factor, tissue_mz};
-use crate::mrsignal::{blood_ir, blood_se, tissue_ir, tissue_se, Contrast};
+use crate::longitudinal::{label_factor, tissue_mz, tissue_mz_ge, tissue_mz_ge_sequence, Prep};
+use crate::mrsignal::{blood_ge, blood_ir, blood_se, tissue_ge_simasl, tissue_ge_spoiled, tissue_ir, tissue_se, Contrast};
 use crate::phantom::{Phantom, Relaxation, T2Mode};
 use crate::protocol::{M0Type, Protocol, QuantitySource, Row, RowKind, SuppressionModel, WithinVolume};
 use crate::resample::{acquisition_grid, axis_aligned_voxels, corner_offset, Resampler};
@@ -132,6 +132,8 @@ pub struct SeriesOutput {
     pub crush_survival: Option<Vec<Vec<f64>>>,
     /// P4, part E.
     pub physio: Option<Vec<PhysioLine>>,
+    /// P5 part A: which gradient-echo steady state the tissue took (`None` unless `"ge"`).
+    pub ge_rule: Option<&'static str>,
 }
 
 /// The compat noise resolution (P2 addendum, part A).
@@ -485,15 +487,21 @@ fn simulate_core(
 
     // ---- the signal equations in use ----
     let ir = p.ir.as_ref().map(|s| s.params);
-    let tissue_steady = |m0: f64, t1: f64, tr: f64, se: bool| -> f64 {
-        match (p.contrast, ir, se) {
-            (Contrast::InversionRecovery, Some(q), false) => tissue_ir(m0, t1, tr, &q),
+    // P5 part A: the gradient-echo excitation angle; the model's spoiled steady state, or
+    // simasl's coherent form under compat
+    let ge_flip = p.ge.as_ref().map(|g| g.flip_deg);
+    let tissue_steady = |m0: f64, t1: f64, t2: f64, tr: f64, se: bool| -> f64 {
+        match (p.contrast, ir, ge_flip, se) {
+            (Contrast::InversionRecovery, Some(q), _, false) => tissue_ir(m0, t1, tr, &q),
+            (Contrast::GradientEcho, _, Some(fa), false) if p.compat.is_some() => tissue_ge_simasl(m0, t1, t2, tr, fa),
+            (Contrast::GradientEcho, _, Some(fa), false) => tissue_ge_spoiled(m0, t1, tr, fa),
             _ => tissue_se(m0, t1, tr),
         }
     };
     let blood_signal = |x: f64| -> f64 {
-        match (p.contrast, ir) {
-            (Contrast::InversionRecovery, Some(q)) => blood_ir(x, &q),
+        match (p.contrast, ir, ge_flip) {
+            (Contrast::InversionRecovery, Some(q), _) => blood_ir(x, &q),
+            (Contrast::GradientEcho, _, Some(fa)) => blood_ge(x, fa),
             _ => blood_se(x),
         }
     };
@@ -539,7 +547,10 @@ fn simulate_core(
     // zero-T2 guard (`np.divide(.., where=t2 != 0)` leaves exp(0) = 1); the readout's own
     // relaxation is off (`Protocol::acquisition`) ----
     let te_factor: Option<Vec<f64>> = p.compat.as_ref().map(|_| {
-        ph.t2.iter().map(|&t2| if t2 != 0.0 { (-p.echo_time_s / t2 as f64).exp() } else { 1.0 }).collect()
+        // under gradient echo simasl's transverse factor is exp(-TE/T2*), with the same guard
+        // (`mri_signal_filter.py:194-198`)
+        let tt = if p.contrast == Contrast::GradientEcho { &ph.t2star } else { &ph.t2 };
+        tt.iter().map(|&t2| if t2 != 0.0 { (-p.echo_time_s / t2 as f64).exp() } else { 1.0 }).collect()
     });
     let te = |i: usize| -> f64 { te_factor.as_ref().map_or(1.0, |f| f[i]) };
 
@@ -550,8 +561,8 @@ fn simulate_core(
             .entry((tr.to_bits(), se))
             .or_insert_with(|| {
                 let sig: Vec<f64> = match &te_factor {
-                    None => (0..ph.nvox()).map(|i| tissue_steady(ph.m0[i] as f64, ph.t1[i] as f64, tr, se)).collect(),
-                    Some(f) => (0..ph.nvox()).map(|i| tissue_steady(ph.m0[i] as f64, ph.t1[i] as f64, tr, se) * f[i]).collect(),
+                    None => (0..ph.nvox()).map(|i| tissue_steady(ph.m0[i] as f64, ph.t1[i] as f64, ph.t2[i] as f64, tr, se)).collect(),
+                    Some(f) => (0..ph.nvox()).map(|i| tissue_steady(ph.m0[i] as f64, ph.t1[i] as f64, ph.t2[i] as f64, tr, se) * f[i]).collect(),
                 };
                 masks
                     .iter()
@@ -576,11 +587,75 @@ fn simulate_core(
                 masks
                     .iter()
                     .map(|m| {
-                        r_sim.mean_slice(z, |i| if m[i] { tissue_mz(ph.m0[i] as f64, ph.t1[i] as f64, r.tr, t_read, s) } else { 0.0 })
+                        r_sim.mean_slice(z, |i| {
+                            if !m[i] {
+                                0.0
+                            } else if let Some(fa) = ge_flip {
+                                // P5 part A: the gradient-echo steady state, sin(a) at the readout
+                                fa.to_radians().sin() * tissue_mz_ge(ph.m0[i] as f64, ph.t1[i] as f64, r.tr, t_read, s, fa)
+                            } else {
+                                tissue_mz(ph.m0[i] as f64, ph.t1[i] as f64, r.tr, t_read, s)
+                            }
+                        })
                     })
                     .collect()
             })
             .clone()
+    };
+
+    // ---- P5 part A: a gradient echo below or above 90 degrees does not saturate the slab, so
+    // when the rows' preparations differ (repetition time, readout time, pulse set,
+    // presaturation) the longitudinal state carries from row to row and no single steady state
+    // holds. Then every row's tissue comes from the propagation, per slice (each slice has its own
+    // readout time). An m0scan row has no labeling; its readout is taken at the end of its
+    // repetition, so its repetition time is recovery before the readout. Not under compat:
+    // simasl treats each volume as its own steady state. ----
+    let prep_key = |v: usize| {
+        let r = &p.rows[v];
+        let presat = suppression[v].as_ref().is_some_and(|s| s.presaturation);
+        (r.tr.to_bits(), r.t.to_bits(), suppression[v].is_some(), pulse_set[v], presat, r.kind == RowKind::M0scan)
+    };
+    let uniform_prep = (0..n).all(|v| prep_key(v) == prep_key(0));
+    let ge_propagated: Option<Vec<Vec<Vec<f32>>>> = match ge_flip {
+        Some(fa) if fa != 90.0 && !uniform_prep && p.compat.is_none() => {
+            let sin = fa.to_radians().sin();
+            let [pnx, pny, _] = ph.grid.dims;
+            let pslab = pnx * pny;
+            let mut out = vec![vec![vec![0.0f32; nvox_sim]; k]; n];
+            for z in 0..nz {
+                let preps: Vec<Prep> = p.rows.iter().enumerate().map(|(v, r)| Prep {
+                    tr: r.tr,
+                    t_read: if r.kind == RowKind::M0scan { r.tr } else { r.t + p.slice_offsets[z] },
+                    s: suppression[v].as_ref(),
+                }).collect();
+                // the sequence per phantom voxel of this slice's slab, computed once
+                let cells: Vec<usize> = r_sim.z_slab(z).iter().map(|&(zs, _)| zs).collect();
+                let local = |i: usize| -> usize {
+                    let pos = cells.iter().position(|&zs| zs == i / pslab).expect("a voxel of this slab");
+                    pos * pslab + i % pslab
+                };
+                let mut seq = vec![vec![0.0f64; cells.len() * pslab]; n];
+                for (pos, &zs) in cells.iter().enumerate() {
+                    for xy in 0..pslab {
+                        let i = zs * pslab + xy;
+                        if ph.dseg[i] <= 0 {
+                            continue;
+                        }
+                        for (v, mz) in tissue_mz_ge_sequence(ph.m0[i] as f64, ph.t1[i] as f64, &preps, fa).into_iter().enumerate() {
+                            seq[v][pos * pslab + xy] = sin * mz;
+                        }
+                    }
+                }
+                for v in 0..n {
+                    for (c, m) in masks.iter().enumerate() {
+                        let sl = r_sim.mean_slice(z, |i| if m[i] { seq[v][local(i)] } else { 0.0 });
+                        out[v][c][z * snx * sny..(z + 1) * snx * sny].copy_from_slice(&sl);
+                    }
+                }
+            }
+            Some(out)
+        }
+        _ => None,
     };
 
     // ---- per-row blood images with per-slice timing ----
@@ -640,10 +715,12 @@ fn simulate_core(
     let pslab = pnx * pny;
     for (v, row) in p.rows.iter().enumerate() {
         // An m0scan row is a plain spin-echo readout (P3), except under compat, where it takes
-        // the series' equation as simasl's does (P2 addendum, part A).
-        let se = row.kind == RowKind::M0scan && p.compat.is_none();
+        // the series' equation as simasl's does (P2 addendum, part A), and under gradient echo,
+        // whose M0 is the same excitation and readout without labeling (P5 addendum, part A).
+        let se = row.kind == RowKind::M0scan && p.compat.is_none() && p.contrast != Contrast::GradientEcho;
         let mut tissue = match (row.kind, &suppression[v]) {
             (RowKind::Deltam, _) => None,
+            _ if ge_propagated.is_some() => ge_propagated.as_ref().map(|g| g[v].clone()),
             (_, Some(_)) => {
                 let mut comps = vec![vec![0.0f32; nvox_sim]; k];
                 for z in 0..nz {
@@ -892,7 +969,9 @@ fn simulate_core(
     let m0 = match m0_seed {
         Some(seed) => {
             let tr = p.m0_repetition_time_s.ok_or("M0Type Separate without an M0 repetition time")?;
-            let tissue = tissue_for(tr, true);
+            // the separate M0 is its own series at its own repetition time: spin echo, or the
+            // gradient-echo steady state (P5 part A)
+            let tissue = tissue_for(tr, p.contrast != Contrast::GradientEcho);
             let mut imgs: Vec<Vec<f32>> = vec![vec![0.0f32; nvox_sim]; ncomp];
             for c in 0..k {
                 imgs[c].copy_from_slice(&tissue[c]);
@@ -941,6 +1020,13 @@ fn simulate_core(
         seeds: (p.seed, m0_seed), acquisition: acq, ground_truth, label_factors, poses, motion_seed,
         events, dropped, compat: compat_facts,
         crush_survival: p4.crush.clone(), physio: p4.physio.as_ref().map(|_| physio_lines),
+        ge_rule: ge_flip.map(|fa| match (p.compat.is_some(), fa == 90.0, ge_propagated.is_some(), p.suppression.is_some()) {
+            (true, ..) => "simasl's coherent steady state per volume (compat)",
+            (_, true, ..) => "90 degrees: the slab is saturated, each row independent (P3's timeline, sin(a) = 1)",
+            (_, _, true, _) => "state propagated row to row (the rows' preparations differ)",
+            (_, _, _, true) => "spoiled steady state of the repeated preparation (fixed point of the suppression timeline)",
+            _ => "spoiled steady state (closed form)",
+        }),
     })
 }
 
