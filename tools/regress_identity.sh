@@ -16,11 +16,21 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 WT=$(cd "$HERE/.." && pwd)/aslscan-base-${BASE//\//-}
 OUT=$HERE/work/regress
 rm -rf "$OUT"; mkdir -p "$OUT/inputs"
+BASE_SHA=$(git -C "$HERE" rev-parse --verify "$BASE^{commit}")
 if [ ! -d "$WT" ]; then
-  git -C "$HERE" worktree add -q "$WT" "$BASE"
+  git -C "$HERE" worktree add -q --detach "$WT" "$BASE_SHA"
 fi
-(cd "$WT" && git checkout -q "$BASE" && CARGO_TARGET_DIR="$WT/target" cargo build -q --release --features cli,kspace,par)
-(cd "$HERE" && cargo build -q --release --features cli,kspace,par)
+# a reused worktree must be this repository's, clean (untracked files included: a stray source
+# file would be built), and at the base commit, or the "base" binary is not the base
+common() { realpath "$(git -C "$1" rev-parse --path-format=absolute --git-common-dir)"; }
+[ "$(common "$WT")" = "$(common "$HERE")" ] || { echo "$WT is not a worktree of $HERE"; exit 1; }
+git -C "$WT" checkout -q --detach "$BASE_SHA"
+[ -z "$(git -C "$WT" status --porcelain --untracked-files=all)" ] \
+  || { echo "$WT has local changes; remove it or clean it"; git -C "$WT" status --short; exit 1; }
+[ "$(git -C "$WT" rev-parse HEAD)" = "$BASE_SHA" ] || { echo "$WT is not at $BASE_SHA"; exit 1; }
+# both target directories pinned, so the binaries run are the ones just built
+(cd "$WT" && CARGO_TARGET_DIR="$WT/target" cargo build -q --release --features cli,kspace,par)
+(cd "$HERE" && CARGO_TARGET_DIR="$HERE/target" cargo build -q --release --features cli,kspace,par)
 OLD=$WT/target/release/aslscan
 NEW=$HERE/target/release/aslscan
 P=$HERE/tests/fixtures/protocols
@@ -79,16 +89,27 @@ for c in "${cases[@]}"; do
     fi
   done
   n=0; bad=0
+  # the file list and the decompressions are checked for failure, not left inside process
+  # substitutions, whose status set -e and pipefail never see (two unreadable gzips would
+  # otherwise compare as two empty streams)
+  files=$(find "$OUT/old-$name" -type f) || { echo "$name: listing failed"; fail=1; continue; }
+  [ -n "$files" ] || { echo "$name: no output files"; fail=1; continue; }
   while IFS= read -r f; do
     rel=${f#$OUT/old-$name/}
     g=$OUT/new-$name/$rel
     n=$((n+1))
     if [ ! -f "$g" ]; then echo "  MISSING $name $rel"; bad=1; continue; fi
     case $f in
-      *.nii.gz) cmp -s <(zcat "$f") <(zcat "$g") || { echo "  DIFF $name $rel"; bad=1; } ;;
+      *.nii.gz)
+        if ! gzip -dc "$f" > "$OUT/a.nii" || ! gzip -dc "$g" > "$OUT/b.nii"; then
+          echo "  UNREADABLE $name $rel"; bad=1
+        elif ! cmp -s "$OUT/a.nii" "$OUT/b.nii"; then
+          echo "  DIFF $name $rel"; bad=1
+        fi ;;
       *) cmp -s "$f" "$g" || { echo "  DIFF $name $rel"; bad=1; } ;;
     esac
-  done < <(find $OUT/old-$name -type f)
+  done <<< "$files"
+  rm -f "$OUT/a.nii" "$OUT/b.nii"
   nnew=$(find $OUT/new-$name -type f | wc -l)
   [ "$nnew" = "$n" ] || { echo "  file count $n vs $nnew"; bad=1; }
   echo "$name: $n files, $([ $bad = 0 ] && echo identical || echo DIFFERENT)"

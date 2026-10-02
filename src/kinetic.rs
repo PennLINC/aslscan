@@ -175,7 +175,9 @@ pub fn delta_m_iv_sub(k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, t: f64, a
 }
 
 /// The PASL branch of [`gkm_body`] with `exp(kk t) (exp(-kk x) - exp(-kk y))` evaluated as
-/// `exp(kk (t - x)) - exp(kk (t - y))` (and `expm1` when `y = t`): the same masks and guards.
+/// `exp(kk (t - y)) expm1(kk (y - x))`: the same masks and guards. Combining the exponents keeps
+/// it finite at large `|kk|`; `expm1` keeps it accurate at small `|kk|`, where `tau_ex` makes
+/// `T1''` nearly `T1b` and the difference of two exponentials would cancel to noise.
 fn pasl_stable(k: &Kinetic, f: f64, m0b: f64, dt: f64, t1p: f64, t: f64) -> f64 {
     let arriving = dt < t && t < dt + k.tau;
     let arrived = t >= dt + k.tau;
@@ -189,7 +191,7 @@ fn pasl_stable(k: &Kinetic, f: f64, m0b: f64, dt: f64, t1p: f64, t: f64) -> f64 
         let q = div0(num, kk * (t - dt));
         2.0 * m0b * f * (t - dt) * k.alpha * decay * q
     } else {
-        let num = (kk * (t - dt)).exp() - (kk * (t - dt - k.tau)).exp();
+        let num = (kk * (t - dt - k.tau)).exp() * (kk * k.tau).exp_m1();
         let q = div0(num, kk * k.tau);
         2.0 * m0b * f * k.alpha * k.tau * decay * q
     }
@@ -608,6 +610,43 @@ mod tests {
         // and delta_m_with_t1p at the GKM's own T1' is delta_m
         for t in [1.2, 2.0, 3.6] {
             assert_eq!(delta_m_with_t1p(&K_PCASL, F, DT, t1p, M0, t).to_bits(), delta_m(&K_PCASL, F, DT, T1T, M0, t).to_bits());
+        }
+    }
+
+    #[test]
+    fn pasl_intravascular_part_is_accurate_where_t1pp_nears_t1b() {
+        // T1t = 3 puts the tau_ex that makes T1'' = T1b (kk = 0) in range: 1/tau_ex = 1/T1b - 1/T1'.
+        // There the arrived branch's difference of two exponentials cancelled to noise, and the
+        // computed part exceeded delta_m (Codex review: iv 0.01296 against delta_m 0.00567).
+        let (t1t, m0, t) = (3.0, 1.0, 2.0);
+        let t1p = t1_prime(F, t1t, 0.9);
+        let tau_star = 1.0 / (1.0 / K_PASL.t1b - 1.0 / t1p);
+        let dm = delta_m(&K_PASL, F, DT, t1t, m0, t);
+        let iv = delta_m_iv(&K_PASL, F, DT, t1t, m0, t, 3.8223938223938227);
+        assert!((iv - 0.004536224).abs() < 1e-8, "{iv} (delta_m {dm})");
+        // the limit kk -> 0: q -> 1, so iv -> 2 M0b f alpha tau exp(-t/T1b)
+        let limit = 2.0 * (m0 / 0.9) * (F / 6000.0) * K_PASL.alpha * K_PASL.tau * (-t / K_PASL.t1b).exp();
+        let near = delta_m_iv(&K_PASL, F, DT, t1t, m0, t, tau_star * (1.0 + 1e-13));
+        assert!((near - limit).abs() <= 1e-9 * limit, "{near} vs {limit}");
+        // across the crossing, in both branches: bounded, and nondecreasing in tau_ex (slower
+        // exchange keeps more label intravascular), which cancellation noise would break. A kk
+        // of exactly zero takes the GKM's quotient guard (zero, which the spec keeps for every
+        // P4 formula); it is skipped, and can happen at most once in the sweep.
+        for t in [DT + 0.3, t, 3.0] {
+            let dm = delta_m(&K_PASL, F, DT, t1t, m0, t);
+            let (mut prev, mut zeros) = (0.0f64, 0);
+            for j in -200..=200 {
+                let tau_ex = tau_star * (1.0 + j as f64 * 1e-12);
+                let iv = delta_m_iv(&K_PASL, F, DT, t1t, m0, t, tau_ex);
+                assert!(iv >= 0.0 && iv <= dm * (1.0 + 1e-12), "t {t} tau_ex {tau_ex}: iv {iv} dm {dm}");
+                if iv == 0.0 {
+                    zeros += 1;
+                    continue;
+                }
+                assert!(iv >= prev * (1.0 - 1e-12), "t {t} tau_ex {tau_ex}: {iv} after {prev}");
+                prev = iv;
+            }
+            assert!(zeros <= 1, "t {t}: {zeros} guarded zeros");
         }
     }
 

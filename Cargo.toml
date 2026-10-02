@@ -29,3 +29,8 @@ clap = { version = "4", features = ["derive"], optional = true }
 [[bin]]
 name = "aslscan"
 required-features = ["cli"]
+
+[dev-dependencies]
+# the end-to-end tests read the written 4D ground truth back (mrsim-acq/io reads only 3D)
+nifti = { version = "0.17", features = ["ndarray_volumes"] }
+ndarray = "0.16"

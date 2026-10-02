@@ -12,6 +12,7 @@ use aslscan::phantom::{self, Phantom, T2Mode};
 use aslscan::protocol::{parse, Overlay, Protocol};
 use aslscan::series::{complex_from, simulate_with, RowOverride, SeriesOutput};
 use mrsim_acq::phase::PhaseModel;
+use nifti::{IntoNdArray, NiftiObject};
 use serde_json::{json, Value};
 
 fn crop() -> Phantom {
@@ -308,6 +309,36 @@ fn p4_sidecar_blocks_and_ground_truth_files() {
     for f in ["deltamIntravascular", "deltamSuppressed", "deltamArterial", "aBV", "aATT"] {
         assert!(gt.join(format!("sub-01_desc-{f}_gt.nii.gz")).exists(), "{f}");
         assert!(gt.join(format!("sub-01_desc-{f}_gt.json")).exists(), "{f}");
+    }
+    // read back: shape, and every value where the layout puts it (memory is voxel-major with
+    // the volume innermost; NIfTI is x fastest with the volume outermost)
+    let [nx, ny, nz] = out.acq_grid.dims;
+    let n = out.n_volumes;
+    let g = &out.ground_truth;
+    for (f, data) in [("deltamIntravascular", &g.delta_m_iv), ("deltamSuppressed", &g.delta_m_suppressed),
+                      ("deltamArterial", &g.delta_m_arterial)] {
+        let data = data.as_ref().unwrap();
+        assert_eq!(data.len(), nx * ny * nz * n);
+        let obj = nifti::ReaderOptions::new().read_file(gt.join(format!("sub-01_desc-{f}_gt.nii.gz"))).unwrap();
+        let arr = obj.into_volume().into_ndarray::<f32>().unwrap();
+        assert_eq!(arr.shape(), &[nx, ny, nz, n], "{f}");
+        let mut nonzero = 0;
+        for ((x, y, z), v) in (0..nz).flat_map(|z| (0..ny).flat_map(move |y| (0..nx).map(move |x| (x, y, z))))
+            .flat_map(|p| (0..n).map(move |v| (p, v)))
+        {
+            let want = data[(x + nx * (y + ny * z)) * n + v];
+            assert!(want.is_finite(), "{f}");
+            assert_eq!(arr[[x, y, z, v]].to_bits(), want.to_bits(), "{f} at {x},{y},{z} volume {v}");
+            nonzero += usize::from(want != 0.0);
+        }
+        assert!(nonzero > 0, "{f} is all zero");
+    }
+    for (f, data) in [("aBV", &g.abv), ("aATT", &g.aatt)] {
+        let data = data.as_ref().unwrap();
+        let (vol, grid) = mrsim_acq::io::load_volume(&gt.join(format!("sub-01_desc-{f}_gt.nii.gz"))).unwrap();
+        assert_eq!(grid.dims, [nx, ny, nz], "{f}");
+        assert_eq!(&vol, data, "{f}");
+        assert!(vol.iter().any(|x| *x > 0.0), "{f} is all zero");
     }
     let tsv = std::fs::read_to_string(gt.join("sub-01_desc-physio_gt.tsv")).unwrap();
     assert_eq!(tsv.lines().count(), 1 + 4 * 2);

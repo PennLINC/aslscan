@@ -234,6 +234,9 @@ pub struct CompatSpec {
     pub desired_snr: Option<f64>,
 }
 
+/// The largest accepted `[vascular_crushing] arterial_velocity` (cm/s).
+pub const MAX_ARTERIAL_VELOCITY: f64 = 1000.0;
+
 /// The acquisition values `asldro = true` pins, as `(overlay key, value)`: what simasl's
 /// acquisition can express (no readout effects, one coil, full sampling, unit scale, and the
 /// noise coming from `desired_snr` instead of `noise_variance`).
@@ -1388,8 +1391,11 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                             arterial_velocity (cm/s per label)".to_string());
             };
             for (name, x) in v {
-                if !(x.is_finite() && *x >= 0.0) {
-                    return Err(format!("overlay: vascular_crushing.arterial_velocity.{name} = {x} is out of range"));
+                // 10 m/s is far above any arterial speed, and keeps v_max / VENC within the
+                // range the sine integral is evaluated on (crushing::survival)
+                if !(x.is_finite() && (0.0..=MAX_ARTERIAL_VELOCITY).contains(x)) {
+                    return Err(format!("overlay: vascular_crushing.arterial_velocity.{name} = {x} is out of range \
+                                        (0 to {MAX_ARTERIAL_VELOCITY} cm/s)"));
                 }
             }
         } else {
@@ -2500,6 +2506,12 @@ mod tests {
             .unwrap_err().contains("act on nothing"));
         assert!(p4(&crushed(json!(0.05)), &format!("{TABLES}{vel}"), None).unwrap_err().contains("0.1"));
         assert!(p4(&crushed(json!([4.0, 4.0])), &format!("{TABLES}{vel}"), None).unwrap_err().contains("entries"));
+        // velocities above 10 m/s are refused (the review's 1e308 overflowed the crusher ratio);
+        // the bound itself is accepted
+        for (v, ok) in [("1e308", false), ("1000.5", false), ("1000.0", true)] {
+            let r = p4(&crushed(json!(0.1)), &format!("{TABLES}[vascular_crushing]\narterial_velocity = {{ grey_matter = {v} }}\n"), None);
+            assert_eq!(r.is_ok(), ok, "{v}: {:?}", r.as_ref().err());
+        }
         let mut venc_only = base();
         venc_only["VascularCrushingVENC"] = json!(4.0);
         assert!(p4(&venc_only, "", None).unwrap_err().contains("without VascularCrushing"));

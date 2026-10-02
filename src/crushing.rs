@@ -75,14 +75,19 @@ pub fn si(x: f64) -> f64 {
 
 /// The surviving fraction of the arterial signal for an arterial speed range `v_max` (cm/s) and
 /// a crusher `VENC` (cm/s): `1` with crushing off (`venc == 0`) or no flow, else
-/// `Si(pi r) / (pi r)`.
+/// `Si(pi r) / (pi r)`. The protocol bounds `v_max <= 1000` and `VENC >= 0.1` cm/s, so
+/// `pi r <= pi 1e4`; below `pi r = 1e-8` the value is `1 - (pi r)^2 / 18` to double precision,
+/// which is `1`, and `r` may have underflowed to zero.
 pub fn survival(v_max: f64, venc: f64) -> f64 {
     if venc == 0.0 || v_max == 0.0 {
         return 1.0;
     }
     let r = v_max / venc;
-    assert!(r.is_finite() && r > 0.0, "crushing ratio v_max / VENC = {v_max} / {venc} is not finite");
+    assert!(r.is_finite() && r <= 1e4, "crushing ratio v_max / VENC = {v_max} / {venc} is outside the protocol's range");
     let x = PI * r;
+    if x < 1e-8 {
+        return 1.0;
+    }
     si(x) / x
 }
 
@@ -137,5 +142,17 @@ mod tests {
         }
         // to zero as the crusher strengthens
         assert!(survival(1000.0, 1.0) < 1e-3);
+    }
+
+    #[test]
+    fn survival_is_finite_across_the_protocols_range() {
+        // the extremes the protocol accepts: v_max 1000 cm/s at VENC 0.1, and a ratio that
+        // underflows (the limit is 1)
+        let c = survival(1000.0, 0.1);
+        assert!(c > 0.0 && c < 1e-4, "{c}");
+        assert_eq!(survival(1e-300, 1e10), 1.0);
+        assert_eq!(survival(1e-9, 1.0), 1.0);
+        // the first correction, (pi 1e-7)^2 / 18 = 5.5e-15, is resolved
+        assert!((survival(1e-7, 1.0) - (1.0 - (PI * 1e-7).powi(2) / 18.0)).abs() < 1e-15);
     }
 }

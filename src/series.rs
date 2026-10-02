@@ -1833,7 +1833,10 @@ mod tests {
         let a = run(&s, "control,label", &ov, T2Mode::Class);
         let b = run(&s, "control,label", &ov, T2Mode::Voxel);
         assert_eq!((a.n_compartments, b.n_compartments), (9, 3));
+        // f64::max drops a NaN operand, so a NaN image would leave `worst` untouched
+        assert!(a.mag.iter().chain(&b.mag).all(|x| x.is_finite()), "non-finite magnitudes");
         let scale = max_abs(&a.mag) as f64;
+        assert!(scale > 0.0);
         let mut worst = 0.0f64;
         for (x, y) in a.mag.iter().zip(&b.mag) {
             let (x, y) = (*x as f64, *y as f64);
@@ -1844,14 +1847,26 @@ mod tests {
 
     #[test]
     fn the_separate_m0_scan_is_untouched_by_every_part() {
-        let s = sidecar([1.0, 1.0, 1.0], 6);
-        let mk = |extra: &str| {
-            let mut p = protocol_from(&s, "control,label", &format!("{HOM}[m0]\nrepetition_time = 8.0\n{extra}"));
+        // all five parts against none, both with suppression pulses (part D needs them)
+        let mk = |s: &Value, ov: &str, extra: &str| {
+            let mut p = protocol_from(s, "control,label", &format!("{ov}{extra}[m0]\nrepetition_time = 8.0\n"));
             p.m0_type = M0Type::Separate;
-            simulate(&p, &phantom(), T2Mode::Class, &no_phase()).unwrap()
+            let o = simulate(&p, &phantom(), T2Mode::Class, &no_phase()).unwrap();
+            (p, o)
         };
-        let off = mk("");
-        let on = mk(&format!("[kinetic]\nexchange_time = 0.4\n{TABLES}[physio]\ntissue_cardiac = 0.05\n"));
+        let (s, ov) = bs(&[2.0, 3.2], 0.95, "");
+        let (_, off) = mk(&s, &ov, "");
+        let (mut crushed, ov) = bs(&[2.0, 3.2], 0.95, "model = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.2\n");
+        crushed["VascularCrushing"] = json!(true);
+        crushed["VascularCrushingVENC"] = json!(4.0);
+        let (p, on) = mk(&crushed, &ov, &format!(
+            "[kinetic]\nexchange_time = 0.4\n{TABLES}\
+             [vascular_crushing]\narterial_velocity = {{ grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }}\n\
+             [physio]\ntissue_cardiac = 0.05\nlabel_cardiac = 0.05\n"));
+        assert!(p.exchange_time.is_some() && p.macrovascular.is_some() && p.crushing.is_some() && p.physio.is_some());
+        assert!(matches!(p.suppression.as_ref().map(|b| &b.model), Some(SuppressionModel::BolusPosition(_))),
+                "part D must be on");
+        assert!(off.m0.is_some());
         assert_eq!(off.m0, on.m0);
         assert_ne!(off.mag, on.mag);
     }

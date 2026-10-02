@@ -318,7 +318,10 @@ mod tests {
     }
 
     /// The normative stream: a fixed series seed reproduces these values. A change here changes
-    /// every dataset generated with physiological noise.
+    /// every dataset generated with physiological noise. The draws go through the platform's
+    /// `ln`, `sqrt`, `cos` and `exp`, which differ by an ULP or two between libms (these values
+    /// came from a Windows build; glibc gives `x[100]` 2 ULP higher), so the pin is to 1e-14
+    /// relative: far below any change of the stream itself, which moves every value at O(1).
     #[test]
     fn the_reference_stream_is_reproduced() {
         let ph = Physio::new(PhysioParams::default(), 2026, 30.0);
@@ -328,7 +331,7 @@ mod tests {
         println!("reference stream: {got:?}");
         let want: [f64; 10] = REFERENCE;
         for (g, w) in got.iter().zip(want) {
-            assert_eq!(g.to_bits(), w.to_bits(), "{got:?}");
+            assert!((g - w).abs() <= 1e-14 * w.abs(), "{got:?}");
         }
     }
 
