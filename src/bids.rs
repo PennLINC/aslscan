@@ -80,6 +80,18 @@ mod writer {
         json!({ "Value": v.0, "Source": v.1.as_str() })
     }
 
+    /// The `PulseSequenceType` to publish when the overlay's `[readout] type` changed the readout
+    /// the input's `PulseSequenceType` describes (P5 part B): the readout simulated, the input's value
+    /// kept under `InputValuesReplaced`.
+    fn overridden_sequence_type(p: &Protocol) -> Option<&'static str> {
+        let rs = p.readout.as_ref()?;
+        let input = p.input_sidecar.get("PulseSequenceType").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+        (rs.kind.1 == crate::protocol::Source::Overlay && !input.contains(rs.kind.0.as_str())).then_some(match rs.kind.0 {
+            crate::protocol::ReadoutKind::Grase => "GRASE",
+            crate::protocol::ReadoutKind::Spiral => "spiral",
+        })
+    }
+
     /// JSON equality with numbers compared as numbers (an input `90` is not replaced by `90.0`),
     /// elementwise through arrays.
     fn same_number(a: &Value, b: &Value) -> bool {
@@ -337,8 +349,13 @@ mod writer {
                                 acquisition grid; simasl's is its spline-resampled m0, so equal SNRs are not \
                                 equal noise unless the grids coincide",
                 "GridOrigin": p.grid_origin.as_str(),
-                "RelaxationAtEcho": "exp(-EchoTime/T2) per phantom voxel, tissue and blood alike, T2 = 0 giving 1; \
-                                     no relaxation in the readout",
+                "RelaxationAtEcho": if p.contrast == crate::mrsignal::Contrast::GradientEcho {
+                    "exp(-EchoTime/T2*) per phantom voxel, tissue and blood alike, T2* = 0 giving 1; \
+                     no relaxation in the readout"
+                } else {
+                    "exp(-EchoTime/T2) per phantom voxel, tissue and blood alike, T2 = 0 giving 1; \
+                     no relaxation in the readout"
+                },
                 "T2BloodUnused": true,
                 "SliceOffsetsAllZero": true,
                 "M0ScanRows": "the series' signal equation without label, as simasl's",
@@ -526,6 +543,9 @@ mod writer {
                 effective.push(("TotalReadoutTime", json!(ees * (ny as f64 - 1.0))));
                 effective.push(("PhaseEncodingDirection", json!(p.phase_encoding_direction)));
             }
+            if let Some(t) = overridden_sequence_type(p) {
+                effective.push(("PulseSequenceType", json!(t)));
+            }
             effective.push(("NumberShots", json!(r3.n_shots)));
             effective.push(("FlipAngle", json!(rs.refocusing_flip_deg.0)));
         }
@@ -603,11 +623,22 @@ mod writer {
                     m0side.insert("PhaseEncodingDirection".to_string(), json!(p.phase_encoding_direction));
                 }
                 m0side.insert("NumberShots".to_string(), json!(r3.n_shots));
+                if let Some(t) = overridden_sequence_type(p) {
+                    m0side.insert("PulseSequenceType".to_string(), json!(t));
+                }
             }
             let mut m0_replaced = Map::new();
             if let Some(old) = m0side.get("FlipAngle") {
                 if !same_number(old, &json!(m0_flip)) {
                     m0_replaced.insert("FlipAngle".to_string(), old.clone());
+                }
+            }
+            // the shared readout's values the M0 sidecar states in place of the input's
+            for k in ["DwellTime", "PulseSequenceType"] {
+                if let (Some(old), Some(new)) = (p.input_sidecar.get(k), m0side.get(k)) {
+                    if !same_number(old, new) {
+                        m0_replaced.insert(k.to_string(), old.clone());
+                    }
                 }
             }
             m0side.insert("FlipAngle".to_string(), json!(m0_flip));
@@ -739,7 +770,7 @@ mod writer {
             "LabelMap": out.labels.iter().map(|(l, n)| (l.to_string(), json!(n))).collect::<Map<String, Value>>(),
         }))?;
         if out.mode == T2Mode::Voxel {
-            for (desc, data) in [("acqT2map", &gt.acq_t2_ms), ("acqT2primemap", &gt.acq_t2p_ms)] {
+            for (desc, data) in [("acqT2map", &gt.acq_t2_ms), ("acqT2primemap", &gt.acq_t2p_ms), ("acqT1map", &gt.acq_t1_ms)] {
                 if let Some(d) = data {
                     write_3d(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.nii.gz")), out.sim_grid.dims, d, &out.sim_grid)
                         .map_err(|e| e.to_string())?;

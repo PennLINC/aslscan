@@ -864,3 +864,87 @@ fn spirals_need_the_kspace_feature() {
     let e = simulate_with(&spiral_protocol("control"), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap_err();
     assert!(e.contains("kspace"), "{e}");
 }
+
+/// Voxel mode below 180 degrees: the T1 map the echo amplitudes used is written to the ground truth
+/// as `desc-acqT1map_gt`, beside the T2 and T2' maps (P5 part B).
+#[test]
+fn voxel_mode_grase_writes_the_acquisition_t1_map() {
+    let p = grase("control,label", false, "");
+    let out = simulate_with(&p, &crop(), T2Mode::Voxel, &phase(), RowOverride::None).unwrap();
+    let t1 = out.ground_truth.acq_t1_ms.as_ref().expect("an acquisition T1 map at 150 degrees");
+    assert_eq!(t1.len(), out.sim_grid.dims.iter().product::<usize>());
+    assert!(t1.iter().any(|v| v.is_finite() && *v > 0.0));
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-acqt1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let mut found = Vec::new();
+    let mut stack = vec![dir.clone()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.to_string_lossy().contains("desc-acqT1map_gt") {
+                found.push(path);
+            }
+        }
+    }
+    assert_eq!(found.len(), 2, "the map and its sidecar: {found:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under gradient echo the compat sidecar names simasl's T2* factor, which the signal uses; the
+/// spin-echo text is unchanged.
+#[test]
+fn compat_sidecar_names_the_gradient_echo_relaxation() {
+    let s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": false, "M0Type": "Included", "RepetitionTimePreparation": [10.0, 5.0, 5.0],
+        "EchoTime": 0.01, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.0], "PhaseEncodingDirection": "j-",
+        "TotalReadoutTime": 0.001
+    });
+    for (contrast, want) in [("ge", "exp(-EchoTime/T2*)"), ("se", "exp(-EchoTime/T2) ")] {
+        let ov: Overlay = toml::from_str(&format!("[compat]\nasldro = true\n[signal]\nacq_contrast = \"{contrast}\"\n")).unwrap();
+        let p = parse(&s, "volume_type\nm0scan\ncontrol\nlabel\n", Some(&ov), crop().params.as_ref()).unwrap();
+        let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+        let dir = std::env::temp_dir().join(format!("aslscan-e2e-compat-{contrast}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+        let side: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("sub-01/perf/sub-01_part-mag_asl.json")).unwrap()).unwrap();
+        let text = side["AslscanSimulation"]["Compat"]["RelaxationAtEcho"].as_str().unwrap().to_string();
+        assert!(text.starts_with(want), "{contrast}: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// An overlay that turns a GRASE sidecar into a spiral publishes the spiral as the sequence type,
+/// and both sidecars keep the input's sequence type and dwell time under `InputValuesReplaced`.
+#[cfg(feature = "kspace")]
+#[test]
+fn spiral_override_provenance_on_both_sidecars() {
+    let s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": false, "M0Type": "Separate", "RepetitionTimePreparation": 4.0,
+        "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "3D", "PulseSequenceType": "3Dgrase", "FlipAngle": 150, "DwellTime": 5e-6
+    });
+    let ov: Overlay = toml::from_str(
+        "seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n[m0]\nrepetition_time = 6.0\n\
+         [readout]\ntype = \"spiral\"\ninterleaves = 2\nspiral_readout_time = 4.0\ndwell_time = 2e-5\n").unwrap();
+    let p = parse(&s, "volume_type\ncontrol\nlabel\n", Some(&ov), crop().params.as_ref()).unwrap();
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-spiral-ov-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let read = |f: &str| -> Value { serde_json::from_str(&std::fs::read_to_string(dir.join("sub-01/perf").join(f)).unwrap()).unwrap() };
+    let side = read("sub-01_part-mag_asl.json");
+    assert_eq!((side["PulseSequenceType"].clone(), side["DwellTime"].clone()), (json!("spiral"), json!(2e-5)));
+    let rep = &side["AslscanSimulation"]["InputValuesReplaced"];
+    assert_eq!((rep["PulseSequenceType"].clone(), rep["DwellTime"].clone()), (json!("3Dgrase"), json!(5e-6)), "{rep}");
+    let m0 = read("sub-01_m0scan.json");
+    assert_eq!(m0["DwellTime"], json!(2e-5));
+    let m0rep = &m0["AslscanSimulation"]["InputValuesReplaced"];
+    assert_eq!(m0rep["DwellTime"], json!(5e-6), "{m0rep}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1175,7 +1175,7 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
              the sidecar has no PhaseEncodingDirection; give [readout] phase_encoding_direction = \"j\" or \"j-\""
                 .to_string())?,
         Some(ReadoutKind::Spiral) => {
-            if side_ped.is_some() || ro_ped.is_some() {
+            if sidecar.get("PhaseEncodingDirection").is_some_and(|v| !v.is_null()) || ro_ped.is_some() {
                 return Err("PhaseEncodingDirection with a spiral readout: a spiral has no phase-encode axis".to_string());
             }
             String::new()
@@ -2168,6 +2168,12 @@ impl Protocol {
 pub fn resolve_readout(p: &Protocol, acq_dims: [usize; 3]) -> Result<Option<ReadoutResolution>, String> {
     let Some(r) = &p.readout else { return Ok(None) };
     let [nx, ny, nz] = acq_dims;
+    // the echo train's amplitudes need the blood's T1 (its EPG), from whichever source it came
+    if !(p.t1b.0.is_finite() && p.t1b.0 > 0.0) {
+        return Err(format!(
+            "the arterial blood T1 is {} s ({}): a 3D echo train's echo amplitudes need a positive T1", p.t1b.0,
+            p.t1b.1.as_str()));
+    }
     if r.kind.0 == ReadoutKind::Spiral {
         return resolve_spiral(p, r, acq_dims).map(Some);
     }
@@ -2216,6 +2222,12 @@ pub fn resolve_readout(p: &Protocol, acq_dims: [usize; 3]) -> Result<Option<Read
         (None, None, None) => return Err(
             "a GRASE readout needs its line spacing: the sidecar has no EffectiveEchoSpacing, TotalReadoutTime or \
              DwellTime; give [readout] line_spacing (ms) or effective echo spacing".to_string()),
+    };
+    // what is published is what is simulated: an overlay spacing accepted within 1% of the
+    // sidecar's replaces it (the sidecar's value goes to InputValuesReplaced)
+    let effective = match r.line_spacing_ms {
+        Some(_) => effective.map(|_| t_line_ms / 1000.0 / ky_segments as f64),
+        None => effective,
     };
     let block = grase_block(ny, ky_segments, t_line_ms, p.reverse_phase)?;
     let probe = EchoTrain { etl, esp_ms: 1.0, refocusing_deg: r.refocusing_flip_deg.0, kz_order: r.kz_order.0, kz_segments,
@@ -3365,7 +3377,12 @@ mod tests {
         assert!(parse(&s2, &c, Some(&with("")), None).unwrap_err().contains("NumberShots 4"));
         s2["NumberShots"] = json!(8);
         assert_eq!(parse(&s2, &c, Some(&with("")), None).unwrap().readout.unwrap().number_shots, (8, Source::Sidecar));
-        for (key, val) in [("PhaseEncodingDirection", json!("j-")), ("TotalReadoutTime", json!(0.03)), ("EffectiveEchoSpacing", json!(0.0005))] {
+        // a zero arterial blood T1 cannot drive the echo amplitudes (before any feature check)
+        let p0 = parse(&s, &c, Some(&with("[kinetic]\nt1_arterial_blood = 0.0\n")), None).unwrap();
+        assert!(resolve_readout(&p0, [64, 64, 20]).unwrap_err().contains("arterial blood T1"));
+        for (key, val) in [("PhaseEncodingDirection", json!("j-")), ("PhaseEncodingDirection", json!(["j-"])),
+                           ("PhaseEncodingDirection", json!(17)), ("TotalReadoutTime", json!(0.03)),
+                           ("EffectiveEchoSpacing", json!(0.0005))] {
             let mut s3 = s.clone();
             s3[key] = val;
             assert!(parse(&s3, &c, Some(&with("")), None).is_err(), "{key}");
@@ -3466,6 +3483,9 @@ mod tests {
         assert!(res(&s, "", [32, 32, 20]).unwrap_err().contains("disagree"));
         // the overlay's line spacing must agree with an effective spacing
         assert!(res(&grase(), "[readout]\nline_spacing = 0.9\n", [32, 32, 20]).unwrap_err().contains("disagrees"));
+        // and one accepted within 1% is the one published: 0.605 ms over 2 segments, not 0.0003 s
+        let r = res(&grase(), "[readout]\nline_spacing = 0.605\n", [32, 32, 20]).unwrap().unwrap();
+        assert!((r.t_line_ms - 0.605).abs() < 1e-15 && (r.effective_spacing_s.unwrap() - 0.0003025).abs() < 1e-15, "{r:?}");
         // no source at all
         let mut s = grase();
         s.as_object_mut().unwrap().remove("EffectiveEchoSpacing");

@@ -73,6 +73,9 @@ pub struct GroundTruth {
     /// SIMULATION grid (ms).
     pub acq_t2_ms: Option<Vec<f32>>,
     pub acq_t2p_ms: Option<Vec<f32>>,
+    /// P5 part B, `voxel` mode below 180 degrees: the T1 map the echo amplitudes used (M0-weighted
+    /// rate mean), on the simulation grid (ms).
+    pub acq_t1_ms: Option<Vec<f32>>,
     /// P4, part A: the intravascular part of `delta_m` (kinetics and the exchange split), like
     /// `delta_m` per row and frame (moved under motion).
     pub delta_m_iv: Option<Vec<f32>>,
@@ -1210,6 +1213,7 @@ fn simulate_core(
         dseg: r_acq.majority(&ph.dseg),
         acq_t2_ms,
         acq_t2p_ms,
+        acq_t1_ms: acq_t1_ms.clone(),
         delta_m_iv: gt_iv,
         delta_m_suppressed: gt_sup,
         delta_m_arterial: gt_art,
