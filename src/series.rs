@@ -138,6 +138,9 @@ pub struct SeriesOutput {
     pub ge_rule: Option<&'static str>,
     /// P5 part B: the 3D readout as resolved with the grid (`None` for 2D).
     pub readout: Option<ReadoutResolution>,
+    /// P5 part B: per label (and the blood), its name and the EPG echo amplitudes of the train,
+    /// from the label's T1 and T2 (in voxel mode the first voxel's, indicative).
+    pub echo_amplitudes: Option<Vec<(String, Vec<f64>)>>,
 }
 
 /// The compat noise resolution (P2 addendum, part A).
@@ -1161,6 +1164,20 @@ fn simulate_core(
         None => None,
     };
 
+    // ---- P5 part B: the echo amplitudes the sidecar records, per label and for the blood ----
+    let echo_amplitudes = res3d.as_ref().map(|r3| {
+        let tr = &r3.train;
+        let amp = |t1_ms: f64, t2_ms: f64| -> Vec<f64> {
+            mrsim_acq::epg::epg_cpmg(tr.etl, tr.esp_ms, tr.refocusing_deg, t1_ms, t2_ms).iter().map(|l| l.exp()).collect()
+        };
+        let mut v: Vec<(String, Vec<f64>)> = ph.labels.iter().map(|(l, name)| {
+            let i = ph.dseg.iter().position(|d| d == l).expect("labels come from dseg");
+            (name.clone(), amp(ph.t1[i] as f64 * 1000.0, ph.t2[i] as f64 * 1000.0))
+        }).collect();
+        v.push(("blood".to_string(), amp(p.t1b.0 * 1000.0, t2_blood_ms as f64)));
+        v
+    });
+
     // ---- ground truth on the acquisition grid ----
     let perfused: Vec<bool> = ph.perfusion.iter().map(|f| *f > 0.0).collect();
     let (delta_m_gt, delta_m_static) = match gt_moved {
@@ -1198,6 +1215,7 @@ fn simulate_core(
         events, dropped, compat: compat_facts,
         crush_survival: p4.crush.clone(), physio: p4.physio.as_ref().map(|_| physio_lines),
         readout: res3d.clone(),
+        echo_amplitudes,
         ge_rule: ge_flip.map(|fa| match (p.compat.is_some(), fa == 90.0, ge_propagated.is_some(), p.suppression.is_some()) {
             (true, ..) => "simasl's coherent steady state per volume (compat)",
             (_, true, ..) => "90 degrees: the slab is saturated, each row independent (P3's timeline, sin(a) = 1)",

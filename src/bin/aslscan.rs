@@ -128,6 +128,13 @@ fn run() -> Result<(), String> {
         "simulated: acquisition {:?}, simulation {:?}, T2 mode {}, {} compartments, {:.1?}",
         out.acq_grid.dims, out.sim_grid.dims, out.mode.as_str(), out.n_compartments, t1.elapsed(),
     );
+    if let Some(r) = &out.readout {
+        println!(
+            "readout: 3D {} train, {} shot(s), {} echoes of {:.4} ms, {} lines of {:.4} ms per echo ({}), refocusing {} degrees",
+            p.readout.as_ref().map_or("?", |s| s.kind.0.as_str()), r.n_shots, r.etl, r.esp_ms, r.epi, r.t_line_ms,
+            r.t_line_source, r.train.refocusing_deg,
+        );
+    }
 
     let names = Names::new(&cli.sub, cli.ses.as_deref());
     write_dataset(&cli.out, &names, &p, &out)?;

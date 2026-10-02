@@ -683,3 +683,60 @@ fn grase_shot_dropout_reaches_the_acquisition() {
     let d = with.mag.iter().zip(&without.mag).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     assert!(d > 0.0);
 }
+
+/// P5 part B and D outputs of a GRASE series: the readout and echo-amplitude blocks, the resolved
+/// standard keys, the NIfTI time step (the volume's NumberShots repetitions), the M0 sidecar, and
+/// the 3D schemas of the physio and motion-event files.
+#[test]
+fn grase_sidecars_and_ground_truth() {
+    let wv = "[physio]\ntissue_cardiac = 0.02\n[motion]\n\
+              within_volume = { dropout_rate = 1.0, severity = 0.5, jump_mm = [0.3, 0.0, 0.0], jump_deg = [0.0, 0.0, 0.0] }\n\
+              [m0]\nrepetition_time = 6.0\n";
+    let mut p = grase("control,label", false, wv);
+    p.m0_type = aslscan::protocol::M0Type::Separate;
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-grase-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let perf = dir.join("sub-01/perf");
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    let ro = &side["AslscanSimulation"]["Readout"];
+    assert_eq!(ro["Type"], json!("grase"));
+    assert_eq!((ro["NumberShots"].clone(), ro["KySegments"].clone(), ro["EchoTrainLength"].clone()), (json!(2), json!(2), json!(2)));
+    assert!((ro["EchoSpacingMs"].as_f64().unwrap() - 12.5).abs() < 1e-9, "{}", ro["EchoSpacingMs"]);
+    assert_eq!(ro["RefocusingFlipAngle"]["Value"], json!(150.0));
+    assert!((ro["VolumeDuration"].as_f64().unwrap() - 8.0).abs() < 1e-12);
+    let amps = &side["AslscanSimulation"]["EchoAmplitudes"]["PerEcho"];
+    assert_eq!(amps["grey_matter"].as_array().unwrap().len(), 2);
+    assert!(amps["blood"][0].as_f64().unwrap() > 0.0 && amps["blood"][0].as_f64().unwrap() < 1.0);
+    // standard keys as resolved; no SliceTiming in 3D
+    assert_eq!(side["NumberShots"], json!(2));
+    assert_eq!(side["FlipAngle"], json!(150.0));
+    assert!((side["EffectiveEchoSpacing"].as_f64().unwrap() - 0.0005).abs() < 1e-15);
+    assert!((side["TotalReadoutTime"].as_f64().unwrap() - 0.0005 * 11.0).abs() < 1e-15);
+    assert!(side.get("SliceTiming").is_none());
+    // the NIfTI time step is the volume's duration
+    let obj = nifti::ReaderOptions::new().read_file(perf.join("sub-01_part-mag_asl.nii.gz")).unwrap();
+    assert!((obj.header().pixdim[4] - 8.0).abs() < 1e-6, "{}", obj.header().pixdim[4]);
+    // the M0 sidecar: the train's refocusing angle, its readout without excitation times
+    let m0: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("sub-01_m0scan.json")).unwrap()).unwrap();
+    assert_eq!(m0["FlipAngle"], json!(150.0));
+    assert_eq!(m0["NumberShots"], json!(2));
+    assert!(m0["AslscanSimulation"]["Readout"].get("ExcitationTimes").is_none());
+    // physio per (volume, shot)
+    let gt = perf.join("ground-truth");
+    let physio = std::fs::read_to_string(gt.join("sub-01_desc-physio_gt.tsv")).unwrap();
+    assert!(physio.starts_with("volume\tshot\ttime"));
+    assert_eq!(physio.lines().count(), 1 + 2 * 2);
+    // one motion event per volume (dropout rate 1), its shot and no slices
+    let ev = std::fs::read_to_string(gt.join("sub-01_desc-motionEvents_gt.tsv")).unwrap();
+    let rows: Vec<Vec<&str>> = ev.lines().skip(1).map(|l| l.split('\t').collect()).collect();
+    assert_eq!(rows.len(), out.events.len());
+    for (r, e) in rows.iter().zip(&out.events) {
+        assert_eq!((r[0].parse::<usize>().unwrap(), r[1].parse::<usize>().unwrap()), (e.volume, e.shot));
+        assert!(e.shot < 2);
+        assert_eq!(r[2], "", "no slice groups in 3D");
+        assert!((r[3].parse::<f64>().unwrap() - 0.5).abs() < 1e-6);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

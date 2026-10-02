@@ -184,6 +184,67 @@ mod writer {
             block["Grid"]["Origin"] = json!(p.grid_origin.as_str());
         }
         p4_blocks(&mut block, p, out);
+        // P5 parts B and D: written only for a 3D readout
+        if let (Some(r3), Some(rs)) = (&out.readout, &p.readout) {
+            let [_, ny, nz] = out.acq_grid.dims;
+            let tr0 = p.rows.iter().find(|r| r.kind != crate::rows::RowKind::M0scan).or(p.rows.first()).map_or(0.0, |r| r.tr);
+            let mut approx = vec![
+                "an ideal slab: exactly the field of view in z, uniform, no kz aliasing",
+                "no through-plane oversampling: partitions are the acquisition grid's z cells",
+                "the echo train leaves Mz = 0 at the excitation and recovery is counted from it",
+                "coil sensitivities uniform in z",
+            ];
+            if r3.t_line_source.contains("DwellTime") {
+                approx.push("the line spacing from DwellTime is a lower bound (no ramps, no receiver oversampling)");
+            }
+            if out.mode == T2Mode::Voxel && r3.train.refocusing_deg != 180.0 {
+                approx.push("voxel mode: a mixed cell's T1 is the M0-weighted rate mean, as for T2 (not a mixture of echo trains)");
+            }
+            block["Readout"] = json!({
+                "Type": rs.kind.0.as_str(), "TypeSource": rs.kind.1.as_str(),
+                "NumberShots": r3.n_shots, "KySegments": rs.ky_segments.0, "KzSegments": rs.kz_segments.0,
+                "EchoTrainLength": r3.etl, "LinesPerEcho": r3.epi,
+                "EchoSpacingMs": r3.esp_ms,
+                "EchoSpacingSource": if rs.echo_spacing_ms.is_some() { "overlay readout.echo_spacing" }
+                                     else { "EchoTime, the k-space-centre time: CentreEcho x ESP + CentreLineTimeMs" },
+                "LineSpacingMs": r3.t_line_ms, "LineSpacingSource": r3.t_line_source,
+                "EffectiveEchoSpacing": r3.effective_spacing_s.unwrap_or(r3.t_line_ms / 1000.0 / rs.ky_segments.0 as f64),
+                "KzOrder": match rs.kz_order.0 { mrsim_acq::readout::KzOrder::Centric => "centric", _ => "linear" },
+                "CentreEcho": r3.e_c, "CentreLineTimeMs": r3.t_kyc_ms,
+                "RefocusingFlipAngle": { "Value": rs.refocusing_flip_deg.0, "Source": rs.refocusing_flip_deg.1.as_str() },
+                "FlipAngleInterpretation": "the sidecar's FlipAngle is the echo train's refocusing angle; the excitation is 90 degrees",
+                "RefocusingTimeMs": { "Value": rs.refocusing_time_ms.0, "Source": rs.refocusing_time_ms.1.as_str() },
+                "ExcitationTimes": p.rows.iter().map(|r| r.t).collect::<Vec<f64>>(),
+                "ShotOrder": "s = ky_segment * KzSegments + kz_segment, one RepetitionTimePreparation apart",
+                "VolumeDuration": r3.n_shots as f64 * tr0,
+                "SeedSalt": format!("{:#x}", mrsim_acq::kspace3d::SEED_SALT_3D),
+                "Noise": "the image noise SD is 1/sqrt(nz) times a 2D acquisition's at the same noise_variance \
+                          (linear Cartesian reconstruction; measured, not asserted, under GRAPPA)",
+                "Approximations": approx,
+            });
+            if let Some(amps) = &out.echo_amplitudes {
+                let table = mrsim_acq::readout::grase_lines(&r3.train, &r3.readout, ny, nz).map_err(|e| e.to_string());
+                let mut labels = Map::new();
+                let mut kz = Map::new();
+                for (name, a) in amps {
+                    labels.insert(name.clone(), json!(a));
+                    if let Ok(t) = &table {
+                        kz.insert(name.clone(), json!((0..nz).map(|q| a[t.line(q, 0).echo - 1]).collect::<Vec<f64>>()));
+                    }
+                }
+                block["EchoAmplitudes"] = json!({
+                    "PerEcho": labels,
+                    "KzModulation": kz,
+                    "Note": if out.mode == T2Mode::Voxel { "the first voxel of each label (voxel mode: indicative)" }
+                            else { "per label (class mode)" },
+                });
+            }
+            // series' rule: the extravascular label has its own group in 3D under physio and exchange
+            if p.physio.is_some() && p.exchange_time.is_some() {
+                block["CompartmentOrder"] = json!(format!("{}, then the extravascular label per label (its own group in 3D \
+                    under physiological noise and exchange)", block["CompartmentOrder"].as_str().unwrap_or("")));
+            }
+        }
         // P5 part A: written only under gradient echo, so other outputs keep their bytes
         if let Some(g) = &p.ge {
             block["GradientEcho"] = json!({
@@ -351,6 +412,12 @@ mod writer {
         // say) it is the first ASL row's, and the sidecar's RepetitionTimePreparation array is
         // the authority.
         let nifti_tr = p.rows.iter().find(|r| r.kind != crate::rows::RowKind::M0scan).or(p.rows.first()).map(|r| r.tr);
+        // a segmented 3D volume takes NumberShots repetitions: the time step is the volume's (P5
+        // part D); the sidecar's RepetitionTimePreparation stays the per-shot value given
+        let nifti_tr = match &out.readout {
+            Some(r3) => nifti_tr.map(|tr| r3.n_shots as f64 * tr),
+            None => nifti_tr,
+        };
         let info = SidecarInfo {
             manufacturer: "aslscan".to_string(),
             phase_encoding_direction: p.phase_encoding_direction.clone(),
@@ -389,6 +456,17 @@ mod writer {
         }
         if let Some(g) = &p.ge {
             effective.push(("FlipAngle", json!(g.flip_deg.rem_euclid(360.0))));
+        }
+        // P5 part B: a 3D readout's standard keys as resolved (the effective spacing BIDS defines,
+        // TotalReadoutTime = it x (ny - 1), the direction, the shots, the refocusing angle)
+        if let (Some(r3), Some(rs)) = (&out.readout, &p.readout) {
+            let ny = out.acq_grid.dims[1];
+            let ees = r3.effective_spacing_s.unwrap_or(r3.t_line_ms / 1000.0 / rs.ky_segments.0 as f64);
+            effective.push(("EffectiveEchoSpacing", json!(ees)));
+            effective.push(("TotalReadoutTime", json!(ees * (ny as f64 - 1.0))));
+            effective.push(("PhaseEncodingDirection", json!(p.phase_encoding_direction)));
+            effective.push(("NumberShots", json!(r3.n_shots)));
+            effective.push(("FlipAngle", json!(rs.refocusing_flip_deg.0)));
         }
         if let Some(s) = &p.suppression {
             // BIDS carries the first PLD's pulse times; an overlay override must be what is
@@ -444,11 +522,23 @@ mod writer {
             // series' excitation angle, except under gradient echo, whose M0 is the same
             // excitation and readout (P5 part A); its FlipAngle says which, the input kept as
             // replaced.
-            let (m0_flip, m0_contrast, m0_note) = match &p.ge {
-                Some(g) => (g.flip_deg.rem_euclid(360.0), "ge",
-                            "the series' gradient-echo readout at its own repetition time: no suppression, no motion"),
-                None => (90.0, "se", "a plain spin-echo readout at its own repetition time: no suppression, no inversion, no motion"),
+            let (m0_flip, m0_contrast, m0_note) = match (&p.ge, &p.readout) {
+                (Some(g), _) => (g.flip_deg.rem_euclid(360.0), "ge",
+                                 "the series' gradient-echo readout at its own repetition time: no suppression, no motion"),
+                // P5 part B: the same echo train, its FlipAngle the refocusing angle
+                (None, Some(rs)) => (rs.refocusing_flip_deg.0, "se",
+                                     "the series' 3D echo train at its own repetition time, excited at its start: no \
+                                      labeling, no suppression, no motion"),
+                (None, None) => (90.0, "se", "a plain spin-echo readout at its own repetition time: no suppression, no inversion, no motion"),
             };
+            if let (Some(r3), Some(rs)) = (&out.readout, &p.readout) {
+                let ny = out.acq_grid.dims[1];
+                let ees = r3.effective_spacing_s.unwrap_or(r3.t_line_ms / 1000.0 / rs.ky_segments.0 as f64);
+                m0side.insert("EffectiveEchoSpacing".to_string(), json!(ees));
+                m0side.insert("TotalReadoutTime".to_string(), json!(ees * (ny as f64 - 1.0)));
+                m0side.insert("PhaseEncodingDirection".to_string(), json!(p.phase_encoding_direction));
+                m0side.insert("NumberShots".to_string(), json!(r3.n_shots));
+            }
             let mut m0_replaced = Map::new();
             if let Some(old) = m0side.get("FlipAngle") {
                 if !same_number(old, &json!(m0_flip)) {
@@ -463,6 +553,16 @@ mod writer {
             });
             if p.physio.is_some() {
                 m0sim["Physio"] = json!("not applied: the separate M0 scan is not a row of the series' clock");
+            }
+            if let Some(r3) = &out.readout {
+                // the series' readout block without its excitation times (the M0 is excited at the
+                // start of its own repetition)
+                let mut ro = simulation_block(p, out)["Readout"].clone();
+                if let Some(o) = ro.as_object_mut() {
+                    o.remove("ExcitationTimes");
+                    o.insert("VolumeDuration".to_string(), json!(r3.n_shots as f64 * p.m0_repetition_time_s.unwrap_or(0.0)));
+                }
+                m0sim["Readout"] = ro;
             }
             m0side.insert("AslscanSimulation".to_string(), m0sim);
             write_json(&PathBuf::from(format!("{prefix_s}_m0scan.json")), &Value::Object(m0side))?;
@@ -528,9 +628,17 @@ mod writer {
             wgt("aATT", a, "s", "volume-weighted mean over phantom voxels with aBV > 0; 0 where none")?;
         }
         if let Some(lines) = &out.physio {
-            let mut tsv = String::from(
-                "volume\tslice\ttime\tcardiac_phase\trespiratory_phase\tdrift\ttissue_factor\tlabel_window_start\t\
-                 label_window_end\tlabel_mean_sin_cardiac\tlabel_mean_sin_respiratory\tlabel_mean_drift\tlabel_factor\n");
+            // 2D: per (volume, slice), unchanged; 3D: per (volume, shot), at each shot's excitation
+            // (P5 part D), a branch of its own so the 2D file keeps its bytes
+            let mut tsv = if out.readout.is_some() {
+                String::from(
+                    "volume\tshot\ttime\tcardiac_phase\trespiratory_phase\tdrift\ttissue_factor\tlabel_window_start\t\
+                     label_window_end\tlabel_mean_sin_cardiac\tlabel_mean_sin_respiratory\tlabel_mean_drift\tlabel_factor\n")
+            } else {
+                String::from(
+                    "volume\tslice\ttime\tcardiac_phase\trespiratory_phase\tdrift\ttissue_factor\tlabel_window_start\t\
+                     label_window_end\tlabel_mean_sin_cardiac\tlabel_mean_sin_respiratory\tlabel_mean_drift\tlabel_factor\n")
+            };
             for l in lines {
                 tsv.push_str(&format!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", l.volume, l.slice, l.time, l.cardiac_phase,

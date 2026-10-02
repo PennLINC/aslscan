@@ -1,0 +1,17 @@
+# A small 3D GRASE protocol (P5 plan, Task 9): two shots in two interleaved ky segments, 150-degree
+# refocusing, suppression, exchange and physiological noise, a separate M0. For the crop phantom.
+seed = 13
+
+[acquisition]
+oversample = 2
+signal_scale = 100.0
+
+[kinetic]
+exchange_time = 0.4
+
+[physio]
+tissue_cardiac = 0.02
+label_cardiac = 0.03
+
+[m0]
+repetition_time = 6.0
