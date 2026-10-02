@@ -740,3 +740,42 @@ fn grase_sidecars_and_ground_truth() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// P5 acceptance (plan, Task 10): the linearity identity on a small GRASE protocol with every P4
+/// part on, physiological noise and a shot dropout event (the three one-row runs share the seed,
+/// so the same events, poses and shot factors).
+fn grase_all(rows: &str, ov: RowOverride) -> Vec<(f64, f64)> {
+    let mut s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": true, "BackgroundSuppressionNumberPulses": 2,
+        "BackgroundSuppressionPulseTime": [1.5, 3.2], "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
+        "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "3D", "PulseSequenceType": "3Dgrase", "PhaseEncodingDirection": "j-",
+        "EffectiveEchoSpacing": 0.0005, "NumberShots": 2, "FlipAngle": 150,
+        "VascularCrushing": true, "VascularCrushingVENC": 4.0
+    });
+    s["LabelingDuration"] = json!(1.8);
+    let ov_toml: Overlay = toml::from_str(
+        "seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n\
+         [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n\
+         [kinetic]\nexchange_time = 0.4\n\
+         [macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
+         arterial_transit_time = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n\
+         [vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n\
+         [physio]\ntissue_cardiac = 0.05\nlabel_cardiac = 0.05\nlabel_drift = 0.02\n\
+         [motion]\nwithin_volume = { dropout_rate = 1.0, severity = 0.3, jump_mm = [0.4, 0.0, 0.0], jump_deg = [0.0, 0.0, 1.0] }\n"
+    ).unwrap();
+    let ctx = format!("volume_type\n{rows}\n");
+    image_of(&parse(&s, &ctx, Some(&ov_toml), crop().params.as_ref()).unwrap(), ov)
+}
+
+#[test]
+fn linearity_holds_for_grase_with_every_part_on() {
+    let worst = residual_of(&grase_all("control", RowOverride::None), &grase_all("label", RowOverride::None),
+                            &grase_all("deltam", RowOverride::None));
+    println!("linearity, GRASE with every P4 part, physio and a shot event: worst residual / tolerance = {worst:.3}");
+    assert!(worst <= 1.0, "{worst}");
+    let bad = residual_of(&grase_all("control", RowOverride::None), &grase_all("label", RowOverride::FlipLabelSign),
+                          &grase_all("deltam", RowOverride::None));
+    assert!(bad > 1e2, "{bad}");
+}
