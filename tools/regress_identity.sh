@@ -12,6 +12,7 @@
 # Both feature sets are built (cli,kspace,par and cli: their bits differ), every NIfTI is compared
 # decompressed and every sidecar byte for byte.
 #
+# The new side is a snapshot of the live sources, ../p5-new/{aslscan,mrsim-acq}, taken at the start.
 # --self-test shows the comparison can fail: the "new" side is ../p5-selftest/{aslscan,mrsim-acq},
 # copies of the live sources with mrsim-acq's forward signal scale multiplied by 1 + 1e-4 (large
 # enough to survive reconstruction and the f32 cast; never committed). It passes only if every run
@@ -50,12 +51,16 @@ mkdir -p "$BASE"
 pin "$HERE" "$BASE/aslscan" "$A_REV"
 pin "$LIVE_M" "$BASE/mrsim-acq" "$M_REV"
 
-NEWROOT=$PARENT
+# The new side builds from a snapshot of the live sources taken now, so an edit made while the
+# (long) comparison runs cannot change what is being compared. rsync --delete keeps unchanged
+# files' times, so the snapshot's own target directories stay incremental between runs.
+NEWROOT=$PARENT/p5-new
+[ "$SELF" = "--self-test" ] && NEWROOT=$PARENT/p5-selftest
+mkdir -p "$NEWROOT"
+rsync -a --delete --exclude target --exclude 'target-*' --exclude work --exclude .git "$HERE/" "$NEWROOT/aslscan/"
+rsync -a --delete --exclude target --exclude 'target-*' --exclude .git "$LIVE_M/" "$NEWROOT/mrsim-acq/"
+echo "new side: aslscan $(git -C "$HERE" rev-parse --short HEAD)$([ -z "$(git -C "$HERE" status --porcelain -- src Cargo.toml)" ] || echo +local), mrsim-acq $(git -C "$LIVE_M" rev-parse --short HEAD)$([ -z "$(git -C "$LIVE_M" status --porcelain -- src Cargo.toml)" ] || echo +local)"
 if [ "$SELF" = "--self-test" ]; then
-  NEWROOT=$PARENT/p5-selftest
-  rm -rf "$NEWROOT"; mkdir -p "$NEWROOT"
-  rsync -a --exclude target --exclude 'target-*' --exclude work --exclude .git "$HERE/" "$NEWROOT/aslscan/"
-  rsync -a --exclude target --exclude 'target-*' --exclude .git "$LIVE_M/" "$NEWROOT/mrsim-acq/"
   K=$NEWROOT/mrsim-acq/src/kspace.rs
   sed -i 's/amp\[i\] = acq\.signal_scale \* coil_sensitivity(/amp[i] = acq.signal_scale * 1.0001 * coil_sensitivity(/' "$K"
   grep -q 'acq.signal_scale \* 1.0001 \* coil_sensitivity(' "$K" || { echo "self-test patch did not apply"; exit 1; }
@@ -138,8 +143,7 @@ fail=0; differed=0
 for feats in cli,kspace,par cli; do
   tag=${feats//,/-}
   OLD_T=$BASE/target-$tag
-  NEW_T=$NEWROOT/aslscan/target/regress-$tag
-  [ "$SELF" = "--self-test" ] || NEW_T=$HERE/target/regress-$tag
+  NEW_T=$NEWROOT-target-$tag
   (cd "$BASE/aslscan" && CARGO_TARGET_DIR="$OLD_T" cargo build -q --release --features $feats)
   (cd "$NEWROOT/aslscan" && CARGO_TARGET_DIR="$NEW_T" cargo build -q --release --features $feats)
   OLD=$OLD_T/release/aslscan
