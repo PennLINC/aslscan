@@ -802,8 +802,14 @@ mod writer {
     fn spiral_reconstruction_block() -> Value {
         use mrsim_acq::grid_recon as gr;
         json!({
-            "Method": "density-weighted least squares per coil and partition, a fixed Chebyshev semi-iteration (linear in \
-                       the data), then the Roemer combine",
+            "Method": "density-weighted least squares per coil and partition on the image band, a fixed Chebyshev \
+                       semi-iteration (linear in the data) on Q A^H W A Q x = Q A^H W d, then the Roemer combine",
+            "Band": if gr::BAND_LIMITED {
+                "Q projects onto the images whose DFT vanishes outside the disc of the largest sample radius \
+                 (frequency i up to (n-1)/2, i - n above)"
+            } else {
+                "none: the full n x n grid"
+            },
             "Iterations": gr::LS_ITERATIONS, "IntervalRatio": gr::LS_KAPPA,
             "PowerIterations": gr::POWER_ITERATIONS, "EigenvalueMargin": gr::LAMBDA_MARGIN,
             "DensityCompensation": "Pipe-Menon, operator form, normalized so a constant object grids to its Cartesian value \

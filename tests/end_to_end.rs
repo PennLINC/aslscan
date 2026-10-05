@@ -849,6 +849,7 @@ fn spiral_sidecars() {
     assert_eq!(ro["Trajectory"]["SamplesPerInterleaf"], json!(200));
     assert!(ro["TimeSegmentation"]["Class"]["CertifiedBound"].as_f64().unwrap() < 1e-7);
     assert_eq!(ro["Reconstruction"]["Iterations"], json!(mrsim_acq::grid_recon::LS_ITERATIONS));
+    assert!(ro["Reconstruction"]["Band"].as_str().unwrap().contains("disc of the largest sample radius"));
     assert_eq!(side["NumberShots"], json!(2));
     assert_eq!(side["DwellTime"], json!(2e-5));
     for key in ["PhaseEncodingDirection", "TotalReadoutTime", "EffectiveEchoSpacing"] {
