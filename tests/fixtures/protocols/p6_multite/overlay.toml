@@ -1,0 +1,18 @@
+# The P6 multi-TE acceptance case (P6 plan, Task 6): PCASL on the crop with exchange, a
+# gradient-echo readout at 60 degrees read at three echo times, one sidecar per echo
+# (asl-echo-{1,2,3}.json, EchoTime 13, 32, 51 ms; a 12 ms EPI block per echo, slices 60 ms apart).
+seed = 61
+
+[acquisition]
+oversample = 2
+signal_scale = 100.0
+noise_variance = 0.01
+
+[signal]
+acq_contrast = "ge"
+
+[kinetic]
+exchange_time = 0.5
+
+[m0]
+repetition_time = 6.0

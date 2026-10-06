@@ -1379,3 +1379,20 @@ fn multi_te_dataset_layout() {
     assert!(gt.iter().all(|n| !n.contains("echo")), "{gt:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The milestone M acceptance fixtures load from their files (one sidecar per echo) and simulate.
+#[test]
+fn the_multi_te_fixtures_load_and_run() {
+    for (dir, ge) in [("p6_multite", true), ("p6_multite_se", false)] {
+        let d = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols")).join(dir);
+        let jsons: Vec<std::path::PathBuf> = (1..=3).map(|e| d.join(format!("asl-echo-{e}.json"))).collect();
+        let refs: Vec<&Path> = jsons.iter().map(|p| p.as_path()).collect();
+        let p = aslscan::protocol::load_with(&refs, &d.join("aslcontext.tsv"), Some(&d.join("overlay.toml")), crop().params.as_ref(), false)
+            .unwrap();
+        assert!(p.p6_active() && p.echo_times_s.len() == 3, "{dir}");
+        assert_eq!(p.multi_te.as_ref().unwrap().refocusing_time_ms.is_none(), ge, "{dir}");
+        let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+        assert_eq!(out.more_echoes.len(), 2);
+        assert!(out.more_echoes.iter().all(|e| e.m0.is_some()), "{dir}: a separate M0 per echo");
+    }
+}

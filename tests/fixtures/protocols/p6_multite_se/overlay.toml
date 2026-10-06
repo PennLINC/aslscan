@@ -1,0 +1,17 @@
+# The spin-echo variant of p6_multite (P6 plan, Task 6): EchoTime 15, 30, 45 ms, the 2 ms
+# refocusing reserve fitting between the 12 ms EPI blocks.
+seed = 62
+
+[acquisition]
+oversample = 2
+signal_scale = 100.0
+noise_variance = 0.01
+
+[kinetic]
+exchange_time = 0.5
+
+[multi_te]
+refocusing_time = 2.0
+
+[m0]
+repetition_time = 6.0

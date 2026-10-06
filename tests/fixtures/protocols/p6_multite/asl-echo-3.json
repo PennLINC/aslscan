@@ -1,0 +1,19 @@
+{
+ "Manufacturer": "aslscan-fixture",
+ "MagneticFieldStrength": 3,
+ "MRAcquisitionType": "2D",
+ "PulseSequenceType": "EPI",
+ "PhaseEncodingDirection": "j-",
+ "ArterialSpinLabelingType": "PCASL",
+ "BackgroundSuppression": false,
+ "VascularCrushing": false,
+ "FlipAngle": 60,
+ "LabelingDuration": 1.8,
+ "PostLabelingDelay": 1.8,
+ "M0Type": "Separate",
+ "RepetitionTimePreparation": 4.0,
+ "EchoTime": 0.051,
+ "TotalReadoutTime": 0.012,
+ "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+ "SliceTiming": [0.0, 0.06]
+}

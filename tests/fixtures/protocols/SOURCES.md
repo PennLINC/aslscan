@@ -22,3 +22,12 @@ Only the JSON sidecar and aslcontext.tsv are kept; no image data.
 - `asl001_p5/overlay.toml`: an overlay for the unchanged `asl001/` sidecar and context (P5 plan,
   Task 14): the in-plane matrix and the spiral's interleaves, readout time and dwell time, which
   the sidecar does not carry and which have no defensible default.
+
+## P6 acceptance cases
+
+- `p6_multite/`: written for aslscan (P6 plan, Task 6), not fetched. PCASL on the crop with
+  exchange, a gradient-echo readout at 60 degrees read at three echo times: one sidecar per echo
+  (`asl-echo-{1,2,3}.json`, identical except `EchoTime` 13, 32, 51 ms; pass them as repeated
+  `--asl-json`), one `aslcontext.tsv`, the overlay.
+- `p6_multite_se/`: its spin-echo variant at 15, 30, 45 ms, the 2 ms refocusing reserve fitting
+  between the 12 ms EPI blocks.
