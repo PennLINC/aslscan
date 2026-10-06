@@ -175,3 +175,34 @@ def test_pure_mask_on_a_two_label_slab():
     mm = ca.pure_mask(seg, aff, seg.shape, aff, [1.0, 1.0, 1.0], motion=shift)
     xs = np.where(mm.any(axis=(1, 2)))[0]
     assert xs.min() == 11 and xs.max() == 54
+
+
+def test_an_echo_list_translates_to_one_sidecar_per_echo():
+    base = ca.asl_series([64, 64, 12], acq_contrast="ge", excitation_flip_angle=60.0)
+    per_echo, sides, ctx, ov = ca.echo_sidecars(base, [0.01, 0.02, 0.03], SHAPE, AFFINE, META)
+    # simasl runs each echo with a constant echo time over the volumes
+    assert [s["echo_time"] for s in per_echo] == [[0.01] * 3, [0.02] * 3, [0.03] * 3]
+    assert [s["EchoTime"] for s in sides] == [0.01, 0.02, 0.03]
+    rest = [{k: v for k, v in s.items() if k != "EchoTime"} for s in sides]
+    assert rest[0] == rest[1] == rest[2]
+    assert ctx == "volume_type\nm0scan\ncontrol\nlabel\n" and 'acq_contrast = "ge"' in ov
+
+
+def test_the_loader_reads_the_echo_n_series(tmp_path):
+    import json
+    import nibabel as nib
+    perf = tmp_path / "sub-01" / "perf"
+    (perf / "ground-truth").mkdir(parents=True)
+    aff = np.eye(4)
+    for e in (1, 2):
+        mag = np.full((2, 2, 2, 3), float(e))
+        nib.save(nib.Nifti1Image(mag, aff), str(perf / f"sub-01_echo-{e}_part-mag_asl.nii.gz"))
+        nib.save(nib.Nifti1Image(np.zeros_like(mag), aff), str(perf / f"sub-01_echo-{e}_part-phase_asl.nii.gz"))
+        json.dump({"EchoTime": 0.01 * e}, open(perf / f"sub-01_echo-{e}_part-mag_asl.json", "w"))
+    for desc in ("perfusion", "att", "T1map", "T2map", "M0map", "dseg"):
+        nib.save(nib.Nifti1Image(np.zeros((2, 2, 2)), aff), str(perf / "ground-truth" / f"sub-01_desc-{desc}_gt.nii.gz"))
+    a = [ca.load_series(str(perf), f"sub-01_echo-{e}") for e in (1, 2)]
+    assert [x["sidecar"]["EchoTime"] for x in a] == [0.01, 0.02]
+    assert np.allclose(a[1]["complex"], 2.0) and np.allclose(a[0]["complex"], 1.0)
+    with pytest.raises(FileNotFoundError):
+        ca.load_series(str(perf), "sub-01")

@@ -7,6 +7,7 @@ Run in the `simasl` environment (it imports `asldro`), from the aslscan reposito
     micromamba run -n simasl python tools/compat_asldro.py all --phantom 3t
     micromamba run -n simasl python tools/compat_asldro.py A --phantom 1.5t
     micromamba run -n simasl python tools/compat_asldro.py A --crop       # the cargo-test case
+    micromamba run -n simasl python tools/compat_asldro.py H --crop       # multi-TE (P6 part C)
 
 Each benchmark runs simasl's real `run_full_pipeline` (with `AcquireMriImageFilter` recorded, so
 each volume's complex image is read from the run itself), translates the same protocol into an
@@ -38,6 +39,9 @@ CROP = ((88, 112), (104, 128), (90, 96))
 SPLINE_REACH = 8
 MIN_PURE = 50
 C_SEEDS = [2, 4, 6, 8, 10, 12, 14, 16]
+# Benchmark H's echo list (s): P6 part C, multi-TE. Spin echo needs TE_1 >= 2h + r and
+# TE_e+1 >= TE_e + 2h + r for the 1 ms readout (h = 0.5 ms) and the default 2 ms refocusing reserve.
+H_TES = [0.01, 0.02, 0.03]
 
 
 # ------------------------------------------------------------------------------- rotations
@@ -355,7 +359,9 @@ def translate(series, gt_shape, gt_affine, gt_meta, parameter_override=None, tra
             raise SystemExit(f"{key} has {len(series[key])} entries for {n} volumes")
     te = series["echo_time"]
     if any(t != te[0] for t in te):
-        raise SystemExit("echo_time varies per volume; multi-TE ASL arrives with P6")
+        # simasl indexes echo_time by volume (examples.py:199): a per-volume vector is not an echo
+        # list; multi-TE runs simasl once per echo (echo_sidecars, benchmark H)
+        raise SystemExit("echo_time varies per volume; simasl's per-volume echo times are not multi-TE echoes")
     lt = series["label_type"].upper()
     side = {
         "ArterialSpinLabelingType": lt,
@@ -397,6 +403,22 @@ def translate(series, gt_shape, gt_affine, gt_meta, parameter_override=None, tra
     return side, "volume_type\n" + "\n".join(ctx) + "\n", "\n".join(ov) + "\n"
 
 
+def echo_sidecars(series, echo_times, gt_shape, gt_affine, gt_meta, parameter_override=None):
+    """Multi-TE (P6 part C): the series once per echo time, as simasl runs it (a constant
+    `echo_time` over the volumes), translated to one aslscan sidecar per echo. Returns (the
+    per-echo series, the sidecars, aslcontext text, overlay text); the sidecars differ in
+    EchoTime only, as aslscan requires."""
+    n = len(series["asl_context"].split())
+    per_echo = [dict(series, echo_time=[te] * n) for te in echo_times]
+    out = [translate(s, gt_shape, gt_affine, gt_meta, parameter_override) for s in per_echo]
+    sides = [o[0] for o in out]
+    for e, (side, ctx, ov) in enumerate(out):
+        if ctx != out[0][1] or ov != out[0][2] or {k: v for k, v in side.items() if k != "EchoTime"} != \
+                {k: v for k, v in sides[0].items() if k != "EchoTime"}:
+            raise SystemExit(f"echo {e + 1}'s translation differs from echo 1's beyond EchoTime")
+    return per_echo, sides, out[0][1], out[0][2]
+
+
 def write_trajectory(path, series, fov_centre, wrong=None):
     """The aslscan trajectory TSV (mm, radians) for simasl's per-volume poses."""
     rows = ["trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z"]
@@ -417,23 +439,42 @@ def aslscan_binary(path):
 
 
 def run_aslscan(binary, phantom_dir, side, ctx, overlay, run_dir):
+    """One aslscan run. `side` is the sidecar, or (P6 part C) a list of them, one per echo: then
+    every echo's `echo-N` series is loaded and a list is returned, in echo order."""
     if os.path.exists(run_dir):
         shutil.rmtree(run_dir)
     inp = os.path.join(run_dir, "inputs")
     os.makedirs(inp)
-    paths = {k: os.path.join(inp, f) for k, f in (("j", "asl.json"), ("c", "aslcontext.tsv"), ("o", "overlay.toml"))}
-    json.dump(side, open(paths["j"], "w"), indent=2)
+    sides = side if isinstance(side, list) else [side]
+    if len(sides) == 1:
+        jsons = [os.path.join(inp, "asl.json")]
+    else:
+        jsons = [os.path.join(inp, f"asl-echo-{e + 1}.json") for e in range(len(sides))]
+    paths = {k: os.path.join(inp, f) for k, f in (("c", "aslcontext.tsv"), ("o", "overlay.toml"))}
+    for j, sd in zip(jsons, sides):
+        json.dump(sd, open(j, "w"), indent=2)
     open(paths["c"], "w").write(ctx)
     open(paths["o"], "w").write(overlay)
     out = os.path.join(run_dir, "out")
-    cmd = [binary, "--asl-json", paths["j"], "--aslcontext", paths["c"], "--overlay", paths["o"],
-           "--phantom", phantom_dir, "--out", out, "--compat-asldro", "--t2-mode", "voxel"]
+    cmd = [binary]
+    for j in jsons:
+        cmd += ["--asl-json", j]
+    cmd += ["--aslcontext", paths["c"], "--overlay", paths["o"],
+            "--phantom", phantom_dir, "--out", out, "--compat-asldro", "--t2-mode", "voxel"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise SystemExit(f"aslscan failed:\n{r.stdout}\n{r.stderr}")
     perf = os.path.join(out, "sub-01", "perf")
-    mag = nib.load(os.path.join(perf, "sub-01_part-mag_asl.nii.gz"))
-    ph = nib.load(os.path.join(perf, "sub-01_part-phase_asl.nii.gz"))
+    if isinstance(side, list):
+        return [load_series(perf, f"sub-01_echo-{e + 1}" if len(sides) > 1 else "sub-01") for e in range(len(sides))]
+    return load_series(perf, "sub-01")
+
+
+def load_series(perf, stem):
+    """An aslscan series (`<stem>_part-{mag,phase}_asl`, the echo-less name for one echo, the
+    `echo-N` name for echo N of several) with the dataset's ground truth."""
+    mag = nib.load(os.path.join(perf, f"{stem}_part-mag_asl.nii.gz"))
+    ph = nib.load(os.path.join(perf, f"{stem}_part-phase_asl.nii.gz"))
     m, p = np.asarray(mag.dataobj, float), np.asarray(ph.dataobj, float)
     if m.ndim == 3:
         m, p = m[..., None], p[..., None]
@@ -442,7 +483,7 @@ def run_aslscan(binary, phantom_dir, side, ctx, overlay, run_dir):
     for desc in ("perfusion", "att", "T1map", "T2map", "M0map", "dseg"):
         f = os.path.join(gtd, f"sub-01_desc-{desc}_gt.nii.gz")
         gt[desc] = np.asarray(nib.load(f).dataobj, float)
-    sidecar = json.load(open(os.path.join(perf, "sub-01_part-mag_asl.json")))
+    sidecar = json.load(open(os.path.join(perf, f"{stem}_part-mag_asl.json")))
     return {"complex": m * np.exp(1j * p), "affine": mag.affine, "ground_truth": gt, "sidecar": sidecar}
 
 
@@ -595,6 +636,43 @@ class Bench:
         n = 3
         return self.exact("G", asl_series(self.identity_matrix(), acq_contrast="ge", excitation_flip_angle=60.0,
                                           repetition_time=[10.0] + [5.0] * (n - 1)))
+
+    # ---- H: multi-TE (P6 part C) on the identity grid, every echo as A, E and G ----
+    def bench_h(self):
+        """aslscan runs once with one sidecar per echo (the repeated sidecars, compat's per-echo
+        images, the echo-N outputs); simasl once per echo with a constant echo time. Each echo of
+        each contrast passes A's criteria; the echoes must differ (the decay is applied)."""
+        n = 3
+        res = {"echo_times": H_TES, "echoes": [], "pass": True}
+        for contrast, extra in (("se", {}), ("ge", {"excitation_flip_angle": 60.0})):
+            base = asl_series(self.identity_matrix(), acq_contrast=contrast, repetition_time=[10.0] + [5.0] * (n - 1), **extra)
+            per_echo, sides, ctx, ov = echo_sidecars(base, H_TES, self.shape, self.gt_affine, self.meta)
+            sims = [run_simasl(self.gt, s, {}, os.path.join(WORK, f"simasl-H-{contrast}-{e + 1}-{self.tag}.zip"))
+                    for e, s in enumerate(per_echo)]
+            outs = run_aslscan(self.binary, self.phantom, sides, ctx, ov, os.path.join(WORK, f"run-H-{contrast}-{self.tag}"))
+            if len(outs) != len(H_TES):
+                raise SystemExit(f"aslscan wrote {len(outs)} echoes for {len(H_TES)} echo times")
+            kinds = base["asl_context"].split()
+            for e, (a, s) in enumerate(zip(outs, sims)):
+                check_affines(a, s)
+                if a["sidecar"]["EchoTime"] != H_TES[e]:
+                    raise SystemExit(f"echo {e + 1}'s sidecar has EchoTime {a['sidecar']['EchoTime']}")
+                rows = per_volume(a, s, kinds)
+                ok = True
+                for r in rows:
+                    tol = 1e-4 if r["volume"] == "control-label" else 1e-5
+                    r["criterion"] = tol
+                    r["pass"] = bool(r["all"]["max_rel"] <= tol)
+                    ok &= r["pass"]
+                res["echoes"].append({"contrast": contrast, "echo": e + 1, "echo_time": H_TES[e], "rows": rows, "pass": bool(ok)})
+                res["pass"] &= ok
+            # the echoes are not copies of each other: echo 2's control below echo 1's
+            c = kinds.index("control")
+            decayed = float(np.abs(outs[1]["complex"][..., c]).sum()) < float(np.abs(outs[0]["complex"][..., c]).sum())
+            res[f"{contrast}_echoes_decay"] = decayed
+            res["pass"] &= decayed
+        res["pass"] = bool(res["pass"])
+        return res
 
     # ---- B: [64, 64, 12], pure mask at 1e-3; all-voxel numbers and ground truth reported ----
     def bench_b(self):
@@ -801,6 +879,16 @@ def markdown(bench, tag, res):
         cr = res["cross"]
         out += ["", f"Cross-side variance ratio simasl/aslscan {cr['variance_ratio_simasl_over_aslscan']:.4f}; "
                     f"squared reference ratio {cr['reference_ratio_squared']:.4f}; pass {cr['pass']}."]
+    if "echoes" in res:
+        out += [f"Echo times {res['echo_times']} s.", "",
+                "| contrast | echo | TE | worst max rel (volumes) | max rel (control - label) | pass |", "|---|---|---|---|---|---|"]
+        for c in res["echoes"]:
+            vols = [r for r in c["rows"] if r["volume"] != "control-label"]
+            cl = [r for r in c["rows"] if r["volume"] == "control-label"]
+            out.append(f"| {c['contrast']} | {c['echo']} | {c['echo_time']} | {fmt(max(r['all']['max_rel'] for r in vols))} | "
+                       f"{fmt(cl[0]['all']['max_rel']) if cl else '-'} | {c['pass']} |")
+        out.append("")
+        out.append(f"Echoes decay: spin echo {res.get('se_echoes_decay')}, gradient echo {res.get('ge_echoes_decay')}.")
     if res.get("reported"):
         out.append(f"Reported, not gated: control max rel (all) {fmt(res['all']['max_rel'])}, rms rel (all) "
                    f"{fmt(res['all']['rms_rel'])}; max rel (pure) {fmt(res['pure']['max_rel'])}.")
@@ -812,7 +900,7 @@ def markdown(bench, tag, res):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("bench", choices=["A", "B", "C", "D", "D-grid", "E", "G", "all"])
+    ap.add_argument("bench", choices=["A", "B", "C", "D", "D-grid", "E", "G", "H", "all"])
     ap.add_argument("--phantom", choices=sorted(PHANTOMS) + ["synth"], default="3t",
                     help="synth: three tissue blocks on the 3 T grid, where the B and D pure masks exist")
     ap.add_argument("--crop", action="store_true", help="the checked-in crop's window of the 3 T ground truth")
@@ -821,9 +909,9 @@ def main():
     if a.crop and a.phantom != "3t":
         raise SystemExit("--crop is a window of the 3 T ground truth")
     b = Bench(a, a.phantom, crop=a.crop)
-    benches = ["A", "B", "C", "D", "D-grid", "E", "G"] if a.bench == "all" else [a.bench]
-    if a.crop and any(x not in ("A", "E", "G") for x in benches):
-        raise SystemExit("on the crop only A, E and G apply (the others need the full field of view)")
+    benches = ["A", "B", "C", "D", "D-grid", "E", "G", "H"] if a.bench == "all" else [a.bench]
+    if a.crop and any(x not in ("A", "E", "G", "H") for x in benches):
+        raise SystemExit("on the crop only A, E, G and H apply (the others need the full field of view)")
     runs = [(b, name) for name in benches]
     if a.bench == "all" and not b.gated:
         # B and D are report-only on the anatomy; their gates are the synthetic blocks', and
