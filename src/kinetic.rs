@@ -222,6 +222,39 @@ pub fn arterial_dm(k: &Kinetic, abv: f64, aatt: f64, m0: f64, t: f64) -> (f64, O
     (2.0 * k.alpha * m0b * abv * decay, Some(t - aatt))
 }
 
+/// The delta-M at `t` of the label that arrived in the voxel during `[u1, u2)` (P6 addendum,
+/// part B: a Look-Locker readout depletes the label that has arrived, so the delta-M read splits
+/// by arrival window). Each parcel arriving at `u` relaxes with the GKM's residue
+/// `exp(-(t - u)/T1')` after it; the windows partition `[0, t)`, and over them the sum is
+/// [`delta_m`] at `t`.
+///
+/// (P)CASL delivers `2 alpha M0b f exp(-dt/T1b)` on `[dt, dt + tau]`:
+/// `2 alpha M0b f exp(-dt/T1b) T1' (exp(-(t - u_hi)/T1') - exp(-(t - u_lo)/T1'))`. PASL delivers
+/// `2 alpha M0b f exp(-u/T1b)` on `[dt, dt + tau]`: with `q = 1/T1b - 1/T1'`,
+/// `2 alpha M0b f exp(-t/T1b) exp(q t) (exp(-q u_lo) - exp(-q u_hi)) / q`, zero at `q = 0` as the
+/// GKM's guard makes it. `u_lo = max(u1, dt)`, `u_hi = min(u2, dt + tau, t)`, zero when
+/// `u_hi <= u_lo`; the GKM's guards on `lambda`, `T1'` and `T1b` hold.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_m_arrival(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t: f64, u1: f64, u2: f64) -> f64 {
+    let (f, m0b, t1p) = gkm_constants(k, f_ml_100g_min, t1t, m0);
+    let (u_lo, u_hi) = (u1.max(dt), u2.min(dt + k.tau).min(t));
+    if u_hi <= u_lo || t1p == 0.0 {
+        return 0.0;
+    }
+    match k.label_type {
+        LabelType::Pasl => {
+            let kk = (if k.t1b != 0.0 { 1.0 / k.t1b } else { 0.0 }) - div0(1.0, t1p);
+            let decay = if k.t1b > 0.0 { (-t / k.t1b).exp() } else { 0.0 };
+            let num = (kk * t).exp() * ((-kk * u_lo).exp() - (-kk * u_hi).exp());
+            2.0 * m0b * f * k.alpha * decay * div0(num, kk)
+        }
+        LabelType::Casl | LabelType::Pcasl => {
+            let decay = if k.t1b != 0.0 { (-dt / k.t1b).exp() } else { 0.0 };
+            2.0 * m0b * f * t1p * k.alpha * decay * ((-(t - u_hi) / t1p).exp() - (-(t - u_lo) / t1p).exp())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,5 +767,79 @@ mod tests {
         assert_eq!(arterial_dm(&Kinetic { t1b: -1.0, ..K_PASL }, abv, aatt, M0, 1.0).0, 0.0);
         assert!(arterial_dm(&Kinetic { t1b: -1.0, ..K_PCASL }, abv, aatt, M0, 1.0).0 > 0.0,
                 "(P)CASL tests != 0, as the GKM does");
+    }
+
+    // ---- P6 part B: arrival windows
+
+    /// Windows partitioning [0, t) sum to the GKM at t (both labeling types; arrival before,
+    /// during and after the windows; t inside and after the bolus).
+    #[test]
+    fn arrival_windows_partition_the_gkm() {
+        for k in [K_PCASL, K_PASL] {
+            for &(f, dt, t1t, m0) in &[(F, DT, T1T, M0), (20.0, 1.4, 0.83, 60.0), (60.0, 0.1, 1.33, 74.6)] {
+                for t in [0.5, 0.9, 1.2, 1.9, 2.6, 3.4, 4.5] {
+                    let whole = delta_m(&k, f, dt, t1t, m0, t);
+                    for cuts in [vec![0.6], vec![0.3, 0.95, 1.7], vec![0.2, 0.4, 0.8, 1.1, 1.5, 2.1, 2.9]] {
+                        let mut edges = vec![0.0];
+                        edges.extend(cuts.iter().copied().filter(|&c| c < t));
+                        edges.push(t);
+                        let sum: f64 = edges.windows(2).map(|w| delta_m_arrival(&k, f, dt, t1t, m0, t, w[0], w[1])).sum();
+                        assert!((sum - whole).abs() <= 1e-12 * whole.abs().max(1e-300) + 1e-15,
+                                "{:?} t {t} dt {dt} cuts {cuts:?}: {sum} vs {whole}", k.label_type);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Each window against the numerical quadrature of its integrand, the parcel arriving at u
+    /// delivered at the GKM's rate and relaxing with T1' after it.
+    #[test]
+    fn arrival_windows_match_quadrature() {
+        for k in [K_PCASL, K_PASL] {
+            let (f, dt, t1t, m0) = (F, DT, T1T, M0);
+            let (fs, m0b, t1p) = gkm_constants(&k, f, t1t, m0);
+            let rate = |u: f64| -> f64 {
+                if u < dt || u > dt + k.tau {
+                    return 0.0;
+                }
+                let decay = match k.label_type {
+                    LabelType::Pasl => (-u / k.t1b).exp(),
+                    _ => (-dt / k.t1b).exp(),
+                };
+                2.0 * k.alpha * m0b * fs * decay
+            };
+            for (t, u1, u2) in [(2.0f64, 0.0f64, 1.0f64), (2.0, 0.9, 1.3), (3.0, 1.1, 2.6), (2.4, 1.6, 2.4), (1.0, 0.5, 0.9)] {
+                let n = 200_000;
+                let (lo, hi) = (u1.max(dt), u2.min(dt + k.tau).min(t));
+                let quad = if hi > lo {
+                    let h = (hi - lo) / n as f64;
+                    (0..n).map(|i| {
+                        let u = lo + (i as f64 + 0.5) * h;
+                        rate(u) * (-(t - u) / t1p).exp()
+                    }).sum::<f64>() * h
+                } else {
+                    0.0
+                };
+                let got = delta_m_arrival(&k, f, dt, t1t, m0, t, u1, u2);
+                assert!((got - quad).abs() <= 1e-10 * quad.abs().max(1e-12) + 1e-14, "{:?} {t} [{u1}, {u2}): {got} vs {quad}", k.label_type);
+            }
+        }
+    }
+
+    /// The GKM's guards: PASL with q = 1/T1b - 1/T1' = 0 is zero (not the continuous limit), as
+    /// delta_m is; no label before the arrival; T1b = 0 zeroes the PASL delivery.
+    #[test]
+    fn arrival_windows_keep_the_gkm_guards() {
+        let (f, t1t, m0) = (F, T1T, M0);
+        let (_, _, t1p) = gkm_constants(&K_PASL, f, t1t, m0);
+        let k = Kinetic { t1b: t1p, ..K_PASL };
+        assert_eq!(delta_m(&k, f, DT, t1t, m0, 1.2), 0.0);
+        assert_eq!(delta_m_arrival(&k, f, DT, t1t, m0, 1.2, 0.0, 1.2), 0.0);
+        assert_eq!(delta_m_arrival(&K_PCASL, f, DT, t1t, m0, 2.0, 0.0, DT), 0.0);
+        assert_eq!(delta_m_arrival(&K_PCASL, f, DT, t1t, m0, 0.5, 0.0, 0.5), 0.0);
+        let k0 = Kinetic { t1b: 0.0, ..K_PASL };
+        assert_eq!(delta_m_arrival(&k0, f, DT, t1t, m0, 1.2, 0.0, 1.2), 0.0);
+        assert!(delta_m_arrival(&K_PASL, f, DT, t1t, m0, 1.2, 0.0, 1.2) > 0.0);
     }
 }
