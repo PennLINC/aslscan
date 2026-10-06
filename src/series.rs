@@ -151,6 +151,69 @@ pub struct SeriesOutput {
     pub spiral_segmentation: Option<Vec<mrsim_acq::kspace3d::SpiralSegmentation>>,
     /// P6 part C: echoes 2.. of a multi-TE series (echo 1 is `mag`, `phase` and `m0`); empty with one.
     pub more_echoes: Vec<EchoSeries>,
+    /// P6 part A: the raw (encoded) series and its records; `mag`, `phase` and the ground truth
+    /// above are then the decoded series and its ideal sub-bolus truth.
+    pub hadamard: Option<HadamardSeries>,
+}
+
+/// The raw series of a Hadamard protocol (P6 part A), for `sourcedata`.
+#[derive(Debug, Clone)]
+pub struct HadamardSeries {
+    pub n_raw: usize,
+    pub raw_mag: Vec<f32>,
+    pub raw_phase: Vec<f32>,
+    /// Echoes 2.. of a multi-TE raw series.
+    pub raw_more_echoes: Vec<(Vec<f32>, Vec<f32>)>,
+    /// The raw truth: the encoded kinetic sum per raw volume (moved in 2D under motion), today's
+    /// conventions; and the unmoved one under motion.
+    pub raw_delta_m: Vec<f32>,
+    pub raw_delta_m_static: Option<Vec<f32>>,
+    pub raw_delta_m_iv: Option<Vec<f32>>,
+    pub raw_delta_m_suppressed: Option<Vec<f32>>,
+    pub raw_delta_m_arterial: Option<Vec<f32>>,
+    pub schedule: crate::schedule::Schedule,
+    /// Per cycle, with `report_leakage`.
+    pub leakage: Option<Vec<HadamardLeakage>>,
+    /// Per preparation, the factors actually applied.
+    pub prep_factors: Vec<PrepFactors>,
+    pub flags: HadamardFlags,
+}
+
+/// One cycle's decoded tissue-only residual: `||L_j||_2` over the brain mask per sub-bolus,
+/// absolute and over the reference tissue's norm.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HadamardLeakage {
+    pub reference_norm: f64,
+    pub per_subbolus: Vec<(f64, f64)>,
+}
+
+/// One preparation's applied factors (P6 part A, the raw truth's table).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrepFactors {
+    pub raw: usize,
+    pub shot: usize,
+    pub encoding_row: Option<usize>,
+    pub start_s: f64,
+    pub labeling_window: [f64; 2],
+    /// The physiological label factor (1 without physiology).
+    pub label: f64,
+    /// The physiological tissue factor; NaN in 2D, where it is per slice (the physiology table).
+    pub tissue: f64,
+    /// The global-bolus suppression factor (`None` without it; per parcel under bolus-position).
+    pub suppression: Option<f64>,
+    /// The shot event's gain (1 without one).
+    pub shot_gain: f64,
+}
+
+/// Which features that keep decoding from being exact were on (P6 part A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HadamardFlags {
+    pub grappa: bool,
+    pub spikes: bool,
+    pub motion: bool,
+    pub shot_factors: bool,
+    pub transients: bool,
+    pub physiology: bool,
 }
 
 /// One later echo of a multi-TE series (P6 part C).
@@ -1264,6 +1327,7 @@ fn simulate_legacy(
         echo_amplitudes,
         spiral_segmentation,
         more_echoes: Vec::new(),
+        hadamard: None,
         ge_rule: ge_flip.map(|fa| match (p.compat.is_some(), fa == 90.0, ge_propagated.is_some(), p.suppression.is_some()) {
             (true, ..) => "simasl's coherent steady state per volume (compat)",
             (_, true, ..) => "90 degrees: the slab is saturated, each row independent (P3's timeline, sin(a) = 1)",

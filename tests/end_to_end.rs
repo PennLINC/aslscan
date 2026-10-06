@@ -1396,3 +1396,197 @@ fn the_multi_te_fixtures_load_and_run() {
         assert!(out.more_echoes.iter().all(|e| e.m0.is_some()), "{dir}: a separate M0 per echo");
     }
 }
+
+// ---------------------------------------------------------------- P6 part A: Hadamard
+
+const H_TAU: f64 = 0.25;
+const H_PLD: f64 = 1.5;
+
+/// Hadamard on the crop: `order`, `cycles` cycles of equal sub-boli (0.25 s, PLD 1.5 s, so every
+/// sub-bolus has arrived at the readout), an
+/// m0scan row first with `m0_first`; spin echo, or gradient echo at 60 degrees with `ge`.
+fn hadamard_crop(order: usize, cycles: usize, m0_first: bool, extra: &str, ge: bool) -> Protocol {
+    let n = order - 1;
+    let (mut ld, mut pld, mut ctx) = (Vec::new(), Vec::new(), String::from("volume_type\n"));
+    if m0_first {
+        ld.push(0.0);
+        pld.push(0.0);
+        ctx.push_str("m0scan\n");
+    }
+    for _ in 0..cycles {
+        for j in 0..n {
+            ld.push(H_TAU);
+            pld.push(H_PLD + H_TAU * (n - 1 - j) as f64);
+            ctx.push_str("deltam\n");
+        }
+    }
+    let s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": ld, "PostLabelingDelay": pld,
+        "BackgroundSuppression": false, "M0Type": if m0_first { "Included" } else { "Absent" },
+        "RepetitionTimePreparation": 4.0, "EchoTime": 0.012, "MagneticFieldStrength": 3,
+        "AcquisitionVoxelSize": [2.0, 2.0, 3.0], "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05],
+        "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.012
+    });
+    let contrast = if ge { "[signal]\nacq_contrast = \"ge\"\nexcitation_flip_angle = 60\n" } else { "" };
+    let ov: Overlay = toml::from_str(&format!(
+        "seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n{contrast}[hadamard]\norder = {order}\n{extra}")).unwrap();
+    parse(&s, &ctx, Some(&ov), crop().params.as_ref()).unwrap()
+}
+
+/// The single deltam row of sub-bolus `j` of `order`: its own duration and effective delay.
+fn single_subbolus(order: usize, j: usize, extra: &str, ge: bool) -> Protocol {
+    let s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": H_TAU,
+        "PostLabelingDelay": H_PLD + H_TAU * (order - 2 - j) as f64,
+        "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "EchoTime": 0.012,
+        "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0], "MRAcquisitionType": "2D",
+        "SliceTiming": [0.0, 0.05], "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.012
+    });
+    let contrast = if ge { "[signal]\nacq_contrast = \"ge\"\nexcitation_flip_angle = 60\n" } else { "" };
+    let ov: Overlay = toml::from_str(&format!("seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n{contrast}{extra}")).unwrap();
+    parse(&s, "volume_type\ndeltam\n", Some(&ov), crop().params.as_ref()).unwrap()
+}
+
+/// Decode raw volumes with an arbitrary +-1 matrix (the negative controls' wrong encodings).
+fn decode_with(h: &[Vec<i8>], raw: &[Vec<(f64, f64)>], j: usize) -> Vec<(f64, f64)> {
+    let scale = 2.0 / raw.len() as f64;
+    (0..raw[0].len()).map(|x| {
+        let (mut re, mut im) = (0.0, 0.0);
+        for (i, r) in raw.iter().enumerate() {
+            re += h[i][j] as f64 * r[x].0;
+            im += h[i][j] as f64 * r[x].1;
+        }
+        (scale * re, scale * im)
+    }).collect()
+}
+
+/// The addendum's per-voxel comparison: `|D - ref| <= 4 * 2^-24 * max_i |S_i| + 1e-6 * max |ref|`,
+/// with `max |ref|` above 100 times the first term's largest value (a resolved sub-bolus). Returns
+/// the worst ratio of the error to its bound.
+fn decode_ratio(d: &[(f64, f64)], reference: &[(f64, f64)], raw: &[Vec<(f64, f64)>]) -> f64 {
+    let max_ref = reference.iter().map(|z| z.0.hypot(z.1)).fold(0.0f64, f64::max);
+    let smax: Vec<f64> = (0..d.len()).map(|x| raw.iter().map(|r| r[x].0.hypot(r[x].1)).fold(0.0f64, f64::max)).collect();
+    let first = 4.0 * 2f64.powi(-24);
+    let floor = first * smax.iter().cloned().fold(0.0, f64::max);
+    assert!(max_ref > 100.0 * floor, "the sub-bolus is not resolved: max ref {max_ref}, f32 floor {floor}");
+    d.iter().zip(reference).zip(&smax)
+        .map(|((a, b), s)| (a.0 - b.0).hypot(a.1 - b.1) / (first * s + 1e-6 * max_ref))
+        .fold(0.0f64, f64::max)
+}
+
+fn raw_images(h: &aslscan::series::HadamardSeries, range: std::ops::Range<usize>) -> Vec<Vec<(f64, f64)>> {
+    range.map(|r| {
+        let n = h.n_raw;
+        (0..h.raw_mag.len() / n).map(|x| {
+            let (m, p) = (h.raw_mag[x * n + r] as f64, h.raw_phase[x * n + r] as f64);
+            (m * p.cos(), m * p.sin())
+        }).collect()
+    }).collect()
+}
+
+fn volume(out: &SeriesOutput, v: usize) -> Vec<(f64, f64)> {
+    let all = complex_from(&out.mag, &out.phase);
+    let n = out.n_volumes;
+    (0..all.len() / n).map(|x| all[x * n + v]).collect()
+}
+
+/// Decoded sub-bolus `j` is the single deltam run of sub-bolus `j` (its own duration and
+/// effective delay), spin echo and gradient echo in the steady state, to the addendum's
+/// tolerance; a flipped sign and a swapped column in the decoding fail the same comparison.
+#[test]
+fn a_decoded_sub_bolus_is_its_single_deltam_run() {
+    let order = 8;
+    for ge in [false, true] {
+        let p = hadamard_crop(order, 1, false, "", ge);
+        let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+        let h = out.hadamard.as_ref().unwrap();
+        assert_eq!((out.n_volumes, h.n_raw), (order - 1, order));
+        let raw = raw_images(h, 0..order);
+        let enc = aslscan::hadamard::encoding(order);
+        let mut flipped = enc.clone();
+        flipped[5][2] = -flipped[5][2];
+        let mut swapped = enc.clone();
+        for r in swapped.iter_mut() {
+            r.swap(1, 4);
+        }
+        for j in 0..order - 1 {
+            let one = simulate_with(&single_subbolus(order, j, "", ge), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+            let reference = volume(&one, 0);
+            let worst = decode_ratio(&volume(&out, j), &reference, &raw);
+            assert!(worst <= 1.0, "ge {ge} sub-bolus {j}: {worst}");
+            for (what, m) in [("flipped", &flipped), ("swapped", &swapped)] {
+                if (what == "flipped" && j == 2) || (what == "swapped" && (j == 1 || j == 4)) {
+                    let bad = decode_ratio(&decode_with(m, &raw, j), &reference, &raw);
+                    assert!(bad > 10.0, "ge {ge} {what} sub-bolus {j}: {bad}");
+                }
+            }
+        }
+    }
+}
+
+/// With exchange and no transient the tissue of every raw volume is the same, so the decoded
+/// tissue-only residual vanishes: the extravascular label (in the tissue compartments) is not
+/// counted as leakage.
+#[test]
+fn no_transient_no_leakage_with_exchange() {
+    let p = hadamard_crop(8, 1, false, "[kinetic]\nexchange_time = 0.5\n", false);
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let l = &out.hadamard.as_ref().unwrap().leakage.as_ref().unwrap()[0];
+    assert!(l.reference_norm > 0.0);
+    // numerically zero: identical tissue in every raw volume (the acquisition's arithmetic
+    // differs between volumes only at the level of the near-zero background)
+    for (j, &(abs, rel)) in l.per_subbolus.iter().enumerate() {
+        assert!(rel <= 1e-12, "sub-bolus {j}: {abs} ({rel})");
+    }
+}
+
+/// Gradient echo with an included M0 before the cycle: the longitudinal state carries over, so
+/// the raw volumes' tissue differs and leaks into every decoded sub-bolus. The decoded volume
+/// minus the single deltam run is the decoded tissue-only residual.
+#[test]
+fn a_transient_leaks_and_the_leakage_is_the_decoded_tissue() {
+    let order = 8;
+    let p = hadamard_crop(order, 1, true, "", true);
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let h = out.hadamard.as_ref().unwrap();
+    assert!(h.flags.transients);
+    let l = &h.leakage.as_ref().unwrap()[0];
+    let brain: Vec<bool> = out.ground_truth.dseg.iter().map(|d| *d > 0).collect();
+    for j in 0..order - 1 {
+        let reference = volume(&simulate_with(&single_subbolus(order, j, "", true), &crop(), T2Mode::Auto, &phase(),
+                                              RowOverride::None).unwrap(), 0);
+        // output 0 is the m0scan row
+        let d = volume(&out, j + 1);
+        let resid: f64 = d.iter().zip(&reference).zip(&brain).filter(|(_, b)| **b)
+            .map(|((a, r), _)| (a.0 - r.0).powi(2) + (a.1 - r.1).powi(2)).sum::<f64>().sqrt();
+        let (abs, rel) = l.per_subbolus[j];
+        println!("transient: sub-bolus {j} leakage {abs:.4} ({rel:.2e} of the reference), decoded - single {resid:.4}");
+        assert!(abs > 1e-3 * l.reference_norm * 1e-3, "sub-bolus {j}: no leakage");
+        assert!((resid - abs).abs() <= 1e-3 * abs + 1e-6 * l.reference_norm, "sub-bolus {j}: {resid} vs {abs}");
+    }
+}
+
+/// The encoded raw truth is the kinetic sum of the labeled sub-boli, and over all sub-boli it is
+/// the whole bolus.
+#[test]
+fn the_raw_truth_is_the_encoded_sum() {
+    let order = 4;
+    let p = hadamard_crop(order, 1, false, "", false);
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let h = out.hadamard.as_ref().unwrap();
+    let n = h.n_raw;
+    let nvox = h.raw_delta_m.len() / n;
+    let enc = aslscan::hadamard::encoding(order);
+    // the decoded truth per sub-bolus, by voxel; raw volume i's truth is the sum of its labeled ones
+    for (i, row) in enc.iter().enumerate() {
+        let w = aslscan::hadamard::weights(row);
+        for x in 0..nvox {
+            let want: f64 = (0..order - 1).filter(|&j| w[j] == 1).map(|j| out.ground_truth.delta_m[x * (order - 1) + j] as f64).sum();
+            let got = h.raw_delta_m[x * n + i] as f64;
+            assert!((got - want).abs() <= 1e-5 * want.abs().max(1e-3), "raw {i} voxel {x}: {got} vs {want}");
+        }
+    }
+    // raw volume 0 labels nothing
+    assert!((0..nvox).all(|x| h.raw_delta_m[x * n] == 0.0));
+}
+
