@@ -137,6 +137,18 @@ pub struct Overlay {
     pub vascular_crushing: Option<CrushOverlay>,
     pub physio: Option<PhysioOverlay>,
     pub readout: Option<ReadoutOverlay>,
+    pub multi_te: Option<MultiTeOverlay>,
+}
+
+/// `[multi_te]` (P6 addendum, part C): read only with more than one echo.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MultiTeOverlay {
+    /// ms reserved about the centre of each spin-echo refocusing pulse (default 2); refused under
+    /// gradient echo, which has none.
+    pub refocusing_time: Option<f64>,
+    /// GiB: the limit on compat's per-echo input images (default 4); compat only.
+    pub max_image_memory_gib: Option<f64>,
 }
 
 /// `[readout]` (P5 addendum, parts B and C): the 3D echo train and its in-plane readout. Every
@@ -556,6 +568,17 @@ pub struct MotionSpec {
     pub within: Option<WithinVolume>,
 }
 
+/// Multi-TE (P6 addendum, part C): one input sidecar per echo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultiTeSpec {
+    /// The input sidecar of each echo, in echo order (the first is also `Protocol::input_sidecar`).
+    pub sidecars: Vec<Value>,
+    /// ms reserved about each refocusing pulse; `None` under gradient echo.
+    pub refocusing_time_ms: Option<(f64, Source)>,
+    /// The limit on compat's per-echo input images (GiB); `None` outside compat.
+    pub max_image_memory_gib: Option<(f64, Source)>,
+}
+
 /// The resolved protocol. Seconds unless the field name says `_ms`.
 #[derive(Debug, Clone)]
 pub struct Protocol {
@@ -598,6 +621,10 @@ pub struct Protocol {
     pub reverse_phase: bool,
     pub phase_encoding_direction: String,
     pub echo_time_s: f64,
+    /// Every echo's time (s), increasing; one entry for a single echo (`echo_time_s`).
+    pub echo_times_s: Vec<f64>,
+    /// `Some` with more than one echo.
+    pub multi_te: Option<MultiTeSpec>,
     pub total_readout_time_s: f64,
     pub accel: usize,
     pub mb: usize,
@@ -975,6 +1002,74 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, mb: usize, shots_3d: Opti
 pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phantom: Option<&PhantomParams>)
     -> Result<Protocol, String>
 {
+    parse_echoes(std::slice::from_ref(sidecar), aslcontext, overlay, phantom)
+}
+
+/// JSON equality with numbers compared as numbers (`60` equals `60.0`), elementwise through
+/// arrays and objects.
+fn same_json(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_json(p, q)),
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same_json(v, w)))
+        }
+        _ => match (a.as_f64(), b.as_f64()) {
+            (Some(p), Some(q)) => p == q,
+            _ => a == b,
+        },
+    }
+}
+
+/// The echo times of a multi-TE protocol (P6 addendum, part C): one sidecar per echo, each with
+/// a scalar `EchoTime`, strictly increasing, and every other key the same in all of them.
+fn echo_times_of(sidecars: &[Value]) -> Result<Vec<f64>, String> {
+    let mut tes = Vec::with_capacity(sidecars.len());
+    for (e, s) in sidecars.iter().enumerate() {
+        let te = match s.get("EchoTime") {
+            Some(Value::Number(n)) => n.as_f64().unwrap(),
+            Some(Value::Array(_)) => {
+                return Err(format!(
+                    "asl.json of echo {}: EchoTime is an array; with one sidecar per echo (the BIDS echo-N layout) \
+                     each sidecar gives its own echo's EchoTime as a number", e + 1))
+            }
+            Some(_) => return Err(format!("asl.json of echo {}: EchoTime must be a number", e + 1)),
+            None => return Err(format!("asl.json of echo {}: missing required field \"EchoTime\"", e + 1)),
+        };
+        tes.push(require_finite_positive(te, &format!("asl.json of echo {}: EchoTime", e + 1))?);
+    }
+    for (e, w) in tes.windows(2).enumerate() {
+        if w[1] <= w[0] {
+            return Err(format!(
+                "the --asl-json sidecars are the echoes in order, so EchoTime must increase strictly: echo {} has {} s, \
+                 echo {} has {} s", e + 1, w[0], e + 2, w[1]));
+        }
+    }
+    let first = sidecars[0].as_object().ok_or("asl.json of echo 1 is not a JSON object")?;
+    for (e, s) in sidecars.iter().enumerate().skip(1) {
+        let other = s.as_object().ok_or_else(|| format!("asl.json of echo {} is not a JSON object", e + 1))?;
+        let mut keys: Vec<&String> = first.keys().chain(other.keys()).filter(|k| k.as_str() != "EchoTime").collect();
+        keys.sort();
+        keys.dedup();
+        for k in keys {
+            let show = |v: Option<&Value>| v.map_or("absent".to_string(), |v| v.to_string());
+            let (a, b) = (first.get(k), other.get(k));
+            if !matches!((a, b), (Some(x), Some(y)) if same_json(x, y)) {
+                return Err(format!(
+                    "the echo sidecars must agree on every key but EchoTime: {k} is {} in echo 1 and {} in echo {}",
+                    show(a), show(b), e + 1));
+            }
+        }
+    }
+    Ok(tes)
+}
+
+/// [`parse`] for one sidecar per echo, in echo order (P6 addendum, part C). One sidecar is
+/// [`parse`] itself.
+pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overlay>, phantom: Option<&PhantomParams>)
+    -> Result<Protocol, String>
+{
+    let sidecar = sidecars.first().ok_or("no ASL sidecar")?;
+    let multi_echo = sidecars.len() > 1;
     let kinds = parse_aslcontext(aslcontext)?;
     let n = kinds.len();
 
@@ -1205,12 +1300,23 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                 "PhaseEncodingDirection {ped:?}: phase is encoded along the second data axis (j or j-) only"))
         }
     };
-    let (te, _) = num_or_array(sidecar, "EchoTime")?;
-    if te.iter().any(|v| *v != te[0]) {
-        return Err(format!(
-            "asl.json: EchoTime array has unequal entries {te:?}; multi-TE ASL arrives with P6"));
-    }
-    let echo_time_s = require_finite_positive(te[0], "asl.json: EchoTime")?;
+    let echo_times_s = if multi_echo {
+        if is_3d {
+            return Err("multi-TE (one --asl-json per echo) with MRAcquisitionType 3D: multi-echo 3D trains are \
+                        deferred (P6 addendum)".to_string());
+        }
+        echo_times_of(sidecars)?
+    } else {
+        let (te, _) = num_or_array(sidecar, "EchoTime")?;
+        if te.iter().any(|v| *v != te[0]) {
+            return Err(format!(
+                "asl.json: EchoTime array has unequal entries {te:?}; multi-TE ASL takes one sidecar per echo (repeat \
+                 --asl-json), written as the BIDS echo-N layout"));
+        }
+        vec![require_finite_positive(te[0], "asl.json: EchoTime")?]
+    };
+    let echo_time_s = echo_times_s[0];
+    let last_echo_time_s = echo_times_s[echo_times_s.len() - 1];
     // 2D: required. 3D GRASE: one of the sources of the line spacing (P5 part B, "Timing from
     // BIDS"), optional; spirals have no phase-encode readout, so it is refused there.
     let total_readout_time_s = match readout_kind.map(|k| k.0) {
@@ -1380,10 +1486,10 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
                 }
             }
             for (i, r) in rows.iter().enumerate() {
-                if r.kind != RowKind::M0scan && r.tr < echo_time_s + ti {
+                if r.kind != RowKind::M0scan && r.tr < last_echo_time_s + ti {
                     return Err(format!(
                         "asl.json: row {i}: RepetitionTimePreparation {} s is shorter than EchoTime {} s + inversion \
-                         time {ti} s (simasl's IR constraint)", r.tr, echo_time_s));
+                         time {ti} s (simasl's IR constraint)", r.tr, last_echo_time_s));
                 }
             }
             (Some(IrSpec {
@@ -2060,7 +2166,36 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
         None
     };
 
+    let mo = overlay.and_then(|o| o.multi_te.as_ref());
+    let multi_te = if !multi_echo {
+        if mo.is_some() {
+            return Err("overlay: [multi_te] is read only with more than one echo (one --asl-json per echo)".to_string());
+        }
+        None
+    } else {
+        let refocusing_time_ms = match (contrast == Contrast::GradientEcho, mo.and_then(|m| m.refocusing_time)) {
+            (true, Some(_)) => {
+                return Err("overlay: multi_te.refocusing_time reserves time for spin-echo refocusing pulses, and a \
+                            gradient-echo readout has none".to_string())
+            }
+            (true, None) => None,
+            (false, Some(v)) => Some((require_finite_positive(v, "overlay multi_te.refocusing_time")?, Source::Overlay)),
+            (false, None) => Some((2.0, Source::Default)),
+        };
+        let max_image_memory_gib = match (compat.is_some(), mo.and_then(|m| m.max_image_memory_gib)) {
+            (false, Some(_)) => {
+                return Err("overlay: multi_te.max_image_memory_gib bounds compat's per-echo images; without [compat] \
+                            asldro = true every echo shares one image set".to_string())
+            }
+            (false, None) => None,
+            (true, Some(v)) => Some((require_finite_positive(v, "overlay multi_te.max_image_memory_gib")?, Source::Overlay)),
+            (true, None) => Some((4.0, Source::Default)),
+        };
+        Some(MultiTeSpec { sidecars: sidecars.to_vec(), refocusing_time_ms, max_image_memory_gib })
+    };
+
     Ok(Protocol {
+        echo_times_s, multi_te,
         compat, grid_origin, exchange_time, macrovascular, crushing, physio, row_start,
         label_type, rows, m0_type, background_suppression, suppression, ir, ge, readout, motion, mb_interleaved,
         slice_offsets, field_strength, voxel_size_mm, reverse_phase, phase_encoding_direction: ped,
@@ -2074,18 +2209,23 @@ pub fn parse(sidecar: &Value, aslcontext: &str, overlay: Option<&Overlay>, phant
 pub fn load(asl_json: &Path, aslcontext_tsv: &Path, overlay: Option<&Path>, phantom: Option<&PhantomParams>)
     -> Result<Protocol, String>
 {
-    load_with(asl_json, aslcontext_tsv, overlay, phantom, false)
+    load_with(&[asl_json], aslcontext_tsv, overlay, phantom, false)
 }
 
 /// [`load`], with `compat_asldro` the CLI's `--compat-asldro`: the same as writing
-/// `[compat] asldro = true` in the overlay (an overlay that says `false` is an error).
+/// `[compat] asldro = true` in the overlay (an overlay that says `false` is an error). `asl_json`
+/// is one sidecar, or one per echo in echo order (P6 addendum, part C).
 pub fn load_with(
-    asl_json: &Path, aslcontext_tsv: &Path, overlay: Option<&Path>, phantom: Option<&PhantomParams>, compat_asldro: bool,
+    asl_json: &[&Path], aslcontext_tsv: &Path, overlay: Option<&Path>, phantom: Option<&PhantomParams>, compat_asldro: bool,
 ) -> Result<Protocol, String> {
-    let sidecar: Value = serde_json::from_str(
-        &std::fs::read_to_string(asl_json).map_err(|e| format!("{}: {e}", asl_json.display()))?,
-    )
-    .map_err(|e| format!("{}: {e}", asl_json.display()))?;
+    let mut sidecars = Vec::with_capacity(asl_json.len());
+    for path in asl_json {
+        let sidecar: Value = serde_json::from_str(
+            &std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?,
+        )
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+        sidecars.push(sidecar);
+    }
     let ctx = std::fs::read_to_string(aslcontext_tsv).map_err(|e| format!("{}: {e}", aslcontext_tsv.display()))?;
     let mut ov: Option<Overlay> = match overlay {
         None => None,
@@ -2111,15 +2251,15 @@ pub fn load_with(
         }
         c.asldro = Some(true);
     }
-    parse(&sidecar, &ctx, ov.as_ref(), phantom)
+    parse_echoes(&sidecars, &ctx, ov.as_ref(), phantom)
 }
 
 impl Protocol {
     /// Whether any P6 feature is on (Hadamard encoding, Look-Locker readouts, more than one
     /// echo). Decided once, here: false sends the series down today's code unchanged (the legacy
-    /// dispatch). Each P6 part adds its condition as it is parsed; none is yet.
+    /// dispatch). Each P6 part adds its condition as it is parsed.
     pub fn p6_active(&self) -> bool {
-        false
+        self.echo_times_s.len() > 1
     }
 
     /// The kinetic constants for `row`.
@@ -2186,6 +2326,96 @@ impl Protocol {
         }
         Ok(acq)
     }
+}
+
+/// Half the sampled block of one 2D EPI readout (s) on an `[nx, ny]` acquired matrix: the
+/// quantity `mrsim_acq`'s `SingleShotEpi::half_read_time` computes (`kx_max * ky_max * dt / 2`,
+/// `dt = t_line / kx_max`), from the `t_line` of [`Protocol::acquisition`], in the same order.
+pub fn half_epi_block_s(p: &Protocol, nx: usize, ny: usize) -> f64 {
+    let t_line = p.total_readout_time_s * 1000.0 / ny as f64;
+    let dt = t_line / nx as f64;
+    (nx * ny) as f64 * dt / 2.0 / 1000.0
+}
+
+/// The excitation timing of a multi-TE protocol on its acquired grid (P6 addendum, part C,
+/// "Timing on explicit intervals"), in seconds. Within one excitation at `exc`, echo `e` samples
+/// `[exc + TE_e - h, exc + TE_e + h]`: under gradient echo the blocks must not overlap; under spin
+/// echo the first refocusing pulse is centred at `TE_1 / 2` and each later one at
+/// `(TE_e + TE_e+1) / 2`, each reserving `refocusing_time` about its centre, which must clear the
+/// excitation and the blocks on either side. Between excitations, slices sharing an offset are one
+/// excitation group (multiband groups): a group's last block must end before the next group's
+/// excitation, and the last group's
+/// before the repetition time, for every row (`row.t + offset` for an ASL row, the offset alone
+/// for an m0scan row) and for the separate M0 at its own repetition time. Under compat every
+/// slice offset is zero (compat refuses unequal `SliceTiming`: simasl's slices are independent and
+/// excited together), so there is one group and no between-group check: compat's abstraction,
+/// recorded in the sidecar; the checks within the excitation and against TR still run.
+pub fn check_excitation_timing(p: &Protocol, acq_dims: [usize; 3]) -> Result<(), String> {
+    let tes = &p.echo_times_s;
+    let h = half_epi_block_s(p, acq_dims[0], acq_dims[1]);
+    let block = |e: usize| [tes[e] - h, tes[e] + h];
+    if block(0)[0] < 0.0 {
+        return Err(format!(
+            "echo 1 at {} s samples from {} s before its excitation (half readout {h} s)", tes[0], -block(0)[0]));
+    }
+    let refocusing = p.multi_te.as_ref().and_then(|m| m.refocusing_time_ms).map(|r| r.0 / 1000.0);
+    match refocusing {
+        None => {
+            for e in 1..tes.len() {
+                if block(e)[0] < block(e - 1)[1] {
+                    return Err(format!(
+                        "gradient echo: echo {} samples [{}, {}] s after the excitation and echo {} [{}, {}] s; the \
+                         readouts overlap (TotalReadoutTime {} s)", e, block(e - 1)[0], block(e - 1)[1], e + 1,
+                        block(e)[0], block(e)[1], p.total_readout_time_s));
+                }
+            }
+        }
+        Some(r) => {
+            let c = tes[0] / 2.0;
+            if c - r / 2.0 < 0.0 || c + r / 2.0 > block(0)[0] {
+                return Err(format!(
+                    "spin echo: the first refocusing pulse, centred at {c} s with {r} s reserved (multi_te.refocusing_time), \
+                     must start after the excitation and end before echo 1's readout starts at {} s", block(0)[0]));
+            }
+            for e in 1..tes.len() {
+                let c = (tes[e - 1] + tes[e]) / 2.0;
+                if c - r / 2.0 < block(e - 1)[1] || c + r / 2.0 > block(e)[0] {
+                    return Err(format!(
+                        "spin echo: the refocusing pulse between echoes {} and {}, centred at {c} s with {r} s reserved \
+                         (multi_te.refocusing_time), must fit between echo {}'s readout ending at {} s and echo {}'s \
+                         starting at {} s", e, e + 1, e, block(e - 1)[1], e + 1, block(e)[0]));
+                }
+            }
+        }
+    }
+    let last_end = block(tes.len() - 1)[1];
+    let mut groups: Vec<f64> = p.slice_offsets.clone();
+    groups.sort_by(f64::total_cmp);
+    groups.dedup();
+    for w in groups.windows(2) {
+        if w[0] + last_end > w[1] {
+            return Err(format!(
+                "the slices excited at {} s read their last echo until {} s, after the next slices' excitation at {} s \
+                 (SliceTiming)", w[0], w[0] + last_end, w[1]));
+        }
+    }
+    let g_last = groups.last().copied().unwrap_or(0.0);
+    for (i, r) in p.rows.iter().enumerate() {
+        let exc = if r.kind == RowKind::M0scan { 0.0 } else { r.t };
+        if exc + g_last + last_end > r.tr {
+            return Err(format!(
+                "row {i}: the last slice's last echo ends at {} s, after its RepetitionTimePreparation {} s",
+                exc + g_last + last_end, r.tr));
+        }
+    }
+    if let (M0Type::Separate, Some(tr)) = (p.m0_type, p.m0_repetition_time_s) {
+        if g_last + last_end > tr {
+            return Err(format!(
+                "the separate M0's last slice's last echo ends at {} s, after its repetition time {tr} s (overlay \
+                 m0.repetition_time)", g_last + last_end));
+        }
+    }
+    Ok(())
 }
 
 /// Complete a 3D protocol's readout with the acquisition grid (P5 plan, Task 7): the segment
@@ -2561,7 +2791,7 @@ mod tests {
         s["EchoTime"] = json!([0.012, 0.012]);
         assert!((parse(&s, CTX, Some(&m0_overlay()), None).unwrap().echo_time_s - 0.012).abs() < 1e-15);
         s["EchoTime"] = json!([0.012, 0.030]);
-        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("P6"));
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("echo-N"));
         let mut s = base();
         s["MultibandAccelerationFactor"] = json!(3);
         s["SliceTiming"] = json!([0.0, 0.05, 0.0, 0.05, 0.0, 0.05]);
@@ -3082,15 +3312,15 @@ mod tests {
         std::fs::write(&j, compat_base().to_string()).unwrap();
         std::fs::write(&c, COMPAT_CTX).unwrap();
         // no overlay at all: the flag alone
-        assert!(load_with(&j, &c, None, None, true).unwrap().compat.is_some());
-        assert!(load_with(&j, &c, None, None, false).unwrap().compat.is_none());
+        assert!(load_with(&[j.as_path()], &c, None, None, true).unwrap().compat.is_some());
+        assert!(load_with(&[j.as_path()], &c, None, None, false).unwrap().compat.is_none());
         // an overlay saying true, or saying nothing about compat, is fine; false is a conflict
         std::fs::write(&o, "[compat]\nasldro = true\ndesired_snr = 20.0\n").unwrap();
-        assert_eq!(load_with(&j, &c, Some(&o), None, true).unwrap().compat, Some(CompatSpec { desired_snr: Some(20.0) }));
+        assert_eq!(load_with(&[j.as_path()], &c, Some(&o), None, true).unwrap().compat, Some(CompatSpec { desired_snr: Some(20.0) }));
         std::fs::write(&o, "seed = 3\n").unwrap();
-        assert!(load_with(&j, &c, Some(&o), None, true).unwrap().compat.is_some());
+        assert!(load_with(&[j.as_path()], &c, Some(&o), None, true).unwrap().compat.is_some());
         std::fs::write(&o, "[compat]\nasldro = false\n").unwrap();
-        assert!(load_with(&j, &c, Some(&o), None, true).unwrap_err().contains("--compat-asldro"));
+        assert!(load_with(&[j.as_path()], &c, Some(&o), None, true).unwrap_err().contains("--compat-asldro"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3543,5 +3773,200 @@ mod tests {
         let mut s = grase();
         s["M0Type"] = json!("Separate");
         assert!(res(&s, "[m0]\nrepetition_time = 0.2\n", [32, 32, 20]).unwrap_err().contains("after"));
+    }
+
+    // ---- P6 part C: multi-TE protocols
+
+    /// `base()` once per echo time.
+    fn echoes(tes: &[f64]) -> Vec<Value> {
+        tes.iter().map(|te| {
+            let mut s = base();
+            s["EchoTime"] = json!(te);
+            s
+        }).collect()
+    }
+
+    fn parse_e(s: &[Value], ov: &str) -> Result<Protocol, String> {
+        parse_echoes(s, CTX, Some(&overlay(&format!("[m0]\nrepetition_time = 8.0\n{ov}"))), None)
+    }
+
+    #[test]
+    fn one_sidecar_parses_as_before() {
+        let p = parse(&base(), CTX, Some(&m0_overlay()), None).unwrap();
+        assert_eq!((p.echo_times_s.clone(), p.multi_te.is_none(), p.p6_active()), (vec![0.012], true, false));
+        let q = parse_echoes(&[base()], CTX, Some(&m0_overlay()), None).unwrap();
+        assert_eq!((q.echo_times_s, q.rows, q.row_start), (p.echo_times_s, p.rows, p.row_start));
+        // an EchoTime array keeps its rule, and the message names the echo-N layout
+        let mut s = base();
+        s["EchoTime"] = json!([0.012, 0.030]);
+        let e = parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err();
+        assert!(e.contains("echo-N") && e.contains("--asl-json"), "{e}");
+        // [multi_te] needs more than one echo
+        assert!(parse_e(&[base()], "[multi_te]\nrefocusing_time = 2.0\n").unwrap_err().contains("more than one echo"));
+    }
+
+    #[test]
+    fn echo_sidecars_give_the_echo_times() {
+        let p = parse_e(&echoes(&[0.012, 0.030, 0.050]), "").unwrap();
+        assert_eq!(p.echo_times_s, vec![0.012, 0.030, 0.050]);
+        assert_eq!(p.echo_time_s, 0.012);
+        assert!(p.p6_active());
+        let m = p.multi_te.as_ref().unwrap();
+        assert_eq!((m.sidecars.len(), m.refocusing_time_ms, m.max_image_memory_gib), (3, Some((2.0, Source::Default)), None));
+        assert_eq!(m.sidecars[1]["EchoTime"], json!(0.030));
+        // order: strictly increasing
+        assert!(parse_e(&echoes(&[0.030, 0.012]), "").unwrap_err().contains("increase strictly"));
+        assert!(parse_e(&echoes(&[0.012, 0.012]), "").unwrap_err().contains("increase strictly"));
+        // each echo's EchoTime is a number
+        let mut s = echoes(&[0.012, 0.030]);
+        s[1]["EchoTime"] = json!([0.030, 0.030]);
+        let e = parse_e(&s, "").unwrap_err();
+        assert!(e.contains("echo 2") && e.contains("echo-N"), "{e}");
+        s[1].as_object_mut().unwrap().remove("EchoTime");
+        assert!(parse_e(&s, "").unwrap_err().contains("echo 2"));
+        // 3D is refused
+        let mut g = echoes(&[0.012, 0.030]);
+        for s in &mut g {
+            s["MRAcquisitionType"] = json!("3D");
+        }
+        assert!(parse_e(&g, "").unwrap_err().contains("3D"));
+    }
+
+    #[test]
+    fn echo_sidecars_must_agree_on_every_other_key() {
+        let check = |key: &str, a: Value, b: Value| {
+            let mut s = echoes(&[0.012, 0.030]);
+            s[0][key] = a.clone();
+            s[1][key] = b.clone();
+            let e = parse_e(&s, "").unwrap_err();
+            assert!(e.contains(key) && e.contains(&a.to_string()) && e.contains(&b.to_string()) && e.contains("echo 2"), "{e}");
+        };
+        check("RepetitionTimePreparation", json!(4.0), json!(4.5)); // number
+        check("SliceTiming", json!([0.0, 0.05, 0.10]), json!([0.0, 0.05, 0.11])); // array
+        check("PhaseEncodingDirection", json!("j-"), json!("j")); // string
+        check("Custom", json!({"a": 1}), json!({"a": 2})); // object
+        // a key in one sidecar only
+        let mut s = echoes(&[0.012, 0.030]);
+        s[1]["Manufacturer"] = json!("X");
+        let e = parse_e(&s, "").unwrap_err();
+        assert!(e.contains("Manufacturer") && e.contains("absent"), "{e}");
+        // numbers compare as numbers, through arrays and objects
+        let mut s = echoes(&[0.012, 0.030]);
+        s[0]["RepetitionTimePreparation"] = json!(4);
+        s[1]["RepetitionTimePreparation"] = json!(4.0);
+        s[0]["Custom"] = json!({"a": [60]});
+        s[1]["Custom"] = json!({"a": [60.0]});
+        parse_e(&s, "").unwrap();
+    }
+
+    #[test]
+    fn multi_te_overlay_keys() {
+        let two = echoes(&[0.012, 0.030]);
+        let p = parse_e(&two, "[multi_te]\nrefocusing_time = 3.0\n").unwrap();
+        assert_eq!(p.multi_te.unwrap().refocusing_time_ms, Some((3.0, Source::Overlay)));
+        assert!(parse_e(&two, "[multi_te]\nrefocusing_time = 0.0\n").is_err());
+        // gradient echo has no refocusing pulse
+        let ge = "[signal]\nacq_contrast = \"ge\"\nexcitation_flip_angle = 60\n";
+        assert_eq!(parse_e(&two, ge).unwrap().multi_te.unwrap().refocusing_time_ms, None);
+        assert!(parse_e(&two, &format!("{ge}[multi_te]\nrefocusing_time = 2.0\n")).unwrap_err().contains("gradient"));
+        // the image-memory limit is compat's
+        assert!(parse_e(&two, "[multi_te]\nmax_image_memory_gib = 2.0\n").unwrap_err().contains("compat"));
+        let mut c = echoes(&[0.012, 0.030]);
+        for s in &mut c {
+            s["M0Type"] = json!("Absent");
+            s["SliceTiming"] = json!([0.0, 0.0, 0.0]);
+        }
+        let cp = parse_echoes(&c, CTX, Some(&overlay("[compat]\nasldro = true\n")), None).unwrap();
+        assert_eq!(cp.multi_te.unwrap().max_image_memory_gib, Some((4.0, Source::Default)));
+        let cp = parse_echoes(&c, CTX, Some(&overlay("[compat]\nasldro = true\n[multi_te]\nmax_image_memory_gib = 1.5\n")), None).unwrap();
+        assert_eq!(cp.multi_te.unwrap().max_image_memory_gib, Some((1.5, Source::Overlay)));
+        // compat still refuses a separate M0
+        assert!(parse_echoes(&two, CTX, Some(&overlay("[compat]\nasldro = true\n[m0]\nrepetition_time = 8.0\n")), None).is_err());
+    }
+
+    /// The half block against the readout `mrsim_acq` builds, whose `half_read_time` is private:
+    /// `time_from_max_echo(0) = dt / 2 - h`.
+    #[test]
+    fn the_half_block_is_the_epi_readout_s() {
+        use mrsim_acq::readout::{Readout, SingleShotEpi};
+        let p = parse(&base(), CTX, Some(&m0_overlay()), None).unwrap();
+        for (nx, ny) in [(64, 64), (24, 20), (37, 53)] {
+            let a = p.acquisition(nx, ny).unwrap();
+            let epi = SingleShotEpi { kx_max: nx, ky_max: ny, t_line: a.t_line, t_echo: a.t_echo, reverse_phase: false };
+            let h_ms = epi.dt() * 0.5 - epi.time_from_max_echo(0);
+            let h = half_epi_block_s(&p, nx, ny) * 1000.0;
+            assert!((h - h_ms).abs() <= 4.0 * f64::EPSILON * h, "{nx}x{ny}: {h} vs {h_ms}");
+        }
+    }
+
+    #[test]
+    fn excitation_timing_rules() {
+        let dims = [32, 32, 3];
+        let run = |s: Vec<Value>, ov: &str| check_excitation_timing(&parse_e(&s, ov).unwrap(), dims);
+        let ge = "[signal]\nacq_contrast = \"ge\"\nexcitation_flip_angle = 60\n";
+        // h = TotalReadoutTime / 2 = 8 ms. Gradient echo: blocks [4, 20], [22, 38] ms
+        run(echoes(&[0.012, 0.030]), ge).unwrap();
+        assert!(run(echoes(&[0.012, 0.025]), ge).unwrap_err().contains("overlap"));
+        // spin echo, 2 ms reserved: TE_1 >= 2h + r = 18 ms, TE_2 >= TE_1 + 2h + r
+        run(echoes(&[0.020, 0.040]), "").unwrap();
+        assert!(run(echoes(&[0.012, 0.040]), "").unwrap_err().contains("first refocusing pulse"));
+        assert!(run(echoes(&[0.020, 0.037]), "").unwrap_err().contains("between echoes 1 and 2"));
+        assert!(run(echoes(&[0.020, 0.040]), "[multi_te]\nrefocusing_time = 5.0\n").is_err());
+        // between excitation groups: offsets 0, 50, 100 ms; the last block ends at TE_2 + 8 ms
+        let with = |tes: &[f64], timing: Value, mb: Option<usize>| {
+            let mut s = echoes(tes);
+            for x in &mut s {
+                x["SliceTiming"] = timing.clone();
+                if let Some(m) = mb {
+                    x["MultibandAccelerationFactor"] = json!(m);
+                }
+            }
+            s
+        };
+        for timing in [json!([0.0, 0.05, 0.10]), json!([0.10, 0.05, 0.0]), json!([0.0, 0.10, 0.05])] {
+            run(with(&[0.020, 0.040], timing.clone(), None), "").unwrap();
+            let e = run(with(&[0.020, 0.045], timing.clone(), None), "").unwrap_err();
+            assert!(e.contains("next slices' excitation"), "{timing}: {e}");
+        }
+        // multiband: slices sharing an offset are one group
+        let mb = json!([0.0, 0.05, 0.0, 0.05]);
+        run(with(&[0.020, 0.040], mb.clone(), Some(2)), "").unwrap();
+        assert!(run(with(&[0.020, 0.045], mb, Some(2)), "").unwrap_err().contains("next slices' excitation"));
+        // an excitation that fits in TR whose last echo does not: t = 3.6 s, last slice at 3.7 s,
+        // its last echo ending at 3.748 s
+        let mut s = echoes(&[0.020, 0.040]);
+        for x in &mut s {
+            x["RepetitionTimePreparation"] = json!(3.72);
+        }
+        assert!(run(s, "").unwrap_err().contains("RepetitionTimePreparation"));
+        // the separate M0 at its own repetition time
+        let p = parse_echoes(&echoes(&[0.020, 0.040]), CTX, Some(&overlay("[m0]\nrepetition_time = 0.12\n")), None).unwrap();
+        assert!(check_excitation_timing(&p, dims).unwrap_err().contains("separate M0"));
+        // an m0scan row excites at its offsets alone
+        let mut s = echoes(&[0.020, 0.040]);
+        for x in &mut s {
+            x["M0Type"] = json!("Included");
+            x["PostLabelingDelay"] = json!([0.0, 1.8, 1.8, 1.8, 1.8]);
+            x["RepetitionTimePreparation"] = json!([0.16, 4.0, 4.0, 4.0, 4.0]);
+        }
+        let ctx = "volume_type\nm0scan\ncontrol\nlabel\ncontrol\nlabel\n";
+        let p = parse_echoes(&s, ctx, None, None).unwrap();
+        check_excitation_timing(&p, dims).unwrap();
+        for x in &mut s {
+            x["RepetitionTimePreparation"] = json!([0.14, 4.0, 4.0, 4.0, 4.0]);
+        }
+        let p = parse_echoes(&s, ctx, None, None).unwrap();
+        assert!(check_excitation_timing(&p, dims).unwrap_err().contains("row 0"));
+        // compat excites every slice together (equal SliceTiming): one group, whose checks run
+        let compat = |tes: &[f64]| {
+            let mut s = echoes(tes);
+            for x in &mut s {
+                x["M0Type"] = json!("Absent");
+                x["SliceTiming"] = json!([0.0, 0.0, 0.0]);
+            }
+            check_excitation_timing(&parse_echoes(&s, CTX, Some(&overlay("[compat]\nasldro = true\n")), None).unwrap(), dims)
+        };
+        compat(&[0.020, 0.045]).unwrap();
+        assert!(compat(&[0.020, 0.037]).unwrap_err().contains("between echoes 1 and 2"));
     }
 }

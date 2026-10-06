@@ -21,9 +21,10 @@ enum Mode {
 #[derive(Parser, Debug)]
 #[command(name = "aslscan", version, about = "Simulate a BIDS ASL series from a BIDS-derivatives phantom")]
 struct Cli {
-    /// The BIDS ASL sidecar (`*_asl.json`) describing the protocol.
-    #[arg(long, value_name = "JSON")]
-    asl_json: PathBuf,
+    /// The BIDS ASL sidecar (`*_asl.json`) describing the protocol. Multi-TE: once per echo, in echo
+    /// order, each with that echo's EchoTime (written as the BIDS echo-N layout).
+    #[arg(long, value_name = "JSON", required = true)]
+    asl_json: Vec<PathBuf>,
     /// The `*_aslcontext.tsv` giving the volume order.
     #[arg(long, value_name = "TSV")]
     aslcontext: PathBuf,
@@ -68,7 +69,7 @@ fn run() -> Result<(), String> {
     let t0 = Instant::now();
 
     let ph = phantom::load(&cli.phantom)?;
-    let mut p = protocol::load_with(&cli.asl_json, &cli.aslcontext, cli.overlay.as_deref(), ph.params.as_ref(), cli.compat_asldro)?;
+    let mut p = protocol::load_with(&cli.asl_json.iter().map(PathBuf::as_path).collect::<Vec<_>>(), &cli.aslcontext, cli.overlay.as_deref(), ph.params.as_ref(), cli.compat_asldro)?;
     if let Some(s) = cli.seed {
         p.seed = s;
     }
