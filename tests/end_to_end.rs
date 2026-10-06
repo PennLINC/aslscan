@@ -949,3 +949,151 @@ fn spiral_override_provenance_on_both_sidecars() {
     assert_eq!(m0rep["DwellTime"], json!(5e-6), "{m0rep}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------- P6: the legacy manifest
+
+/// A protocol of the legacy manifest: no P6 feature, and the identity schedule that states its
+/// layout (one raw volume and one output per row, `NumberShots` preparations per raw volume on
+/// the clock of `row_start`).
+fn assert_legacy(name: &str, p: &Protocol) {
+    use aslscan::schedule::{Output, Schedule};
+    assert!(!p.p6_active(), "{name}: a legacy protocol must not activate the P6 path");
+    let s = Schedule::identity(p);
+    let shots = p.readout.as_ref().map_or(1, |r| r.number_shots.0);
+    let n = p.rows.len();
+    assert_eq!(s.raw_rows, p.rows, "{name}");
+    assert_eq!((s.raws.len(), s.preps.len(), s.outputs.len()), (n, n * shots, n), "{name}");
+    assert!(s.cycles.is_empty(), "{name}");
+    for (v, row) in p.rows.iter().enumerate() {
+        assert_eq!(s.outputs[v], Output::Raw(v), "{name}");
+        assert_eq!((s.raws[v].n_preps, s.raws[v].readout, s.raws[v].cycle), (shots, 0, None), "{name}");
+        for (k, prep) in s.preps_of(v).iter().enumerate() {
+            assert_eq!((prep.raw, prep.shot, prep.suppression), (v, k, v), "{name}");
+            assert_eq!(prep.start_s, p.row_start[v] + k as f64 * row.tr, "{name} row {v} shot {k}");
+            assert_eq!(prep.venc, p.crushing.as_ref().map(|c| c.venc[v]), "{name}");
+        }
+    }
+}
+
+fn fixture(dir: &str) -> (Value, String) {
+    let d = format!("{}/tests/fixtures/protocols/{dir}/", env!("CARGO_MANIFEST_DIR"));
+    let s = serde_json::from_str(&std::fs::read_to_string(format!("{d}asl.json")).unwrap()).unwrap();
+    (s, std::fs::read_to_string(format!("{d}aslcontext.tsv")).unwrap())
+}
+
+fn fixture_overlay(dir: &str) -> String {
+    std::fs::read_to_string(format!("{}/tests/fixtures/protocols/{dir}/overlay.toml", env!("CARGO_MANIFEST_DIR")))
+        .unwrap()
+}
+
+fn parse_named(name: &str, s: &Value, ctx: &str, ov: &str) -> Protocol {
+    let ov: Overlay = toml::from_str(ov).unwrap_or_else(|e| panic!("{name}: overlay: {e}"));
+    parse(s, ctx, Some(&ov), crop().params.as_ref()).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// P6 Task 2: every legacy combination the gates and tests run (the regression cases of
+/// `tools/regress_identity.sh` with its generated variants, the P5 acceptance fixtures, the
+/// protocol builders of this file) parses with the P6 path off and has the identity layout.
+/// Rejection fixtures stay in their own tests.
+#[test]
+fn the_legacy_manifest_keeps_the_identity_schedule() {
+    // the regression cases
+    let m0 = "[m0]\nrepetition_time = 8.0\n";
+    let (a2, a2ctx) = fixture("asl002");
+    let mut a2off = a2.clone();
+    a2off["BackgroundSuppression"] = json!(false);
+    for (name, s, ov) in [
+        ("asl002_bs", &a2, m0.to_string()),
+        ("asl002_motion", &a2, format!("seed = 5\n{m0}[motion]\nmode = \"random\"\ntrans_mm = [2.0, 2.0, 1.0]\nrot_deg = [1.0, 1.0, 2.0]\nvolumes = [5, 20, 40]\n")),
+        ("asl002_noise", &a2off, format!("{m0}[acquisition]\nnoise_variance = 4.0\n")),
+        ("asl002_ir", &a2off, format!("{m0}[signal]\nacq_contrast = \"ir\"\n")),
+    ] {
+        assert_legacy(name, &parse_named(name, s, &a2ctx, &ov));
+    }
+    let (mut a4, a4ctx) = fixture("asl004");
+    a4["TotalReadoutTime"] = json!(0.025);
+    assert_legacy("asl004_bs", &parse_named("asl004_bs", &a4, &a4ctx, m0));
+    for dir in ["pasl_cutoff", "crop_pcasl", "p4_all", "p5_ge", "p5_grase", "asl003_p5"] {
+        let (s, ctx) = fixture(dir);
+        assert_legacy(dir, &parse_named(dir, &s, &ctx, &fixture_overlay(dir)));
+    }
+    let crop_json = |extra: Value| {
+        let mut s = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8, "M0Type": "Absent",
+            "RepetitionTimePreparation": 4.0, "EchoTime": 0.012, "MagneticFieldStrength": 3,
+            "AcquisitionVoxelSize": [2.0, 2.0, 3.0], "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05],
+            "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.012
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            s[k] = v.clone();
+        }
+        s
+    };
+    let bs = |t: [f64; 2]| json!({"BackgroundSuppression": true, "BackgroundSuppressionNumberPulses": 2, "BackgroundSuppressionPulseTime": t});
+    let pasl = |extra: Value| {
+        let mut s = crop_json(extra);
+        let o = s.as_object_mut().unwrap();
+        o.remove("LabelingDuration");
+        o.insert("ArterialSpinLabelingType".into(), json!("PASL"));
+        o.insert("BolusCutOffFlag".into(), json!(true));
+        o.insert("BolusCutOffTechnique".into(), json!("Q2TIPS"));
+        o.insert("BolusCutOffDelayTime".into(), json!(0.7));
+        s
+    };
+    let plain = crop_json(json!({"BackgroundSuppression": false}));
+    let crush = crop_json(json!({"BackgroundSuppression": false, "VascularCrushing": true, "VascularCrushingVENC": [0.0, 4.0, 0.0, 4.0]}));
+    let ctx = "volume_type\ncontrol\nlabel\ncontrol\nlabel\n";
+    let motion = "seed = 3\n[motion]\nmode = \"random\"\ntrans_mm = [1.0, 1.0, 0.0]\nrot_deg = [0.0, 0.0, 2.0]\nvolumes = [1, 3]\n";
+    let macro_ov = "seed = 3\n[kinetic]\nexchange_time = 0.5\n[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\narterial_transit_time = { grey_matter = 3.0, white_matter = 3.2, csf = 0.0 }\n[vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n";
+    for (name, s, ov) in [
+        ("crop_bs", crop_json(bs([2.0, 3.2])), "seed = 3\n"),
+        ("crop_ir", plain.clone(), "seed = 3\n[signal]\nacq_contrast = \"ir\"\n"),
+        ("crop_motion", plain.clone(), motion),
+        ("crop_pasl_bs", pasl(bs([0.9, 1.5])), "seed = 3\n"),
+        ("crop_pasl_motion", pasl(json!({"BackgroundSuppression": false})), motion),
+        ("p4_physio", plain.clone(), "seed = 3\n[physio]\ntissue_cardiac = 0.02\ntissue_drift = 0.01\nlabel_respiratory = 0.03\n"),
+        ("p4_macro_crush", crush, macro_ov),
+        ("p4_bolus", crop_json(bs([1.5, 2.7])), "seed = 3\n[background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n"),
+    ] {
+        assert_legacy(name, &parse_named(name, &s, ctx, ov));
+    }
+    // the P5 regression variants: gradient echo with an included M0 at 90 and 35 degrees, and
+    // segmented GRASE with a shot event between its shots
+    let (ge, gectx) = fixture("p5_ge");
+    let ge_ov = fixture_overlay("p5_ge").split("[m0]").next().unwrap().to_string();
+    for flip in [90, 35] {
+        let mut s = ge.clone();
+        s["FlipAngle"] = json!(flip);
+        s["M0Type"] = json!("Included");
+        s["PostLabelingDelay"] = json!([0.0, 1.8, 1.8, 1.0, 1.0]);
+        let ctx = gectx.replacen("volume_type\n", "volume_type\nm0scan\n", 1);
+        assert_legacy(&format!("p5_ge{flip}"), &parse_named("p5_ge", &s, &ctx, &ge_ov));
+    }
+    let (gr, grctx) = fixture("p5_grase");
+    let seg = format!("{}\n[motion.within_volume]\ndropout_rate = 1.0\nseverity = 0.3\njump_mm = [0.5, 0.0, 0.0]\njump_deg = [0.0, 0.0, 1.0]\n",
+                      fixture_overlay("p5_grase"));
+    assert_legacy("p5_grase_seg", &parse_named("p5_grase_seg", &gr, &grctx, &seg));
+    // the real-geometry P5 cases: asl005 (GRASE) and asl001 (spiral, kspace only)
+    let (a5, a5ctx) = fixture("asl005");
+    assert_legacy("asl005_p5", &parse_named("asl005_p5", &a5, &a5ctx, &fixture_overlay("asl005_p5")));
+    #[cfg(feature = "kspace")]
+    {
+        let (a1, a1ctx) = fixture("asl001");
+        assert_legacy("asl001_p5", &parse_named("asl001_p5", &a1, &a1ctx, &fixture_overlay("asl001_p5")));
+    }
+
+    // the protocol builders of this file
+    for rows in ["control", "label", "deltam", "control,label,control,label"] {
+        assert_legacy("protocol_with", &protocol_with(rows, 0.0, false, ""));
+        assert_legacy("protocol_with bs", &protocol_with(rows, 0.5, true, ""));
+        assert_legacy("ge", &protocol_with(rows, 0.0, true, "[signal]\nacq_contrast = \"ge\"\nexcitation_flip_angle = 60\n"));
+        assert_legacy("p4_all", &p4_all(rows, ""));
+        assert_legacy("grase", &grase(rows, true, ""));
+        assert_legacy("twin_2d", &twin_2d(rows, true));
+        #[cfg(feature = "kspace")]
+        assert_legacy("spiral", &spiral_protocol(rows));
+    }
+    for row in ["control", "label", "deltam"] {
+        assert_legacy("p4_one", &p4_one(row, 0.4));
+    }
+}

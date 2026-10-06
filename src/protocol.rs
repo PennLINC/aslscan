@@ -2115,6 +2115,13 @@ pub fn load_with(
 }
 
 impl Protocol {
+    /// Whether any P6 feature is on (Hadamard encoding, Look-Locker readouts, more than one
+    /// echo). Decided once, here: false sends the series down today's code unchanged (the legacy
+    /// dispatch). Each P6 part adds its condition as it is parsed; none is yet.
+    pub fn p6_active(&self) -> bool {
+        false
+    }
+
     /// The kinetic constants for `row`.
     pub fn kinetic(&self, row: &Row) -> Kinetic {
         Kinetic { label_type: self.label_type, tau: row.tau, alpha: self.alpha.0, lambda: self.lambda.0, t1b: self.t1b.0 }

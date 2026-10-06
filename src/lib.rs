@@ -45,6 +45,9 @@ pub mod protocol;
 /// BIDS-derivatives phantom maps -> `Phantom`, T2' derivation, class/voxel resolution (feature `io`).
 #[cfg(feature = "io")]
 pub mod phantom;
+/// The schedule: preparations, raw volumes, output volumes (P6; feature `io`).
+#[cfg(feature = "io")]
+pub mod schedule;
 /// Row semantics, class split, the one acquisition call, the separate M0 (feature `io`).
 #[cfg(feature = "io")]
 pub mod series;

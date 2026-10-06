@@ -416,7 +416,28 @@ pub fn simulate_compartments(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &P
     Ok((images, out))
 }
 
+/// The legacy dispatch (P6 addendum): a protocol with no P6 feature runs [`simulate_legacy`],
+/// today's series unchanged; one with a P6 feature runs [`simulate_p6`].
 fn simulate_core(
+    p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, ov: RowOverride, capture: Option<&mut Vec<Vec<f32>>>,
+) -> Result<SeriesOutput, String> {
+    if p.p6_active() {
+        simulate_p6(p, ph, mode, phase, ov, capture)
+    } else {
+        simulate_legacy(p, ph, mode, phase, ov, capture)
+    }
+}
+
+/// The series of a protocol with a P6 feature, driven by its [`Schedule`](crate::schedule::Schedule).
+fn simulate_p6(
+    _p: &Protocol, _ph: &Phantom, _mode: T2Mode, _phase: &PhaseModel, _ov: RowOverride,
+    _capture: Option<&mut Vec<Vec<f32>>>,
+) -> Result<SeriesOutput, String> {
+    Err("P6 series (Hadamard, Look-Locker, multi-TE) are not implemented yet".to_string())
+}
+
+/// The series of every protocol without a P6 feature: the P1-P5 code, unchanged.
+fn simulate_legacy(
     p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, ov: RowOverride, capture: Option<&mut Vec<Vec<f32>>>,
 ) -> Result<SeriesOutput, String> {
     if let (Some(pf), fs) = (ph.params.and_then(|q| q.field_strength), p.field_strength) {
