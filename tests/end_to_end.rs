@@ -1590,3 +1590,71 @@ fn the_raw_truth_is_the_encoded_sum() {
     assert!((0..nvox).all(|x| h.raw_delta_m[x * n] == 0.0));
 }
 
+
+/// The Hadamard dataset (2D): the decoded series in the main tree with its Hadamard block and
+/// TotalAcquiredPairs = cycles, the raw series and its truth under sourcedata, one row per
+/// preparation in the preparation table.
+#[test]
+fn hadamard_dataset_layout() {
+    let order = 4;
+    let p = hadamard_crop(order, 2, true, "[physio]\ntissue_cardiac = 0.03\nlabel_cardiac = 0.04\n", false);
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-hadamard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let list = |d: &std::path::Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        v.sort();
+        v
+    };
+    let perf = dir.join("sub-01/perf");
+    assert_eq!(list(&perf), ["ground-truth", "sub-01_aslcontext.tsv", "sub-01_part-mag_asl.json", "sub-01_part-mag_asl.nii.gz",
+                             "sub-01_part-phase_asl.json", "sub-01_part-phase_asl.nii.gz"]);
+    // the per-volume tables are the raw volumes', so they are in sourcedata only
+    assert!(!list(&perf.join("ground-truth")).iter().any(|f| f.contains("physio") || f.contains("preparations")));
+    assert_eq!(std::fs::read_to_string(perf.join("sub-01_aslcontext.tsv")).unwrap(),
+               format!("volume_type\nm0scan\n{}", "deltam\n".repeat(2 * (order - 1))));
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    assert_eq!(side["TotalAcquiredPairs"], json!(2));
+    let hb = &side["AslscanSimulation"]["Hadamard"];
+    assert_eq!((hb["Order"].clone(), hb["Counts"].clone()), (json!(4), json!({ "Preparations": 9, "RawVolumes": 9, "Decoded": 6 })));
+    assert_eq!(hb["Outputs"][0], json!({ "RawVolume": 0 }));
+    assert_eq!(hb["Outputs"][4], json!({ "Cycle": 2, "SubBolus": 1 }));
+    // H4 row 1 is (-1, 1, -1) without the all-ones column: sub-boli 1 and 3 labeled
+    assert_eq!(hb["RawVolumes"][2]["LabeledSubBoli"], json!([1, 3]));
+    assert_eq!(hb["NonExact"]["Physiology"], json!(true));
+    assert!(hb["TissueLeakage"].as_array().unwrap().len() == 2 && hb["TotalAcquiredPairsConvention"].is_string());
+    let gt: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("ground-truth/sub-01_desc-deltam_gt.json")).unwrap()).unwrap();
+    assert!(gt["Description"].as_str().unwrap().contains("ideal sub-bolus truth"));
+    // sourcedata: the raw series, one row per raw volume, the raw truth, the preparations
+    let src = dir.join("sourcedata/sub-01/perf");
+    assert_eq!(list(&src), ["ground-truth", "sub-01_part-mag_asl.json", "sub-01_part-mag_asl.nii.gz", "sub-01_part-phase_asl.json",
+                            "sub-01_part-phase_asl.nii.gz", "sub-01_rawvolumes.tsv"]);
+    let raw = std::fs::read_to_string(src.join("sub-01_rawvolumes.tsv")).unwrap();
+    let lines: Vec<&str> = raw.lines().collect();
+    assert_eq!(lines.len(), 10);
+    assert_eq!(lines[1], "0\tm0scan\tn/a\tn/a\t\t0\t1");
+    assert_eq!(lines[2], "1\tencoded\t1\t0\t\t1\t1");
+    assert_eq!(lines[4], "3\tencoded\t1\t2\t2,3\t3\t1");
+    let srcgt = list(&src.join("ground-truth"));
+    for f in ["sub-01_desc-deltam_gt.nii.gz", "sub-01_desc-physio_gt.tsv", "sub-01_desc-preparations_gt.tsv"] {
+        assert!(srcgt.contains(&f.to_string()), "{f} in {srcgt:?}");
+    }
+    let prep = std::fs::read_to_string(src.join("ground-truth/sub-01_desc-preparations_gt.tsv")).unwrap();
+    let rows: Vec<Vec<&str>> = prep.lines().skip(1).map(|l| l.split('\t').collect()).collect();
+    assert_eq!(rows.len(), 9);
+    let h = out.hadamard.as_ref().unwrap();
+    for (i, r) in rows.iter().enumerate() {
+        assert_eq!(r[0], i.to_string());
+        assert_eq!(r[1], h.prep_factors[i].raw.to_string());
+        // the label factor recorded is the one applied, and it varies (physiology)
+        assert_eq!(r[8].parse::<f64>().unwrap(), h.prep_factors[i].label);
+        assert_eq!(r[9], "per slice (desc-physio_gt.tsv)");
+    }
+    let nii = |f: &std::path::Path| -> usize {
+        nifti::ReaderOptions::new().read_file(f).unwrap().header().dim[4] as usize
+    };
+    assert_eq!(nii(&src.join("ground-truth/sub-01_desc-deltam_gt.nii.gz")), 9);
+    assert_eq!(nii(&perf.join("ground-truth/sub-01_desc-deltam_gt.nii.gz")), 7);
+    let _ = std::fs::remove_dir_all(&dir);
+}

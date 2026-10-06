@@ -153,6 +153,15 @@ fn run() -> Result<(), String> {
         );
     }
 
+    if let (Some(h), Some(hs)) = (&p.hadamard, &out.hadamard) {
+        let worst = hs.leakage.as_ref().map(|l| l.iter().flat_map(|c| c.per_subbolus.iter().map(|x| x.1)).fold(0.0, f64::max));
+        println!(
+            "Hadamard: order {}, {} cycle(s), {} raw volume(s) decoded to {} output(s) (the raw series is under sourcedata); \
+             tissue leakage {}",
+            h.order, h.cycles.len(), hs.n_raw, out.n_volumes,
+            worst.map_or("not computed".to_string(), |w| format!("at most {w:.3e} of the reference")),
+        );
+    }
     let names = Names::new(&cli.sub, cli.ses.as_deref());
     write_dataset(&cli.out, &names, &p, &out)?;
     let tail = if p.echo_times_s.len() > 1 {

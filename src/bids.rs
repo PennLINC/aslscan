@@ -290,7 +290,7 @@ mod writer {
                     "RefocusingFlipAngle": { "Value": rs.refocusing_flip_deg.0, "Source": rs.refocusing_flip_deg.1.as_str() },
                     "FlipAngleInterpretation": "the sidecar's FlipAngle is the echo train's refocusing angle; the excitation is 90 degrees",
                     "RefocusingTimeMs": { "Value": rs.refocusing_time_ms.0, "Source": rs.refocusing_time_ms.1.as_str() },
-                    "ExcitationTimes": p.rows.iter().map(|r| r.t).collect::<Vec<f64>>(),
+                    "ExcitationTimes": excitation_times(p, out),
                     "ShotOrder": "s = interleaf * KzSegments + kz_segment, one RepetitionTimePreparation apart",
                     "VolumeDuration": r3.n_shots as f64 * tr0,
                     "Trajectory": {
@@ -330,7 +330,7 @@ mod writer {
                 "RefocusingFlipAngle": { "Value": rs.refocusing_flip_deg.0, "Source": rs.refocusing_flip_deg.1.as_str() },
                 "FlipAngleInterpretation": "the sidecar's FlipAngle is the echo train's refocusing angle; the excitation is 90 degrees",
                 "RefocusingTimeMs": { "Value": rs.refocusing_time_ms.0, "Source": rs.refocusing_time_ms.1.as_str() },
-                "ExcitationTimes": p.rows.iter().map(|r| r.t).collect::<Vec<f64>>(),
+                "ExcitationTimes": excitation_times(p, out),
                 "ShotOrder": "s = ky_segment * KzSegments + kz_segment, one RepetitionTimePreparation apart",
                 "VolumeDuration": r3.n_shots as f64 * tr0,
                 "SeedSalt": format!("{:#x}", mrsim_acq::kspace3d::SEED_SALT_3D),
@@ -594,7 +594,7 @@ mod writer {
                 ("PartialFourier", json!(out.acquisition.partial_fourier)),
                 ("ParallelReductionFactorInPlane", json!(out.acquisition.accel)),
                 ("MultibandAccelerationFactor", json!(p.mb)),
-                ("TotalAcquiredPairs", json!(p.total_acquired_pairs())),
+                ("TotalAcquiredPairs", json!(p.hadamard.as_ref().map_or(p.total_acquired_pairs(), |h| h.cycles.len()))),
             ];
             if let Some(ir) = &p.ir {
                 // Standard fields; a simasl-legal negative excitation angle is written as its
@@ -640,6 +640,9 @@ mod writer {
                 side.insert(k.to_string(), v);
             }
             let mut sim = simulation_block(p, out);
+            if let Some(hb) = hadamard_block(p, out) {
+                sim["Hadamard"] = hb;
+            }
             sim["InputValuesReplaced"] = Value::Object(replaced);
             if let Some(me) = multi_echo_block(p, out, e) {
                 sim["MultiEcho"] = me;
@@ -772,7 +775,12 @@ mod writer {
         let moved = out.ground_truth.delta_m_static.is_some();
         write_json(&PathBuf::from(format!("{gt_prefix}_desc-deltam_gt.json")), &json!({
             "Units": "arbitrary (same as M0map)",
-            "Description": if moved {
+            "Description": if out.hadamard.is_some() {
+                "the ideal sub-bolus truth (P6 part A): each decoded volume's delta_m of its sub-bolus from the \
+                 kinetics alone at the cycle's readout, without physiological or suppression factors, static (a \
+                 decoded volume has no single pose), box-averaged; zero for m0scan rows. The raw volumes' truth is \
+                 under sourcedata"
+            } else if moved {
                 "+delta_m at each label/deltam row's own timing, moved by the row's pose on the simulation grid \
                  and box-averaged (no shot events, no suppression factor); zero for other rows"
             } else {
@@ -811,6 +819,40 @@ mod writer {
         if let Some(a) = &gt.aatt {
             wgt("aATT", a, "s", "volume-weighted mean over phantom voxels with aBV > 0; 0 where none")?;
         }
+        if out.hadamard.is_none() {
+            write_volume_tables(&gt_prefix, p, out)?;
+        }
+        // `phantom::load` already bounds labels to 0..=32767, so this cannot truncate; the
+        // conversion is checked anyway rather than cast.
+        let dseg: Vec<i16> = gt.dseg.iter().map(|l| i16::try_from(*l).map_err(|_| format!("dseg label {l} does not fit int16")))
+            .collect::<Result<_, _>>()?;
+        write_3d_i16(&PathBuf::from(format!("{gt_prefix}_desc-dseg_gt.nii.gz")), out.acq_grid.dims, &dseg, &out.acq_grid)
+            .map_err(|e| e.to_string())?;
+        write_json(&PathBuf::from(format!("{gt_prefix}_desc-dseg_gt.json")), &json!({
+            "Units": "label indices", "Resampling": "majority vote by overlap, ties to the lower label",
+            "LabelMap": out.labels.iter().map(|(l, n)| (l.to_string(), json!(n))).collect::<Map<String, Value>>(),
+        }))?;
+        if out.mode == T2Mode::Voxel {
+            for (desc, data) in [("acqT2map", &gt.acq_t2_ms), ("acqT2primemap", &gt.acq_t2p_ms), ("acqT1map", &gt.acq_t1_ms)] {
+                if let Some(d) = data {
+                    write_3d(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.nii.gz")), out.sim_grid.dims, d, &out.sim_grid)
+                        .map_err(|e| e.to_string())?;
+                    write_json(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.json")), &json!({
+                        "Units": "ms", "Grid": "simulation",
+                        "Resampling": "M0-weighted mean of rates, inverted; INFINITY stored as inf",
+                    }))?;
+                }
+            }
+        }
+        if let Some(h) = &out.hadamard {
+            write_hadamard_sourcedata(root, names, p, out, h)?;
+        }
+        Ok(())
+    }
+
+    /// The physiology and motion tables, one line per volume (and slice or shot): the series'
+    /// own, or under Hadamard the raw volumes', which sourcedata carries.
+    fn write_volume_tables(gt_prefix: &str, p: &Protocol, out: &SeriesOutput) -> Result<(), String> {
         if let Some(lines) = &out.physio {
             // 2D: per (volume, slice), unchanged; 3D: per (volume, shot), at each shot's excitation
             // (P5 part D), a branch of its own so the 2D file keeps its bytes
@@ -847,28 +889,191 @@ mod writer {
             }
             std::fs::write(format!("{gt_prefix}_desc-motionEvents_gt.tsv"), ev).map_err(|e| e.to_string())?;
         }
-        // `phantom::load` already bounds labels to 0..=32767, so this cannot truncate; the
-        // conversion is checked anyway rather than cast.
-        let dseg: Vec<i16> = gt.dseg.iter().map(|l| i16::try_from(*l).map_err(|_| format!("dseg label {l} does not fit int16")))
-            .collect::<Result<_, _>>()?;
-        write_3d_i16(&PathBuf::from(format!("{gt_prefix}_desc-dseg_gt.nii.gz")), out.acq_grid.dims, &dseg, &out.acq_grid)
+        Ok(())
+    }
+
+    /// The excitation times the 3D readout block records: the rows', or the raw volumes' under
+    /// Hadamard (a decoded row's delay runs from its own sub-bolus).
+    fn excitation_times(p: &Protocol, out: &SeriesOutput) -> Vec<f64> {
+        match &out.hadamard {
+            Some(h) => h.schedule.raw_rows.iter().map(|r| r.t).collect(),
+            None => p.rows.iter().map(|r| r.t).collect(),
+        }
+    }
+
+    /// The labeled sub-boli of an encoded raw volume (1-based), or none.
+    fn labeled(order: usize, row: Option<usize>) -> Vec<usize> {
+        match row {
+            Some(i) => crate::hadamard::weights(&crate::hadamard::encoding(order)[i]).iter().enumerate()
+                .filter(|(_, w)| **w == 1).map(|(j, _)| j + 1).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `AslscanSimulation.Hadamard` (P6 part A, "Outputs").
+    fn hadamard_block(p: &Protocol, out: &SeriesOutput) -> Option<Value> {
+        let (h, hs) = (p.hadamard.as_ref()?, out.hadamard.as_ref()?);
+        let sched = &hs.schedule;
+        let leakage = match &hs.leakage {
+            Some(l) => json!(l.iter().enumerate().map(|(c, x)| json!({
+                "Cycle": c + 1,
+                "ReferenceNorm": x.reference_norm,
+                "Absolute": x.per_subbolus.iter().map(|q| q.0).collect::<Vec<f64>>(),
+                "Normalized": x.per_subbolus.iter().map(|q| q.1).collect::<Vec<f64>>(),
+            })).collect::<Vec<_>>()),
+            None => json!("not computed (hadamard.report_leakage = false)"),
+        };
+        let f = hs.flags;
+        Some(json!({
+            "Order": h.order,
+            "Matrix": crate::hadamard::encoding(h.order),
+            "MatrixNote": "Sylvester, the all-ones first column removed; row i is raw volume i of a cycle, column j \
+                           sub-bolus j + 1 (labeled first); -1 labels the sub-bolus, +1 leaves it as control",
+            "SubBoli": h.spans.iter().map(|(a, b)| [*a, *b]).collect::<Vec<_>>(),
+            "LabelingDuration": h.tau_tot,
+            "PostLabelingDelay": h.pld,
+            "ReportLeakage": resolved_bool(h.report_leakage),
+            "Cycles": h.cycles.iter().map(|c| c.rows.clone()).collect::<Vec<_>>(),
+            "Outputs": sched.outputs.iter().map(|o| match *o {
+                crate::schedule::Output::Raw(r) => json!({ "RawVolume": r }),
+                crate::schedule::Output::Decoded { cycle, subbolus } => json!({ "Cycle": cycle + 1, "SubBolus": subbolus + 1 }),
+            }).collect::<Vec<_>>(),
+            "RawVolumes": sched.raws.iter().map(|r| json!({
+                "Cycle": r.cycle.map(|c| c + 1), "EncodingRow": r.encoding_row,
+                "LabeledSubBoli": labeled(h.order, r.encoding_row),
+                "FirstPreparation": r.prep, "Preparations": r.n_preps,
+            })).collect::<Vec<_>>(),
+            "Counts": { "Preparations": sched.preps.len(), "RawVolumes": sched.raws.len(),
+                        "Decoded": sched.outputs.iter().filter(|o| matches!(o, crate::schedule::Output::Decoded { .. })).count() },
+            "DecodingRule": "D_j = (2/H) sum_i h_ij S_i over each cycle's raw volumes S_i, on the complex images (from \
+                             the acquisition's float32 magnitude and phase) in float64; the label subtracts, so D_j has \
+                             the sign of a deltam volume; m0scan rows are raw volumes passed through",
+            "NoiseScale": 2.0 / (h.order as f64).sqrt(),
+            "NoiseScaleNote": "the decoded noise SD is the raw SD times 2/sqrt(H) (measured, not imposed)",
+            "TissueLeakage": leakage,
+            "TissueLeakageDefinition": "L_j: the decoded tissue-only raw volumes (the tissue kept apart before any \
+                                        label is added, so the extravascular label is not counted), acquired with noise, \
+                                        spikes and GRAPPA off; ||L_j||_2 over the brain mask, absolute and over the norm of \
+                                        the cycle's unsuppressed tissue steady state acquired in the same call",
+            "NonExact": { "Grappa": f.grappa, "Spikes": f.spikes, "Motion": f.motion, "ShotFactors": f.shot_factors,
+                          "Transients": f.transients, "Physiology": f.physiology },
+            "Readout": match &out.readout {
+                Some(r3) if r3.spiral.is_some() => "3D spiral",
+                Some(_) => "3D GRASE",
+                None => "2D EPI",
+            },
+            "TotalAcquiredPairsConvention": "the number of encoding cycles: each cycle measures every sub-bolus once, \
+                                             the role a control-label pair plays for one PLD; a Hadamard acquisition has \
+                                             no control-label pairs",
+            "GroundTruth": "this dataset: the ideal sub-bolus truth per decoded volume (static); sourcedata: the raw \
+                            volumes' encoded truth and desc-preparations_gt.tsv (the factors applied per preparation)",
+            "PerVolumeRecords": "the per-volume entries of this block's siblings (background-suppression label factors, \
+                                 crushing survival, motion, physiology) index the raw volumes listed in RawVolumes",
+        }))
+    }
+
+    fn resolved_bool(v: (bool, crate::protocol::Source)) -> Value {
+        json!({ "Value": v.0, "Source": v.1.as_str() })
+    }
+
+    /// The raw series of a Hadamard protocol under `sourcedata/sub-X/[ses-Y/]perf/` (P6 part A,
+    /// "Outputs"): the raw volumes per echo, their sidecar, one row per raw volume, and the raw
+    /// truth with the per-preparation factor table.
+    fn write_hadamard_sourcedata(root: &Path, names: &Names, p: &Protocol, out: &SeriesOutput,
+                                 h: &crate::series::HadamardSeries) -> Result<(), String> {
+        let spec = p.hadamard.as_ref().ok_or("a Hadamard series without [hadamard]")?;
+        let perf = root.join("sourcedata").join(names.perf_dir());
+        let gt_dir = perf.join("ground-truth");
+        std::fs::create_dir_all(&gt_dir).map_err(|e| format!("{}: {e}", gt_dir.display()))?;
+        let prefix_s = perf.join(names.stem()).to_string_lossy().to_string();
+        let sched = &h.schedule;
+        let n_echo = p.echo_times_s.len();
+        for e in 0..n_echo {
+            let echo_tag = if n_echo > 1 { format!("_echo-{}", e + 1) } else { String::new() };
+            let prefix_e = format!("{prefix_s}{echo_tag}");
+            let (mag, phase) = if e == 0 { (&h.raw_mag, &h.raw_phase) } else { (&h.raw_more_echoes[e - 1].0, &h.raw_more_echoes[e - 1].1) };
+            let info = SidecarInfo {
+                manufacturer: "aslscan".to_string(),
+                phase_encoding_direction: p.phase_encoding_direction.clone(),
+                total_readout_time: p.total_readout_time_s,
+                echo_time: p.echo_times_s[e],
+                partial_fourier: out.acquisition.partial_fourier,
+                accel: out.acquisition.accel,
+                mb: p.mb,
+                repetition_time_s: sched.raw_rows.iter().find(|r| r.kind != crate::rows::RowKind::M0scan).map(|r| r.tr),
+                b0_field_source: None,
+            };
+            write_complex_4d(&prefix_e, "asl", out.acq_grid.dims, h.n_raw, mag, phase, &out.acq_grid, &info)
+                .map_err(|e| e.to_string())?;
+            let side = json!({
+                "Description": "the raw (encoded) series of a Hadamard time-encoded acquisition, before decoding; \
+                                the dataset's decoded series is the main one",
+                "EchoTime": p.echo_times_s[e],
+                "RepetitionTimePreparation": sched.raw_rows.iter().map(|r| r.tr).collect::<Vec<f64>>(),
+                "RawVolumes": h.n_raw,
+                "RawVolumeTable": format!("{}_rawvolumes.tsv", names.stem()),
+                "AslscanSimulation": { "Hadamard": hadamard_block(p, out) },
+            });
+            write_json(&PathBuf::from(format!("{prefix_e}_part-mag_asl.json")), &side)?;
+            let mut ph_side = side.clone();
+            ph_side["Units"] = json!("rad");
+            write_json(&PathBuf::from(format!("{prefix_e}_part-phase_asl.json")), &ph_side)?;
+        }
+        let mut tsv = String::from("raw_volume	kind	cycle	encoding_row	labeled_subboli	first_preparation	preparations
+");
+        for (r, rv) in sched.raws.iter().enumerate() {
+            tsv.push_str(&format!("{r}	{}	{}	{}	{}	{}	{}
+",
+                if rv.encoding_row.is_some() { "encoded" } else { sched.raw_rows[r].kind.as_str() },
+                rv.cycle.map_or("n/a".to_string(), |c| (c + 1).to_string()),
+                rv.encoding_row.map_or("n/a".to_string(), |i| i.to_string()),
+                labeled(spec.order, rv.encoding_row).iter().map(|j| j.to_string()).collect::<Vec<_>>().join(","),
+                rv.prep, rv.n_preps));
+        }
+        std::fs::write(format!("{prefix_s}_rawvolumes.tsv"), tsv).map_err(|e| e.to_string())?;
+
+        // the raw truth
+        let gt_prefix = gt_dir.join(names.stem()).to_string_lossy().to_string();
+        let mean = "volume-weighted mean over the phantom voxels each acquisition voxel overlaps";
+        let moved = h.raw_delta_m_static.is_some();
+        write_4d(&PathBuf::from(format!("{gt_prefix}_desc-deltam_gt.nii.gz")), out.acq_grid.dims, h.n_raw, &h.raw_delta_m, &out.acq_grid)
             .map_err(|e| e.to_string())?;
-        write_json(&PathBuf::from(format!("{gt_prefix}_desc-dseg_gt.json")), &json!({
-            "Units": "label indices", "Resampling": "majority vote by overlap, ties to the lower label",
-            "LabelMap": out.labels.iter().map(|(l, n)| (l.to_string(), json!(n))).collect::<Map<String, Value>>(),
+        write_json(&PathBuf::from(format!("{gt_prefix}_desc-deltam_gt.json")), &json!({
+            "Units": "arbitrary (same as M0map)",
+            "Description": "+ the encoded kinetic sum of each raw volume's labeled sub-boli (no suppression or \
+                            physiological factor), today's conventions; zero for m0scan raw volumes",
+            "Frame": if out.readout.is_some() { "static (a 3D raw volume's shots have their own poses)" }
+                     else if moved { "moved by the raw volume's pose" } else { "static" },
+            "Resampling": mean,
         }))?;
-        if out.mode == T2Mode::Voxel {
-            for (desc, data) in [("acqT2map", &gt.acq_t2_ms), ("acqT2primemap", &gt.acq_t2p_ms), ("acqT1map", &gt.acq_t1_ms)] {
-                if let Some(d) = data {
-                    write_3d(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.nii.gz")), out.sim_grid.dims, d, &out.sim_grid)
-                        .map_err(|e| e.to_string())?;
-                    write_json(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.json")), &json!({
-                        "Units": "ms", "Grid": "simulation",
-                        "Resampling": "M0-weighted mean of rates, inverted; INFINITY stored as inf",
-                    }))?;
-                }
+        if let Some(gts) = &h.raw_delta_m_static {
+            write_4d(&PathBuf::from(format!("{gt_prefix}_desc-deltamStatic_gt.nii.gz")), out.acq_grid.dims, h.n_raw, gts, &out.acq_grid)
+                .map_err(|e| e.to_string())?;
+        }
+        for (desc, data) in [("deltamIntravascular", &h.raw_delta_m_iv), ("deltamSuppressed", &h.raw_delta_m_suppressed),
+                             ("deltamArterial", &h.raw_delta_m_arterial)] {
+            if let Some(d) = data {
+                write_4d(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.nii.gz")), out.acq_grid.dims, h.n_raw, d, &out.acq_grid)
+                    .map_err(|e| e.to_string())?;
+                write_json(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.json")), &json!({
+                    "Units": "arbitrary (same as M0map)", "Description": "per raw volume, the encoded sum of its labeled                      sub-boli's part (P4's definition per row)", "Resampling": mean,
+                }))?;
             }
         }
+        write_volume_tables(&gt_prefix, p, out)?;
+        let mut tsv = String::from(
+            "preparation	raw_volume	shot	encoding_row	labeled_subboli	start	labeling_window_start	             labeling_window_end	label_factor	tissue_factor	suppression_factor	shot_gain
+");
+        for (i, f) in h.prep_factors.iter().enumerate() {
+            tsv.push_str(&format!("{i}	{}	{}	{}	{}	{}	{}	{}	{}	{}	{}	{}
+", f.raw, f.shot,
+                f.encoding_row.map_or("n/a".to_string(), |r| r.to_string()),
+                labeled(spec.order, f.encoding_row).iter().map(|j| j.to_string()).collect::<Vec<_>>().join(","),
+                f.start_s, f.labeling_window[0], f.labeling_window[1], f.label,
+                if f.tissue.is_nan() { "per slice (desc-physio_gt.tsv)".to_string() } else { f.tissue.to_string() },
+                f.suppression.map_or("n/a".to_string(), |x| x.to_string()), f.shot_gain));
+        }
+        std::fs::write(format!("{gt_prefix}_desc-preparations_gt.tsv"), tsv).map_err(|e| e.to_string())?;
         Ok(())
     }
 
