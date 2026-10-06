@@ -18,8 +18,14 @@
 # enough to survive reconstruction and the f32 cast; never committed). It passes only if every run
 # succeeds AND at least one NIfTI differs in content.
 #
-# Needs work/phantom-3t, work/phantom-3t-z100 and work/phantom-3t-z97 (see tools/hrgt_to_bids.py:
-# z97 is --crop 0:197 0:233 46:143, which fits asl004's 24 slices of 4.05 mm).
+# Needs work/phantom-3t, work/phantom-3t-z100, work/phantom-3t-z97, work/phantom-3t-z120 and
+# work/phantom-3t-asl001 (see tools/hrgt_to_bids.py: z97 is --crop 0:197 0:233 46:143, which fits
+# asl004's 24 slices of 4.05 mm; z120 and asl001 are the P5 acceptance crops named in the
+# asl005_p5 and asl001_p5 overlays).
+#
+# A case may name a required feature as its seventh field (kspace): a build without it skips the
+# case, and the run checks the executed and skipped counts per build. Under --self-test every
+# executed case must show a NIfTI difference, not just one of them.
 # Exits nonzero on any difference (or, under --self-test, on no difference) or failed run.
 set -euo pipefail
 A_REV=${1:?usage: tools/regress_identity.sh <aslscan-rev> <mrsim-acq-rev> [--self-test]}
@@ -69,6 +75,10 @@ if [ "$SELF" = "--self-test" ]; then
   K=$NEWROOT/mrsim-acq/src/kspace.rs
   sed -i 's/amp\[i\] = acq\.signal_scale \* coil_sensitivity(/amp[i] = acq.signal_scale * 1.0001 * coil_sensitivity(/' "$K"
   grep -q 'acq.signal_scale \* 1.0001 \* coil_sensitivity(' "$K" || { echo "self-test patch did not apply"; exit 1; }
+  # the spiral forward (P5 part C) forms its own amplitude
+  S=$NEWROOT/mrsim-acq/src/spiral.rs
+  sed -i 's/s\.amp\[i\] = acq\.signal_scale \* coil_sensitivity(/s.amp[i] = acq.signal_scale * 1.0001 * coil_sensitivity(/' "$S"
+  grep -q 'acq.signal_scale \* 1.0001 \* coil_sensitivity(' "$S" || { echo "self-test patch did not apply to the spiral"; exit 1; }
 elif [ -n "$SELF" ]; then
   echo "unknown option $SELF"; exit 1
 fi
@@ -122,6 +132,27 @@ pasl_json() {
 }
 pasl_json '"BackgroundSuppression": true, "BackgroundSuppressionNumberPulses": 2, "BackgroundSuppressionPulseTime": [0.9, 1.5]' > $A/pasl-bs.json
 pasl_json '"BackgroundSuppression": false' > $A/pasl-plain.json
+# P5 cases. Gradient echo with an included M0 and suppression: 90 degrees is the closed-form branch
+# (the longitudinal state is not propagated), 35 degrees the propagation branch with mixed
+# preparations; the fixture itself (60 degrees, separate M0) as is. The m0scan row comes first and
+# every per-row array gains its 0 entry.
+ge_json() {
+  sed -e "s/\"FlipAngle\": 60/\"FlipAngle\": $1/" -e 's/"M0Type": "Separate"/"M0Type": "Included"/' \
+      -e 's/"PostLabelingDelay": \[1.8, 1.8, 1.0, 1.0\]/"PostLabelingDelay": [0.0, 1.8, 1.8, 1.0, 1.0]/' $P/p5_ge/asl.json
+}
+ge_json 90 > $A/p5-ge90.json
+ge_json 35 > $A/p5-ge35.json
+for f in $A/p5-ge90.json $A/p5-ge35.json; do
+  grep -q '"M0Type": "Included"' $f && grep -q '\[0.0, 1.8' $f && ! grep -q '"FlipAngle": 60' $f \
+    || { echo "p5_ge variant $f did not apply"; exit 1; }
+done
+sed '1a m0scan' $P/p5_ge/aslcontext.tsv > $A/p5-ge-m0.tsv
+# the included M0 takes no [m0] table
+sed '/^\[m0\]/,$d' $P/p5_ge/overlay.toml > $A/p5-ge-incl.toml
+# segmented GRASE with a shot event in every volume between its two shots
+{ cat $P/p5_grase/overlay.toml; printf '\n[motion.within_volume]\ndropout_rate = 1.0\nseverity = 0.3\njump_mm = [0.5, 0.0, 0.0]\njump_deg = [0.0, 0.0, 1.0]\n'; } > $A/p5-grase-seg.toml
+Z120=$HERE/work/phantom-3t-z120
+P001=$HERE/work/phantom-3t-asl001
 cases=(
   "pasl_cutoff|$P/pasl_cutoff/asl.json|$P/pasl_cutoff/aslcontext.tsv|$P/pasl_cutoff/overlay.toml|$FULL"
   "crop_pcasl|$P/crop_pcasl/asl.json|$P/crop_pcasl/aslcontext.tsv|$P/crop_pcasl/overlay.toml|$CROP"
@@ -142,9 +173,17 @@ cases=(
   "p4_macro_crush|$A/crop-crush.json|$A/crop-ctx.tsv|$A/crop-macro.toml|$CROP"
   "p4_macro_voxel|$A/crop-crush.json|$A/crop-ctx.tsv|$A/crop-macro.toml|$CROP|--t2-mode voxel"
   "p4_bolus|$A/crop-bs-early.json|$A/crop-ctx.tsv|$A/crop-bolus.toml|$CROP"
+  "p5_ge90|$A/p5-ge90.json|$A/p5-ge-m0.tsv|$A/p5-ge-incl.toml|$CROP"
+  "p5_ge35|$A/p5-ge35.json|$A/p5-ge-m0.tsv|$A/p5-ge-incl.toml|$CROP"
+  "p5_ge_m0sep|$P/p5_ge/asl.json|$P/p5_ge/aslcontext.tsv|$P/p5_ge/overlay.toml|$CROP"
+  "p5_grase_seg|$P/p5_grase/asl.json|$P/p5_grase/aslcontext.tsv|$A/p5-grase-seg.toml|$CROP"
+  "asl005_p5|$P/asl005/asl.json|$P/asl005/aslcontext.tsv|$P/asl005_p5/overlay.toml|$Z120"
+  "asl001_p5|$P/asl001/asl.json|$P/asl001/aslcontext.tsv|$P/asl001_p5/overlay.toml|$P001||kspace"
 )
+# executed cases per build (the rest are skipped for a missing feature)
+declare -A expect=([cli-kspace-par]=25 [cli]=24)
 
-fail=0; differed=0
+fail=0; undetected=0
 for feats in cli,kspace,par cli; do
   tag=${feats//,/-}
   OLD_T=$BASE/target-$tag
@@ -153,16 +192,21 @@ for feats in cli,kspace,par cli; do
   (cd "$NEWROOT/aslscan" && CARGO_TARGET_DIR="$NEW_T" cargo build -q --release --features $feats)
   OLD=$OLD_T/release/aslscan
   NEW=$NEW_T/release/aslscan
+  ran=0; skipped=0
   for c in "${cases[@]}"; do
-    IFS='|' read -r name json ctx ov ph extra <<< "$c"
+    IFS='|' read -r name json ctx ov ph extra need <<< "$c"
     name=$name.$tag
+    if [ -n "$need" ] && [[ ",$feats," != *",$need,"* ]]; then
+      echo "$name: skipped (needs $need)"; skipped=$((skipped+1)); continue
+    fi
+    ran=$((ran+1))
     for side in old new; do
       bin=$OLD; [ $side = new ] && bin=$NEW
       if ! $bin --asl-json $json --aslcontext $ctx --overlay $ov --phantom $ph $extra --out $OUT/$side-$name > $OUT/log-$side-$name.txt 2>&1; then
         echo "$name: $side run FAILED"; tail -2 $OUT/log-$side-$name.txt; fail=1; continue 2
       fi
     done
-    n=0; bad=0
+    n=0; bad=0; differed=0
     # the file list and the decompressions are checked for failure, not left inside process
     # substitutions, whose status set -e and pipefail never see (two unreadable gzips would
     # otherwise compare as two empty streams)
@@ -188,12 +232,18 @@ for feats in cli,kspace,par cli; do
     [ "$nnew" = "$n" ] || { echo "  file count $n vs $nnew"; bad=1; }
     echo "$name: $n files, $([ $bad = 0 ] && echo identical || echo DIFFERENT)"
     [ $bad = 0 ] || [ "$SELF" = "--self-test" ] || fail=1
+    if [ "$SELF" = "--self-test" ] && [ $differed = 0 ]; then
+      echo "  self-test FAILED for $name: the perturbed acquisition stage produced identical images"; undetected=1
+    fi
   done
+  echo "$tag: $ran executed, $skipped skipped"
+  [ "$ran" = "${expect[$tag]}" ] && [ $((ran+skipped)) = ${#cases[@]} ] \
+    || { echo "$tag: expected ${expect[$tag]} executed of ${#cases[@]}"; fail=1; }
 done
 if [ "$SELF" = "--self-test" ]; then
   [ $fail = 0 ] || { echo "self-test: a build or run failed, which is not a detected difference"; exit 1; }
-  [ $differed = 1 ] || { echo "self-test FAILED: the perturbed acquisition stage produced identical images"; exit 1; }
-  echo "self-test passed: the perturbation was detected"
+  [ $undetected = 0 ] || { echo "self-test FAILED: some cases did not detect the perturbation"; exit 1; }
+  echo "self-test passed: every executed case detected the perturbation"
   exit 0
 fi
 exit $fail
