@@ -520,7 +520,9 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
         let mut out = vec![vec![vec![0.0f32; nvox_sim]; k]; n];
         let m0scan: Vec<bool> = l.cycles.iter().map(|c| c.m0scan).collect();
         let n_labels = ph.labels.len();
-        let mut mz_mean = vec![vec![vec![0.0f64; n_labels]; nz]; n];
+        // per readout, slice and phantom label: the sum of Mz and the voxel count (pooled per group below)
+        let mut mz_sum = vec![vec![vec![0.0f64; n_labels]; nz]; n];
+        let mut mz_count = vec![vec![0usize; n_labels]; nz];
         for z in 0..nz {
             let cycles: Vec<LlCycle> = l.cycles.iter().enumerate().map(|(c, cy)| LlCycle {
                 tr: rows[cy.rows[0]].tr,
@@ -547,15 +549,11 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                     let mz = tissue_mz_ll_series(ph.m0[i] as f64, ph.t1[i] as f64, &cycles, &m0scan, None, false);
                     for (v, x) in mz.into_iter().flatten().enumerate() {
                         seq[v][pos * pslab + xy] = l.flip_deg[v].to_radians().sin() * x;
-                        mz_mean[v][z][c] += x;
+                        mz_sum[v][z][c] += x;
                     }
                 }
             }
-            for row_means in mz_mean.iter_mut() {
-                for (c, x) in row_means[z].iter_mut().enumerate() {
-                    *x /= counts[c].max(1) as f64;
-                }
-            }
+            mz_count[z] = counts;
             for v in 0..n {
                 for (c, m) in masks.iter().enumerate() {
                     let sl = r_sim.mean_slice(z, |i| if m[i] { seq[v][local(i)] } else { 0.0 });
@@ -574,7 +572,12 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                     let t_read = if cy.m0scan { off } else { rows[v].t + off };
                     ll_lines.push(LlLine {
                         cycle: c, readout: rd, group: g, time: first_prep(v).start_s + t_read, flip_deg: l.flip_deg[v],
-                        tissue_mz: (0..n_labels).map(|lab| zs.iter().map(|&z| mz_mean[v][z][lab]).sum::<f64>() / zs.len() as f64).collect(),
+                        // the group's mean: its slices' sums over their counts, pooled (a label absent
+                        // from a slice adds nothing to either)
+                        tissue_mz: (0..n_labels).map(|lab| {
+                            let count: usize = zs.iter().map(|&z| mz_count[z][lab]).sum();
+                            if count == 0 { 0.0 } else { zs.iter().map(|&z| mz_sum[v][z][lab]).sum::<f64>() / count as f64 }
+                        }).collect(),
                     });
                 }
             }
@@ -2054,5 +2057,55 @@ mod tests {
         assert_eq!(e2, single);
         assert!(e2[0].per_subbolus[0].0 > 0.0);
         assert_ne!(h.leakage.as_ref().unwrap()[0].per_subbolus[0].0, e2[0].per_subbolus[0].0);
+    }
+
+    /// The Look-Locker table's group means pool the group's slices (sums over counts): two slices
+    /// excited together, each label's mean over every one of its phantom voxels in both slabs,
+    /// from an independent call of the timeline per voxel.
+    #[test]
+    fn look_locker_group_means_pool_the_slices() {
+        use crate::longitudinal::{tissue_mz_ll_sequence, LlCycle};
+        use crate::resample::{axis_aligned_voxels, corner_offset};
+        let ph = crop();
+        let pld: Vec<f64> = (0..4).map(|n| 0.6 + 0.3 * n as f64).collect();
+        let mut s = sidecar(vec![1.0; 4], pld, vec![4.5; 4], "Absent", true);
+        s["LookLocker"] = json!(true);
+        s["FlipAngle"] = json!(35);
+        s["SliceTiming"] = json!([0.0, 0.0]);
+        let p = parse_echoes(&[s], "volume_type\ncontrol\ncontrol\ncontrol\ncontrol\n", Some(&overlay("", true)), None).unwrap();
+        let sched = Schedule::new(&p);
+        let b = build(&p, &ph, T2Mode::Class, RowOverride::None, p.echo_times_s[0], &sched).unwrap();
+        assert_eq!(b.ll_lines.len(), 4, "one group of two slices, four readouts");
+        let o = p.acq.oversample;
+        let dv = p.voxel_size_mm;
+        let r_sim = Resampler::with_offset(ph.grid.dims, axis_aligned_voxels(&ph.grid).unwrap(), b.sim_grid.dims,
+                                           [dv[0] / o as f64, dv[1] / o as f64, dv[2]], corner_offset(&ph.grid, &b.acq_grid).unwrap());
+        let [pnx, pny, _] = ph.grid.dims;
+        // the resolved flips (the test overlay's excitation_flip_angle, 60, over the sidecar's)
+        let flips = p.look_locker.as_ref().unwrap().flip_deg.clone();
+        assert_eq!(flips, vec![60.0; 4]);
+        let cyc = LlCycle { tr: 4.5, s: None, t_read: p.rows.iter().map(|r| r.t).collect(), flip_deg: flips };
+        for (lab, (l, _)) in ph.labels.iter().enumerate() {
+            let (mut sum, mut count) = (vec![0.0f64; 4], 0usize);
+            // the slabs of the two slices, each voxel counted once per slab it belongs to (as the series does)
+            for z in 0..b.sim_grid.dims[2] {
+                for &(zs, _) in r_sim.z_slab(z) {
+                    for xy in 0..pnx * pny {
+                        let i = zs * pnx * pny + xy;
+                        if ph.dseg[i] == *l {
+                            let mz = tissue_mz_ll_sequence(ph.m0[i] as f64, ph.t1[i] as f64, std::slice::from_ref(&cyc)).remove(0);
+                            for (n, x) in mz.iter().enumerate() {
+                                sum[n] += x;
+                            }
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            for (n, line) in b.ll_lines.iter().enumerate() {
+                let want = sum[n] / count as f64;
+                assert!((line.tissue_mz[lab] - want).abs() <= 1e-9 * want.abs(), "label {l} readout {n}: {} vs {want}", line.tissue_mz[lab]);
+            }
+        }
     }
 }

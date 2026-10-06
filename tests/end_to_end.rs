@@ -1863,3 +1863,57 @@ fn review_fixes_end_to_end() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Follow-up review: the compat image bound is checked before anything is built (a phantom with a
+/// fieldmap, which the build refuses under compat, still gets the bound's error); the legacy
+/// Look-Locker sidecar says which truths it writes, and writes none of the others; a constant
+/// FlipAngle array with an included M0 between cycles takes the generalized timeline numerically.
+#[test]
+fn follow_up_review_fixes() {
+    let sidecars: Vec<Value> = [0.015, 0.030].iter().map(|te| json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
+        "EchoTime": te, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.0], "PhaseEncodingDirection": "j-",
+        "TotalReadoutTime": 0.012
+    })).collect();
+    let ov: Overlay = toml::from_str("[compat]\nasldro = true\n[multi_te]\nmax_image_memory_gib = 1e-9\n").unwrap();
+    let p = aslscan::protocol::parse_echoes(&sidecars, "volume_type\ncontrol\nlabel\n", Some(&ov), crop().params.as_ref()).unwrap();
+    let mut ph = crop();
+    ph.fieldmap = Some(vec![0.0; ph.dseg.len()]);
+    let e = simulate_with(&p, &ph, T2Mode::Auto, &phase(), RowOverride::None).unwrap_err();
+    assert!(e.contains("max_image_memory_gib") && !e.contains("fieldmap"), "{e}");
+
+    // the legacy Look-Locker sidecar and files, and the generalized one's
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-followup-{}", std::process::id()));
+    for (m, legacy) in [(1usize, true), (4, false)] {
+        let p = look_locker(&["control", "label"], m, 35.0, 4.5, "");
+        let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+        let side: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("sub-01/perf/sub-01_part-mag_asl.json")).unwrap()).unwrap();
+        let gt = side["AslscanSimulation"]["LookLocker"]["GroundTruth"].as_str().unwrap().to_string();
+        let files: Vec<String> = std::fs::read_dir(dir.join("sub-01/perf/ground-truth")).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        let extra = files.iter().any(|f| f.contains("deltamRead") || f.contains("lookLocker"));
+        assert_eq!((gt.contains("legacy dispatch writes no"), extra), (legacy, !legacy), "m {m}: {gt} {files:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // one readout per cycle, an m0scan between: the scalar takes P5's M0 convention, the array the
+    // generalized one, so the images differ
+    let run = |flip: Value| {
+        let s = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.0, "PostLabelingDelay": [0.6, 0.0, 0.6],
+            "BackgroundSuppression": false, "M0Type": "Included", "RepetitionTimePreparation": 4.5, "LookLocker": true,
+            "EchoTime": 0.012, "FlipAngle": flip, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+            "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05], "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.012
+        });
+        let ov: Overlay = toml::from_str("seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n[signal]\nacq_contrast = \"ge\"\n").unwrap();
+        let p = parse(&s, "volume_type\ncontrol\nm0scan\nlabel\n", Some(&ov), crop().params.as_ref()).unwrap();
+        simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap()
+    };
+    let (sc, ar) = (run(json!(35)), run(json!([35, 35, 35])));
+    assert!(sc.look_locker.as_ref().unwrap().legacy_dispatch && !ar.look_locker.as_ref().unwrap().legacy_dispatch);
+    assert_ne!(bits(&sc.mag), bits(&ar.mag));
+}
