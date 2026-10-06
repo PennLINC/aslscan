@@ -35,6 +35,8 @@ pub mod crushing;
 pub mod bolus;
 /// Physiological noise: cardiac and respiratory phase, the drift, the factors (P4, part E).
 pub mod physio;
+/// Hadamard time-encoded labeling: Sylvester matrices, weights, decoding (P6 part A), pure std.
+pub mod hadamard;
 /// Box-overlap averaging between the phantom, acquisition and simulation grids.
 pub mod resample;
 /// The volume list: `Row` and `RowKind`, pure std.
