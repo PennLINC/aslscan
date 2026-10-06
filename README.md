@@ -5,9 +5,8 @@ and a digital brain phantom. It produces a BIDS dataset that looks like real sca
 along with the ground-truth maps used to create it. Because the true perfusion values are known
 exactly, the simulated data can be used to test and compare ASL processing pipelines.
 
-aslscan is at an early stage (version 0.0.0). The scope described below is deliberately narrow,
-and aslscan reports an error when a protocol asks for something it does not model. It does not
-silently ignore those requests.
+aslscan is at an early stage (version 0.0.0). It reports an error when a protocol asks for
+something it does not model, and never silently ignores the request.
 
 ## What it does
 
@@ -18,35 +17,58 @@ difference between them is proportional to perfusion.
 aslscan simulates this in three stages.
 
 1. **Kinetics.** For each phantom voxel, the Buxton general kinetic model gives the size of the
-   label-control difference at each image's timing. The inputs are the phantom's perfusion and
-   arrival-time maps and the protocol's labeling duration and post-labeling delay.
-2. **Signal.** The static tissue signal comes from each voxel's M0 and T1 values and the
-   repetition time. The labeled blood signal is carried separately so that it can relax with
-   its own T2.
-3. **Acquisition.** The images pass through a model of a 2D spin-echo echo-planar (EPI) readout,
-   provided by the companion library [mrsim-acq](https://github.com/PennLINC/mrsim-acq). This
-   step can add distortion from a B0 fieldmap, signal decay during the readout, Gibbs ringing,
-   partial Fourier, multiple receive coils, parallel imaging, ghosting, spikes, and noise.
+   label-control difference at each image's timing. It uses the phantom's perfusion and
+   arrival-time maps and the protocol's labeling duration and post-labeling delay. Optional
+   extensions add the following:
+   - water exchange between blood and tissue;
+   - a separate arterial (macrovascular) compartment, which vascular crushing can remove;
+   - the effect of background-suppression pulses on each part of the labeled bolus;
+   - cardiac, respiratory and drift fluctuations.
+2. **Signal.** The static tissue signal comes from each voxel's M0 and T1 values, the repetition
+   time and the contrast. The contrast can be spin echo, inversion recovery or gradient echo. Under
+   background suppression, aslscan follows the tissue magnetization through every pulse. The labeled
+   blood is carried in its own compartments so that it relaxes with its own T2.
+3. **Acquisition.** The images pass through a model of the scanner readout, provided by the
+   companion library [mrsim-acq](https://github.com/PennLINC/mrsim-acq). The readout can be 2D
+   echo-planar (EPI), 3D GRASE, or 3D stack-of-spirals. This step can add the following:
+   - distortion from a B0 fieldmap;
+   - signal decay during the readout;
+   - Gibbs ringing;
+   - partial Fourier;
+   - multiple receive coils and parallel imaging;
+   - ghosting and spikes;
+   - noise;
+   - head motion.
 
 Physics is evaluated at the phantom's resolution first and then averaged down to the scan
-resolution. Partial-volume effects at tissue boundaries are therefore handled correctly.
+resolution, so partial-volume effects at tissue boundaries are handled correctly.
 
 The design and its validation against ASLDRO, the Python ASL simulator used as the reference,
-are documented in
-[the design spec](https://github.com/PennLINC/mrsim-acq/blob/main/docs/specs/2026-09-21-mrsim-acq-aslscan-design.md).
+are documented in the [mrsim-acq specs](https://github.com/PennLINC/mrsim-acq/tree/main/docs/specs).
+The first spec covers the core. The later addenda cover ASLDRO compatibility (P2); motion,
+background suppression and inversion recovery (P3); the vascular and physiological extensions
+(P4); 3D readouts and gradient echo (P5); and Hadamard, Look-Locker and multi-echo (P6).
 
 ### Supported protocols
 
-| Supported | Not yet supported (reported as an error) |
+| Area | Supported |
 |---|---|
-| PCASL, CASL, and PASL labeling (PASL requires bolus cut-off, e.g. QUIPSS II/Q2TIPS) | Background suppression |
-| 2D multi-slice acquisitions, with slice timing applied to the delay | 3D readouts (GRASE, stack-of-spirals) |
-| Spin-echo contrast | Gradient-echo and inversion-recovery contrast |
-| Single or multiple post-labeling delays | Look-Locker, Hadamard, velocity-selective labeling |
-| `control`, `label`, `deltam`, and `m0scan` volumes | `cbf` volumes; multi-echo (differing echo times) |
-| M0 included in the series, as a separate scan, estimated, or absent | Vascular crushing; head motion |
+| Labeling | PCASL, CASL, PASL (with bolus cut-off, e.g. QUIPSS II/Q2TIPS); Hadamard time-encoded (P)CASL |
+| Delays | Single or multiple post-labeling delays; Look-Locker readouts (several per labeling, 2D) |
+| Readout | 2D multi-slice EPI (with multiband), 3D GRASE, 3D stack-of-spirals |
+| Contrast | Spin echo, inversion recovery, gradient echo |
+| Echoes | One, or several echo times (2D EPI; the BIDS `echo-N` layout) |
+| Background suppression | Pulses at any times; a global-bolus model or a per-parcel bolus-position model |
+| Volumes | `control`, `label`, `deltam`, `m0scan`; M0 included, separate, estimated, or absent |
+| Vascular | Water exchange, an arterial compartment, vascular crushing |
+| Noise and motion | Thermal noise, physiological fluctuations, rigid head motion, within-volume (shot) motion |
 
-Phase encoding must lie along the second image axis (`j` or `j-`).
+Not supported, each reported as an error:
+- velocity-selective labeling, which has no BIDS labeling type yet;
+- Look-Locker or several echo times with 3D readouts;
+- Look-Locker combined with Hadamard or with several echo times;
+- `cbf` volumes;
+- phase encoding along any axis other than the second (`j` or `j-`).
 
 ## Installation
 
@@ -72,9 +94,9 @@ for Linux (WSL).
    ```
 
    The program is written to `target/release/aslscan`. The three features enable the
-   command-line interface (`cli`), the faster FFT-based acquisition code (`kspace`), and
-   multi-threading (`par`). You can also run `cargo install --path . --features cli,kspace,par`
-   to put `aslscan` on your `PATH`.
+   command-line interface (`cli`), the faster FFT-based acquisition code (`kspace`, required for
+   spiral readouts), and multi-threading (`par`). You can also run
+   `cargo install --path . --features cli,kspace,par` to put `aslscan` on your `PATH`.
 
 ## Quick start
 
@@ -88,6 +110,19 @@ short PCASL series on them and runs in well under a second:
 The cropped phantom is only 24 x 24 x 6 mm and is intended for testing. For realistic data, use a
 full-brain phantom (see [Making a phantom](#making-a-phantom)).
 
+Every directory under `tests/fixtures/protocols/` is a working example; `SOURCES.md` there
+describes each one:
+
+| Fixture | Shows |
+|---|---|
+| `crop_pcasl`, `pcasl_single`, `pcasl_multipld`, `pasl_cutoff` | Basic PCASL and PASL, single and multiple delays |
+| `p4_all` | Exchange, the arterial compartment, crushing, bolus-position suppression, physiology |
+| `p5_ge`, `p5_grase` | Gradient echo with suppression; a small 3D GRASE protocol |
+| `asl001`-`asl005` (with the `_p5` overlays) | Real BIDS examples, including 3D spiral (asl001) and GRASE (asl005) |
+| `p6_multite`, `p6_multite_se` | Three echo times (one sidecar per echo) |
+| `p6_hadamard`, `p6_hadamard_grase`, `p6_hadamard_multite` | Hadamard-encoded PCASL in 2D, in 3D, and with three echoes |
+| `p6_ll` | Look-Locker PASL, twelve readouts per labeling |
+
 ## Usage
 
 ```
@@ -96,7 +131,7 @@ aslscan --asl-json <JSON> --aslcontext <TSV> --phantom <DIR> --out <DIR> [OPTION
 
 | Option | Meaning |
 |---|---|
-| `--asl-json` | BIDS ASL sidecar (`*_asl.json`) describing the scan protocol. |
+| `--asl-json` | BIDS ASL sidecar (`*_asl.json`) describing the scan protocol. Repeat it once per echo, in echo order, for a multi-echo series. |
 | `--aslcontext` | BIDS `*_aslcontext.tsv` listing the volume types in order. One output volume is produced per row. |
 | `--phantom` | Directory containing the phantom maps. |
 | `--out`, `-o` | Directory to write the BIDS dataset to. |
@@ -104,6 +139,7 @@ aslscan --asl-json <JSON> --aslcontext <TSV> --phantom <DIR> --out <DIR> [OPTION
 | `--t2-mode` | `auto` (default), `class`, or `voxel`. Controls how T2 and T2* are represented; see below. |
 | `--sub`, `--ses` | Subject and session labels for the output file names. The subject defaults to `01`. |
 | `--seed` | Random seed for noise and other random effects. Overrides the overlay's seed. |
+| `--compat-asldro` | Restrict the simulation to what ASLDRO can express, for direct comparison with it (see below). |
 
 Run `aslscan --help` for the full list.
 
@@ -111,27 +147,30 @@ Run `aslscan --help` for the full list.
 
 The protocol is read from a standard BIDS ASL sidecar and `aslcontext.tsv`, as found in a real
 BIDS dataset. In practice, you can take these two files from a dataset whose acquisition you
-want to reproduce. aslscan uses the labeling type, labeling duration, post-labeling delay,
-bolus cut-off settings, M0 type, repetition time, echo time, total readout time, voxel size,
-slice timing, and phase-encoding direction.
+want to reproduce. aslscan reads, among others:
+- labeling: type, duration, post-labeling delay, bolus cut-off, M0 type;
+- timing: repetition time, echo time, total readout time, slice timing;
+- geometry: voxel size, phase-encoding direction, flip angle;
+- background suppression and its pulse times;
+- vascular crushing and its VENC;
+- for 3D readouts, `PulseSequenceType` and `NumberShots`.
 
-The following BIDS fields are required:
-
-- `BackgroundSuppression`, which must be `false`
-- `MRAcquisitionType: "2D"`, along with `SliceTiming`
-- `PhaseEncodingDirection` and `TotalReadoutTime`
-
-Many public datasets use background suppression and will be rejected for that reason. The
-protocols under `tests/fixtures/protocols/` (`pcasl_single`, `pcasl_multipld`, `pasl_cutoff`,
-`crop_pcasl`) are complete working examples.
+What each acquisition type needs:
+- **2D:** `MRAcquisitionType: "2D"`, `SliceTiming`, `PhaseEncodingDirection` and
+  `TotalReadoutTime`.
+- **3D:** `MRAcquisitionType: "3D"` with `PulseSequenceType` naming GRASE or spiral. For details
+  that BIDS does not carry (segmentation, spiral interleaves and readout time), use the overlay's
+  `[readout]` table.
 
 ### Overlay file
 
 Some values needed for simulation are not part of BIDS, such as the blood-brain partition
 coefficient, the number of receive coils, and the noise level. These can be set in an optional
-TOML file. All keys are optional. Values are taken from the overlay first, then from the BIDS
-sidecar or the phantom, and then from the defaults below. The output sidecar records the value
-used for each setting and where it came from.
+TOML file. All keys are optional unless a feature requires them. Values are taken from the
+overlay first, then from the BIDS sidecar or the phantom, and then from the defaults. The output
+sidecar records the value used for each setting and where it came from. An unrecognized key is an
+error, and so is a key belonging to a feature that is off. Either way, a mistake is reported rather
+than ignored.
 
 ```toml
 seed = 20260923                # random seed
@@ -140,10 +179,15 @@ seed = 20260923                # random seed
 label_efficiency = 0.85        # default 0.85 (PCASL/CASL), 0.98 (PASL); BIDS LabelingEfficiency is used if present
 lambda_blood_brain = 0.9       # ml/g; default 0.9
 t1_arterial_blood = 1.65       # s; default 1.65 at 3 T, 1.35 at 1.5 T
+exchange_time = 0.5            # s; turns on blood-to-tissue water exchange (off by default)
 
 [signal]
-acq_contrast = "se"            # only "se" (spin echo) is supported
+acq_contrast = "se"            # "se" (spin echo, default), "ir" (inversion recovery), "ge" (gradient echo)
 t2_blood = 0.165               # s; default 0.165 at 3 T, 0.290 at 1.5 T
+t2_arterial = 0.165            # s; the arterial compartment's T2 (default: the blood T2)
+inversion_time = 1.0           # s; "ir" only (default: sidecar InversionTime, else 1.0)
+excitation_flip_angle = 60.0   # degrees; "ir" and "ge" (default: sidecar FlipAngle, else 90)
+inversion_flip_angle = 180.0   # degrees; "ir" only
 
 [acquisition]
 oversample = 2                 # in-plane simulation resolution relative to the scan (default 2)
@@ -166,10 +210,133 @@ eddy_tau = 70.0                # ms
 
 [m0]
 repetition_time = 8.0          # s; required when M0Type is "Separate"
+flip_angle = 30.0              # degrees; a Look-Locker series' separate M0 (see below)
 ```
 
-Note that **noise is off by default**. Set `noise_variance` to add it. An unrecognized key is an
-error, so a misspelled key is reported rather than ignored.
+Note that **noise is off by default**. Set `noise_variance` to add it.
+
+The remaining tables switch on optional features.
+
+**Background suppression** (with `BackgroundSuppression: true` in the sidecar):
+
+```toml
+[background_suppression]
+inversion_efficiency = 0.95    # fraction of magnetization each pulse inverts (default 0.95)
+presaturation = false          # a saturation pulse at labeling start
+pulse_times_per_pld = [[1.42], [1.92]]  # multi-delay series: one pulse list per delay
+model = "global-bolus"         # or "bolus-position": each part of the bolus sees only the pulses after it
+pulse_region = "slab"          # "global" or "slab"; bolus-position only
+slab_entry_time = 0.3          # s, or "arrival"; with "slab"
+```
+
+**Motion:**
+
+```toml
+[motion]
+mode = "random"                # "off", "random", "linear", or "trajectory"
+trans_mm = [2.0, 2.0, 1.0]     # random/linear amplitudes
+rot_deg = [1.0, 1.0, 2.0]
+volumes = [5, 20, 40]          # volumes affected (default all)
+trajectory = "motion.tsv"      # "trajectory" mode: trans_x/y/z (mm), rot_x/y/z (radians), one row per volume
+
+[motion.within_volume]         # multiband or segmented-3D shot events
+dropout_rate = 0.1
+severity = 0.5
+jump_mm = [0.5, 0.0, 0.0]
+jump_deg = [0.0, 0.0, 1.0]
+```
+
+**Vascular and physiological extensions:**
+
+```toml
+[macrovascular]                # an arterial compartment; per label, or the phantom's abv/aatt maps
+arterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }
+arterial_transit_time = { grey_matter = 1.5, white_matter = 1.7, csf = 0.0 }
+
+[vascular_crushing]            # with VascularCrushing: true in the sidecar
+arterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }  # cm/s
+
+[physio]                       # fractional amplitudes; all default 0
+tissue_cardiac = 0.02
+tissue_respiratory = 0.01
+tissue_drift = 0.01
+label_cardiac = 0.03
+label_respiratory = 0.0
+label_drift = 0.0
+cardiac_frequency = 1.0        # Hz (default 1.0)
+respiratory_frequency = 0.25   # Hz (default 0.25)
+```
+
+**3D readouts:**
+
+```toml
+[readout]
+type = "grase"                 # or "spiral"; overrides PulseSequenceType
+ky_segments = 4                # GRASE
+kz_segments = 1
+interleaves = 8                # spiral (required)
+spiral_readout_time = 4.0      # ms; spiral (required)
+dwell_time = 4e-6              # s; spiral (otherwise the sidecar's DwellTime)
+refocusing_flip_angle = 150.0  # degrees (default: the sidecar's FlipAngle, else 180)
+```
+
+The P6 features have their own tables, described in the next section.
+
+### Multi-echo, Hadamard and Look-Locker
+
+**Several echo times.** Give one sidecar per echo with repeated `--asl-json`, in echo order, and
+one `aslcontext.tsv`.
+- Each sidecar carries its own scalar `EchoTime`, and the echo times must increase.
+- Every other field must be the same in all the sidecars.
+- The echoes of each excitation share the same longitudinal state. Each compartment decays with its
+  own T2 (spin echo) or T2* (gradient echo).
+- aslscan checks that every echo's readout, and every spin-echo refocusing pulse, fits between
+  excitations.
+
+```toml
+[multi_te]
+refocusing_time = 2.0          # ms reserved for each spin-echo refocusing pulse (default 2)
+```
+
+**Hadamard time-encoded labeling.** Add a `[hadamard]` table. The `aslcontext.tsv` lists the
+*decoded* volumes:
+- `deltam` rows, `H - 1` per encoding cycle, in sub-bolus order;
+- `m0scan` rows, allowed only between cycles.
+
+The sidecar's arrays describe those decoded volumes:
+- each row's `LabelingDuration` is its sub-bolus's duration;
+- each row's `PostLabelingDelay` is its sub-bolus's effective delay, from the end of that sub-bolus
+  to the excitation.
+
+aslscan simulates the encoded acquisition and decodes it. Its tissue-leakage report shows how much
+static tissue signal survived decoding into each sub-bolus; this is non-zero when the tissue
+differs between encoded volumes, for example after a gradient-echo transient.
+
+```toml
+[hadamard]
+order = 8                      # 4, 8, 16 or 32 (required)
+report_leakage = true          # also decode the tissue alone and report its leakage (default true)
+```
+
+**Look-Locker readouts.** Set `LookLocker: true` in the sidecar, with gradient echo
+(`acq_contrast = "ge"`) and a 2D readout.
+- `FlipAngle` is required: a scalar, or one value per volume.
+- Each run of consecutive volumes of one type with increasing `PostLabelingDelay` is one labeling
+  followed by several readouts.
+- Each readout depletes both the tissue magnetization and the label that has already arrived.
+- One readout per labeling with a single scalar flip reproduces the ordinary gradient-echo series
+  exactly.
+
+```toml
+[look_locker]
+readouts_per_cycle = 12        # optional check against the grouping the arrays give
+```
+
+### Comparing with ASLDRO
+
+`--compat-asldro` (or `[compat] asldro = true`) pins the simulation to what ASLDRO v2.2.0 can
+express, so that the two can be compared voxel by voxel. It refuses anything ASLDRO cannot
+model. `tools/compat_asldro.py` runs the comparison benchmarks against ASLDRO itself.
 
 ### Phantom
 
@@ -186,6 +353,7 @@ The phantom is a directory of NIfTI images on a common grid, each with a JSON si
 | `M0map.nii.gz` | equilibrium magnetization | `arbitrary` |
 | `dseg.nii.gz` | tissue labels; `dseg.json` names them in a `LabelMap` | `label indices` |
 | `fieldmap.nii.gz` | B0 fieldmap (optional) | `Hz` |
+| `abv.nii.gz`, `aatt.nii.gz` | arterial blood volume and transit time (optional, for `[macrovascular]`) | `fraction`, `s` |
 
 An optional `phantom.json` can supply `LambdaBloodBrain`, `T1ArterialBlood`, and
 `MagneticFieldStrength`. The field strength must match the protocol's. Without a fieldmap, no EPI
@@ -228,13 +396,24 @@ smaller region.
       sub-01_desc-deltam_gt.nii.gz           noise-free label-control difference, per volume
 ```
 
-The dataset passes the BIDS validator. The `ground-truth/` directory is listed in `.bidsignore`.
-Each `*_asl.json` sidecar repeats the input protocol and adds an `AslscanSimulation` section.
-That section records every value aslscan resolved, including grid sizes, kinetic constants and
-their sources, acquisition settings, and random seeds. When a setting in the simulation
-overrides a value in the input sidecar, the standard BIDS field reports the value that was
-simulated, and the original input value is kept under
-`AslscanSimulation.InputValuesReplaced`.
+Optional features add files:
+
+| Feature | Adds |
+|---|---|
+| Motion | `ground-truth/sub-01_desc-motion_gt.tsv` and `_desc-motionEvents_gt.tsv`, plus `_desc-deltamStatic_gt` (the unmoved truth). |
+| Vascular extensions | `ground-truth/sub-01_desc-deltamIntravascular_gt`, `_desc-deltamArterial_gt`, `_desc-deltamSuppressed_gt`, `_desc-aBV_gt`, `_desc-aATT_gt`. |
+| Physiology | `ground-truth/sub-01_desc-physio_gt.tsv`, with the factors applied per volume and slice (or shot). |
+| Several echo times | One series per echo: `sub-01_echo-<n>_part-{mag,phase}_asl.nii.gz` with its own sidecar, and a separate M0 per echo. The one `aslcontext.tsv` and the ground truth are shared by all echoes. |
+| Hadamard | The main series is the *decoded* data. `sourcedata/sub-01/perf/` holds the raw encoded series, a table of the raw volumes, the raw truth, and `desc-preparations_gt.tsv` (the factors applied to each labeling). `TotalAcquiredPairs` is the number of encoding cycles. |
+| Look-Locker | `ground-truth/sub-01_desc-deltamRead_gt` (what each readout read, after depletion) and `desc-lookLocker_gt.tsv` (the tissue magnetization before each readout). |
+
+The dataset passes the BIDS validator. The `ground-truth/` directories are listed in
+`.bidsignore`, and validators skip `sourcedata/` by design. Each `*_asl.json` sidecar repeats the
+input protocol and adds an `AslscanSimulation` section. That section records every value aslscan
+resolved: grid sizes, kinetic constants and their sources, acquisition settings, random seeds, and
+the details of each optional feature. When a setting in the simulation overrides a value in the
+input sidecar, the standard BIDS field reports the value that was simulated, and the original
+input value is kept under `AslscanSimulation.InputValuesReplaced`.
 
 ## Testing
 
@@ -242,10 +421,22 @@ simulated, and the original input value is kept under
 cargo test --features io,test-hooks
 ```
 
-This runs the unit tests and the end-to-end tests, using the fixtures under `tests/fixtures/`.
-The reference values for the kinetic and signal models were generated with ASLDRO by
-`tools/gen_gkm_fixtures.py` and `tools/gen_mrsignal_fixtures.py`. The `test-hooks` feature exists
-only for these tests. Do not enable it when producing data.
+```bash
+cargo test --release --features cli,kspace,par,test-hooks
+```
+
+These run the unit tests and the end-to-end tests, using the fixtures under `tests/fixtures/`.
+The second also covers the spiral readout. The reference values for the kinetic and signal models
+were generated with ASLDRO by `tools/gen_gkm_fixtures.py` and `tools/gen_mrsignal_fixtures.py`.
+The `test-hooks` feature exists only for these tests. Do not enable it when producing data.
+
+Two longer checks need locally converted phantoms under `work/`:
+
+- `tools/regress_identity.sh <aslscan-rev> <mrsim-acq-rev>` builds a base revision and the current
+  sources side by side. It compares their outputs byte for byte on a set of protocols covering
+  every earlier feature. Use it to show that a change leaves existing outputs unchanged.
+- `tools/compat_asldro.py` (run in a Python environment with ASLDRO) compares `--compat-asldro`
+  output with ASLDRO voxel by voxel.
 
 ## License
 
