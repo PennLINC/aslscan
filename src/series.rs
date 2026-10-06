@@ -154,6 +154,33 @@ pub struct SeriesOutput {
     /// P6 part A: the raw (encoded) series and its records; `mag`, `phase` and the ground truth
     /// above are then the decoded series and its ideal sub-bolus truth.
     pub hadamard: Option<HadamardSeries>,
+    /// P6 part B: the Look-Locker records.
+    pub look_locker: Option<LookLockerSeries>,
+}
+
+/// A Look-Locker series' records (P6 part B).
+#[derive(Debug, Clone)]
+pub struct LookLockerSeries {
+    /// `sin(a_n)` times the depleted label each readout read, per readout volume and slice
+    /// (static); `None` on the legacy dispatch, whose readouts read the undepleted label.
+    pub delta_m_read: Option<Vec<f32>>,
+    /// One line per readout and excitation group (empty on the legacy dispatch).
+    pub lines: Vec<LlLine>,
+    /// One readout per cycle at one flip: P5's series itself.
+    pub legacy_dispatch: bool,
+}
+
+/// One readout of one excitation group (P6 part B, `desc-lookLocker_gt.tsv`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlLine {
+    pub cycle: usize,
+    pub readout: usize,
+    pub group: usize,
+    /// The excitation on the series clock (s).
+    pub time: f64,
+    pub flip_deg: f64,
+    /// The mean tissue Mz before the pulse, per label (phantom voxels of the group's slices).
+    pub tissue_mz: Vec<f64>,
 }
 
 /// The raw series of a Hadamard protocol (P6 part A), for `sourcedata`.
@@ -1328,6 +1355,7 @@ fn simulate_legacy(
         spiral_segmentation,
         more_echoes: Vec::new(),
         hadamard: None,
+        look_locker: None,
         ge_rule: ge_flip.map(|fa| match (p.compat.is_some(), fa == 90.0, ge_propagated.is_some(), p.suppression.is_some()) {
             (true, ..) => "simasl's coherent steady state per volume (compat)",
             (_, true, ..) => "90 degrees: the slab is saturated, each row independent (P3's timeline, sin(a) = 1)",

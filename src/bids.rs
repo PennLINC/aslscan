@@ -603,7 +603,12 @@ mod writer {
                 effective.push(("FlipAngle", json!(ir.params.excitation_flip_deg.rem_euclid(360.0))));
             }
             if let Some(g) = &p.ge {
-                effective.push(("FlipAngle", json!(g.flip_deg.rem_euclid(360.0))));
+                // P6 part B: a Look-Locker FlipAngle array is every volume's own excitation
+                let fa = match &p.look_locker {
+                    Some(l) if l.flip_array => json!(l.flip_deg),
+                    _ => json!(g.flip_deg.rem_euclid(360.0)),
+                };
+                effective.push(("FlipAngle", fa));
             }
             // P5 part B: a 3D readout's standard keys as resolved (the effective spacing BIDS defines,
             // TotalReadoutTime = it x (ny - 1), the direction, the shots, the refocusing angle)
@@ -642,6 +647,9 @@ mod writer {
             let mut sim = simulation_block(p, out);
             if let Some(hb) = hadamard_block(p, out) {
                 sim["Hadamard"] = hb;
+            }
+            if let Some(lb) = look_locker_block(p, out) {
+                sim["LookLocker"] = lb;
             }
             sim["InputValuesReplaced"] = Value::Object(replaced);
             if let Some(me) = multi_echo_block(p, out, e) {
@@ -688,6 +696,11 @@ mod writer {
                 // excitation and readout (P5 part A); its FlipAngle says which, the input kept as
                 // replaced.
                 let (m0_flip, m0_contrast, m0_note) = match (&p.ge, &p.readout) {
+                    // P6 part B: a Look-Locker series' M0 at its own excitation, not a Look-Locker file
+                    (Some(_), _) if p.look_locker.as_ref().is_some_and(|l| l.m0_flip_deg.is_some()) => (
+                        p.look_locker.as_ref().and_then(|l| l.m0_flip_deg).map_or(90.0, |f| f.0), "ge",
+                        "a gradient-echo readout at its own repetition time and excitation (overlay m0.flip_angle, or the \
+                     series' scalar FlipAngle): one excitation, not a Look-Locker series; no suppression, no motion"),
                     (Some(g), _) => (g.flip_deg.rem_euclid(360.0), "ge",
                                      "the series' gradient-echo readout at its own repetition time: no suppression, no motion"),
                     // P5 part B: the same echo train, its FlipAngle the refocusing angle
@@ -775,7 +788,11 @@ mod writer {
         let moved = out.ground_truth.delta_m_static.is_some();
         write_json(&PathBuf::from(format!("{gt_prefix}_desc-deltam_gt.json")), &json!({
             "Units": "arbitrary (same as M0map)",
-            "Description": if out.hadamard.is_some() {
+            "Description": if out.look_locker.as_ref().is_some_and(|l| !l.legacy_dispatch) {
+                "+delta_m at each readout's own excitation per slice (e = t_n + slice offset), undepleted: the label \
+                 delivered, before the readouts deplete it (desc-deltamRead_gt is what each readout read); \
+                 box-averaged; zero for other rows"
+            } else if out.hadamard.is_some() {
                 "the ideal sub-bolus truth (P6 part A): each decoded volume's delta_m of its sub-bolus from the \
                  kinetics alone at the cycle's readout, without physiological or suppression factors, static (a \
                  decoded volume has no single pose), box-averaged; zero for m0scan rows. The raw volumes' truth is \
@@ -821,6 +838,34 @@ mod writer {
         }
         if out.hadamard.is_none() {
             write_volume_tables(&gt_prefix, p, out)?;
+        }
+        if let Some(l) = &out.look_locker {
+            if let Some(d) = &l.delta_m_read {
+                write_4d(&PathBuf::from(format!("{gt_prefix}_desc-deltamRead_gt.nii.gz")), out.acq_grid.dims, out.n_volumes, d, &out.acq_grid)
+                    .map_err(|e| e.to_string())?;
+                write_json(&PathBuf::from(format!("{gt_prefix}_desc-deltamRead_gt.json")), &json!({
+                    "Units": "arbitrary (same as M0map)",
+                    "Description": "what each Look-Locker readout read: sin(a_n) times the label depleted by the cycle's \
+                                    earlier readouts (each leaving cos(a) of the label that had arrived in the slice), \
+                                    per slice, static; zero for other rows",
+                    "Resampling": mean,
+                }))?;
+            }
+            if !l.lines.is_empty() {
+                let mut tsv = String::from("cycle\treadout\tgroup\ttime\tflip_angle");
+                for (_, name) in &out.labels {
+                    tsv.push_str(&format!("\ttissue_mz_{name}"));
+                }
+                tsv.push('\n');
+                for x in &l.lines {
+                    tsv.push_str(&format!("{}\t{}\t{}\t{}\t{}", x.cycle, x.readout, x.group, x.time, x.flip_deg));
+                    for m in &x.tissue_mz {
+                        tsv.push_str(&format!("\t{m}"));
+                    }
+                    tsv.push('\n');
+                }
+                std::fs::write(format!("{gt_prefix}_desc-lookLocker_gt.tsv"), tsv).map_err(|e| e.to_string())?;
+            }
         }
         // `phantom::load` already bounds labels to 0..=32767, so this cannot truncate; the
         // conversion is checked anyway rather than cast.
@@ -908,6 +953,42 @@ mod writer {
                 .filter(|(_, w)| **w == 1).map(|(j, _)| j + 1).collect(),
             None => Vec::new(),
         }
+    }
+
+    /// `AslscanSimulation.LookLocker` (P6 part B, "Outputs").
+    fn look_locker_block(p: &Protocol, out: &SeriesOutput) -> Option<Value> {
+        let (l, ls) = (p.look_locker.as_ref()?, out.look_locker.as_ref()?);
+        let cycles: Vec<Value> = l.cycles.iter().map(|c| json!({
+            "FirstRow": c.rows[0],
+            "Readouts": c.rows.len(),
+            "M0scan": c.m0scan,
+            "ExcitationTimes": if c.m0scan { vec![0.0] } else { c.rows.iter().map(|&r| p.rows[r].t).collect::<Vec<f64>>() },
+            "FlipAngles": c.rows.iter().map(|&r| l.flip_deg[r]).collect::<Vec<f64>>(),
+        })).collect();
+        Some(json!({
+            "Cycles": cycles,
+            "ReadoutsPerCycle": l.readouts_per_cycle,
+            "LegacyDispatch": ls.legacy_dispatch,
+            "LegacyDispatchNote": "one readout per cycle at one flip is P5's gradient-echo series itself, bit for bit",
+            "TissueModel": "per slice, the cycle's events on Mz: the suppression pulses before the first readout, then \
+                            each readout (its signal sin(a) Mz just before it, leaving cos(a) Mz), T1 recovery between \
+                            them and to TR; the steady state of the repeated cycle is its affine fixed point, and cycles \
+                            that differ carry the state forward; an m0scan cycle is one readout at the start of its own \
+                            repetition",
+            "BloodModel": "each readout depletes the difference magnetization of the label that has arrived in its slice \
+                           (label in transit is outside the imaged slices); the read is sin(a_n) sum_k [prod cos(a_m)] \
+                           delta_m_arrival over the arrival windows between the slice's excitations, with the GKM's T1' \
+                           after arrival",
+            "M0FlipAngle": l.m0_flip_deg.map(|(v, src)| json!({ "Value": v, "Source": src.as_str() })),
+            "Refused": ["exchange (P4 part A)", "the arterial compartment (P4 part B)", "crushing (P4 part C)",
+                        "bolus-position suppression (P4 part D)"],
+            "PoseIndex": "motion poses are indexed by volume (each readout its own), not by time",
+            "Pixdim4": "the NIfTI time step is the first non-m0scan row's RepetitionTimePreparation, a storage \
+                        convention; the readout schedule is Cycles",
+            "GroundTruth": "desc-deltam_gt: the undepleted delta_m at each slice's excitation; desc-deltamRead_gt: what each \
+                            readout read; desc-lookLocker_gt.tsv: one line per readout and excitation group with the mean \
+                            tissue Mz before the pulse per label",
+        }))
     }
 
     /// `AslscanSimulation.Hadamard` (P6 part A, "Outputs").

@@ -40,3 +40,6 @@ Only the JSON sidecar and aslcontext.tsv are kept; no image data.
   in four ky segments, four shots per raw volume, EchoTime 13.28 ms, DwellTime 3.2 us, 130 degrees).
 - `p6_hadamard_multite/`: Hadamard x multi-TE on the crop: one sidecar per echo (gradient echo at
   13, 32, 51 ms, 60 degrees, slices 60 ms apart).
+- `p6_ll/`: written for aslscan (P6 plan, Task 15). Look-Locker PASL on the crop (Q2TIPS, 0.7 s cutoff),
+  2D EPI: a control cycle and a label cycle of twelve gradient-echo readouts at 35 degrees, 0.3 s
+  apart from PLD 0.8 s, TR 4.5 s, a separate M0 at the series' flip.

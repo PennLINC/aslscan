@@ -1,0 +1,18 @@
+# The P6 Look-Locker acceptance case (P6 plan, Task 15) on the crop: PASL (Q2TIPS, 0.7 s), 2D EPI, a
+# control cycle and a label cycle of twelve gradient-echo readouts at 35 degrees, 0.3 s apart from
+# PLD 0.8 s, TR 4.5 s; a separate M0 at the series' flip.
+seed = 81
+
+[acquisition]
+oversample = 2
+signal_scale = 100.0
+noise_variance = 0.01
+
+[signal]
+acq_contrast = "ge"
+
+[look_locker]
+readouts_per_cycle = 12
+
+[m0]
+repetition_time = 6.0

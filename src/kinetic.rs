@@ -255,6 +255,26 @@ pub fn delta_m_arrival(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f
     }
 }
 
+/// The delta-M a Look-Locker readout reads, before its `sin(a)` (P6 addendum, part B): `e` are
+/// this slice's excitation times of the cycle's readouts up to and including the one read (s from
+/// the start of labeling, increasing), `flips_deg` the flips of the readouts before it. The label
+/// that arrived in `[e_k, e_k+1)` (`e_0 = 0`) has been excited by every later readout before this
+/// one, each leaving `cos(a)` of it:
+/// `sum_k prod_{m > k, m < n} cos(a_m) * delta_m_arrival(e_n; e_k, e_k+1)`.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_m_read(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, e: &[f64], flips_deg: &[f64]) -> f64 {
+    let n = e.len();
+    assert!(n >= 1 && flips_deg.len() + 1 == n, "{n} excitations need {} earlier flips, got {}", n.saturating_sub(1), flips_deg.len());
+    let t = e[n - 1];
+    (0..n)
+        .map(|w| {
+            let lo = if w == 0 { 0.0 } else { e[w - 1] };
+            let depletion: f64 = flips_deg[w..].iter().map(|a| a.to_radians().cos()).product();
+            depletion * delta_m_arrival(k, f_ml_100g_min, dt, t1t, m0, t, lo, e[w])
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,5 +861,37 @@ mod tests {
         let k0 = Kinetic { t1b: 0.0, ..K_PASL };
         assert_eq!(delta_m_arrival(&k0, f, DT, t1t, m0, 1.2, 0.0, 1.2), 0.0);
         assert!(delta_m_arrival(&K_PASL, f, DT, t1t, m0, 1.2, 0.0, 1.2) > 0.0);
+    }
+
+    /// The depleted read against a brute-force count: the label arriving in a small interval
+    /// around u is depleted by every readout excited after u and before the one read. Includes a
+    /// delayed slice whose first excitation follows the arrival.
+    #[test]
+    fn the_read_is_the_label_depleted_by_the_later_readouts() {
+        for k in [K_PCASL, K_PASL] {
+            for (dt, offset) in [(DT, 0.0), (1.05, 0.2), (0.3, 0.1)] {
+                let t_n: Vec<f64> = (0..8).map(|n| 0.9 + 0.3 * n as f64).collect();
+                let e: Vec<f64> = t_n.iter().map(|t| t + offset).collect();
+                let flips: Vec<f64> = (0..8).map(|n| 25.0 + 5.0 * n as f64).collect();
+                for n in 1..=8 {
+                    let got = delta_m_read(&k, F, dt, T1T, M0, &e[..n], &flips[..n - 1]);
+                    let t = e[n - 1];
+                    let steps = 20_000;
+                    let h = t / steps as f64;
+                    let brute: f64 = (0..steps).map(|i| {
+                        let (u0, u1) = (i as f64 * h, (i + 1) as f64 * h);
+                        let u = 0.5 * (u0 + u1);
+                        let w: f64 = (0..n - 1).filter(|&m| e[m] > u).map(|m| flips[m].to_radians().cos()).product();
+                        w * delta_m_arrival(&k, F, dt, T1T, M0, t, u0, u1)
+                    }).sum();
+                    // the midpoint weight is exact except in the steps that straddle an excitation
+                    assert!((got - brute).abs() <= 2e-4 * brute.abs().max(1e-9), "{:?} dt {dt} offset {offset} n {n}: {got} vs {brute}", k.label_type);
+                    // with no earlier readouts (or zero flips) it is the undepleted delta_m
+                    let zero = delta_m_read(&k, F, dt, T1T, M0, &e[..n], &vec![0.0; n - 1]);
+                    let whole = delta_m(&k, F, dt, T1T, M0, t);
+                    assert!((zero - whole).abs() <= 1e-12 * whole.abs().max(1e-300));
+                }
+            }
+        }
     }
 }

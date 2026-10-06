@@ -1686,3 +1686,125 @@ fn the_hadamard_fixtures_load_and_run() {
         assert!(p.hadamard.is_some(), "{dir}");
     }
 }
+
+// ---------------------------------------------------------------- P6 part B: Look-Locker
+
+/// A Look-Locker PCASL series on the crop: `rows` (one cycle per run of a volume type), `m`
+/// readouts 0.3 s apart from PLD 0.6 s, gradient echo at `flip` degrees, repetition time `tr`.
+fn look_locker(rows: &[&str], m: usize, flip: f64, tr: f64, extra: &str) -> Protocol {
+    let mut pld = Vec::new();
+    let mut ctx = String::from("volume_type\n");
+    for kind in rows {
+        for n in 0..m {
+            pld.push(0.6 + 0.3 * n as f64);
+            ctx.push_str(kind);
+            ctx.push('\n');
+        }
+    }
+    let s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.0, "PostLabelingDelay": pld,
+        "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": tr, "LookLocker": true,
+        "EchoTime": 0.012, "FlipAngle": flip, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05], "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.012
+    });
+    let ov: Overlay = toml::from_str(&format!(
+        "seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n[signal]\nacq_contrast = \"ge\"\n{extra}")).unwrap();
+    parse(&s, &ctx, Some(&ov), crop().params.as_ref()).unwrap()
+}
+
+/// At a vanishing flip the readouts deplete nothing: the blood read over sin(a) is the undepleted
+/// delta_m at each slice's excitation, and the tissue over sin(a) is the fully recovered M0
+/// (no saturation; an independent reference, not the timeline).
+#[test]
+fn a_vanishing_flip_reads_the_undepleted_label() {
+    let a: f64 = 1e-3;
+    let p = look_locker(&["label"], 8, a, 4.5, "");
+    let out = simulate_with(&p, &crop(), T2Mode::Class, &phase(), RowOverride::None).unwrap();
+    let ll = out.look_locker.as_ref().unwrap();
+    assert!(!ll.legacy_dispatch);
+    let read = ll.delta_m_read.as_ref().unwrap();
+    let truth = &out.ground_truth.delta_m;
+    let peak = truth.iter().cloned().fold(0.0f32, f32::max) as f64;
+    assert!(peak > 0.0, "a nonzero reference");
+    let sin = a.to_radians().sin();
+    let worst = read.iter().zip(truth).map(|(r, t)| (*r as f64 / sin - *t as f64).abs()).fold(0.0f64, f64::max) / peak;
+    println!("vanishing flip: read / sin(a) vs undepleted, worst {worst:e} of the peak");
+    assert!(worst < 1e-5, "{worst}");
+    // and at 40 degrees the later readouts read visibly less than the undepleted label
+    let p40 = look_locker(&["label"], 8, 40.0, 4.5, "");
+    let o40 = simulate_with(&p40, &crop(), T2Mode::Class, &phase(), RowOverride::None).unwrap();
+    let r40 = o40.look_locker.as_ref().unwrap().delta_m_read.as_ref().unwrap();
+    let n = o40.n_volumes;
+    let sum = |v: &[f32], k: usize| (0..v.len() / n).map(|x| v[x * n + k] as f64).sum::<f64>();
+    let s40 = 40f64.to_radians().sin();
+    assert!((sum(r40, 0) / s40 - sum(&o40.ground_truth.delta_m, 0)).abs() < 1e-4 * sum(&o40.ground_truth.delta_m, 0));
+    assert!(sum(r40, 7) / s40 < 0.9 * sum(&o40.ground_truth.delta_m, 7));
+    // the tissue: with nothing saturating it the steady state is M0 itself; the control cycle's
+    // compartments over sin(a), integrated, against the M0 truth integrated (box averages keep the
+    // integral; a simulation voxel is a quarter of an acquisition voxel)
+    let pc = look_locker(&["control"], 8, a, 4.5, "");
+    let (comps, oc) = aslscan::series::simulate_compartments(&pc, &crop(), T2Mode::Class, &phase(), RowOverride::None).unwrap();
+    let (k, nv) = (oc.labels.len(), oc.n_volumes);
+    let m0_sum: f64 = oc.ground_truth.m0.iter().map(|x| *x as f64).sum();
+    for v in 0..nv {
+        let tissue: f64 = comps[..k].iter().map(|c| c.iter().skip(v).step_by(nv).map(|x| *x as f64).sum::<f64>()).sum::<f64>() / sin / 4.0;
+        assert!((tissue - m0_sum).abs() <= 1e-4 * m0_sum, "readout {v}: {tissue} vs {m0_sum}");
+    }
+}
+
+/// The identity I_C - I_L = I_B per readout holds when the control and label cycles share their
+/// history (matched preparation), fails for a flipped label sign, and fails when the label
+/// cycle's history differs (another repetition time): the depleted tissue does not cancel.
+#[test]
+fn look_locker_linearity_per_readout() {
+    let m = 6;
+    let run = |rows: &[&str], tr: f64, ov: RowOverride| {
+        let out = simulate_with(&look_locker(rows, m, 30.0, tr, ""), &crop(), T2Mode::Auto, &phase(), ov).unwrap();
+        let all = complex_from(&out.mag, &out.phase);
+        let n = out.n_volumes;
+        (0..n).map(|v| (0..all.len() / n).map(|x| all[x * n + v]).collect::<Vec<_>>()).collect::<Vec<_>>()
+    };
+    let (c, l, b) = (run(&["control"], 4.5, RowOverride::None), run(&["label"], 4.5, RowOverride::None), run(&["deltam"], 4.5, RowOverride::None));
+    for n in 0..m {
+        let worst = residual_of(&c[n], &l[n], &b[n]);
+        assert!(worst <= 1.0, "readout {n}: {worst}");
+    }
+    let flipped = run(&["label"], 4.5, RowOverride::FlipLabelSign);
+    assert!(residual_of(&c[m - 1], &flipped[m - 1], &b[m - 1]) > 1e2);
+    let other = run(&["label"], 4.0, RowOverride::None);
+    assert!(residual_of(&c[m - 1], &other[m - 1], &b[m - 1]) > 1e2, "mismatched history must not cancel");
+}
+
+/// One readout per cycle at one flip is P5's gradient-echo series bit for bit: p5_ge (two delays,
+/// suppression, a separate M0, 60 degrees: the state carried row to row) with LookLocker: true.
+#[test]
+fn one_readout_look_locker_is_p5() {
+    let d = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols/p5_ge/");
+    let s: Value = serde_json::from_str(&std::fs::read_to_string(format!("{d}asl.json")).unwrap()).unwrap();
+    let ctx = std::fs::read_to_string(format!("{d}aslcontext.tsv")).unwrap();
+    let ov: Overlay = toml::from_str(&std::fs::read_to_string(format!("{d}overlay.toml")).unwrap()).unwrap();
+    let base = parse(&s, &ctx, Some(&ov), crop().params.as_ref()).unwrap();
+    let mut sl = s.clone();
+    sl["LookLocker"] = json!(true);
+    let ll = parse(&sl, &ctx, Some(&ov), crop().params.as_ref()).unwrap();
+    assert!(ll.p6_active() && ll.look_locker.as_ref().unwrap().cycles.iter().all(|c| c.rows.len() == 1));
+    let (a, b) = (simulate_with(&base, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap(),
+                  simulate_with(&ll, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap());
+    assert!(b.look_locker.as_ref().unwrap().legacy_dispatch);
+    assert_eq!(bits(&a.mag), bits(&b.mag));
+    assert_eq!(bits(&a.phase), bits(&b.phase));
+    assert_eq!(bits(&a.m0.as_ref().unwrap().0), bits(&b.m0.as_ref().unwrap().0));
+    assert_eq!(bits(&a.ground_truth.delta_m), bits(&b.ground_truth.delta_m));
+}
+
+/// The milestone L fixture loads and runs; its separate M0 takes the series' flip.
+#[test]
+fn the_look_locker_fixture_loads_and_runs() {
+    let d = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols/p6_ll"));
+    let p = aslscan::protocol::load_with(&[d.join("asl.json").as_path()], &d.join("aslcontext.tsv"), Some(&d.join("overlay.toml")),
+                                         crop().params.as_ref(), false).unwrap();
+    let l = p.look_locker.as_ref().unwrap();
+    assert_eq!((l.cycles.len(), l.readouts_per_cycle, l.m0_flip_deg.map(|f| f.0)), (2, Some(12), Some(35.0)));
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert_eq!(out.look_locker.as_ref().unwrap().lines.len(), 2 * 12 * 2);
+}
