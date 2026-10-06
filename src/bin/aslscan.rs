@@ -146,8 +146,20 @@ fn run() -> Result<(), String> {
         );
     }
 
+    if let Some(m) = &p.multi_te {
+        println!(
+            "multi-TE: {} echoes at {:?} s, {}", p.echo_times_s.len(), p.echo_times_s,
+            m.refocusing_time_ms.map_or("gradient echo".to_string(), |r| format!("spin echo, {} ms reserved per refocusing pulse", r.0)),
+        );
+    }
+
     let names = Names::new(&cli.sub, cli.ses.as_deref());
     write_dataset(&cli.out, &names, &p, &out)?;
-    println!("wrote {} ({:.1?} total)", cli.out.join(names.rel("_part-{mag,phase}_asl.nii.gz")).display(), t0.elapsed());
+    let tail = if p.echo_times_s.len() > 1 {
+        format!("_echo-{{1..{}}}_part-{{mag,phase}}_asl.nii.gz", p.echo_times_s.len())
+    } else {
+        "_part-{mag,phase}_asl.nii.gz".to_string()
+    };
+    println!("wrote {} ({:.1?} total)", cli.out.join(names.rel(&tail)).display(), t0.elapsed());
     Ok(())
 }

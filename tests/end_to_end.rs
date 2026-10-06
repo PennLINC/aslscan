@@ -1097,3 +1097,285 @@ fn the_legacy_manifest_keeps_the_identity_schedule() {
         assert_legacy("p4_one", &p4_one(row, 0.4));
     }
 }
+
+// ---------------------------------------------------------------- P6 part C: multi-TE
+
+/// PCASL on the crop, one sidecar per echo time, slices 70 ms apart (room for four echoes of a
+/// 12 ms readout), no noise unless `extra` sets it; gradient echo at 60 degrees with `ge`.
+fn multi_te(rows: &str, tes: &[f64], extra: &str, ge: bool) -> Protocol {
+    let sidecars: Vec<Value> = tes.iter().map(|te| json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
+        "EchoTime": te, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.07], "PhaseEncodingDirection": "j-",
+        "TotalReadoutTime": 0.012
+    })).collect();
+    let contrast = if ge { "[signal]\nacq_contrast = \"ge\"\nexcitation_flip_angle = 60\n" } else { "" };
+    let ov: Overlay = toml::from_str(&format!(
+        "seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n{contrast}{extra}")).unwrap();
+    let ctx = format!("volume_type\n{}\n", rows.split(',').collect::<Vec<_>>().join("\n"));
+    aslscan::protocol::parse_echoes(&sidecars, &ctx, Some(&ov), crop().params.as_ref()).unwrap()
+}
+
+const SE_TES: [f64; 4] = [0.015, 0.030, 0.045, 0.060];
+const GE_TES: [f64; 4] = [0.013, 0.026, 0.039, 0.052];
+
+/// Every echo's complex image of a series.
+fn echo_images(out: &SeriesOutput) -> Vec<Vec<(f64, f64)>> {
+    let mut v = vec![complex_from(&out.mag, &out.phase)];
+    v.extend(out.more_echoes.iter().map(|e| complex_from(&e.mag, &e.phase)));
+    v
+}
+
+fn bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+/// Echo `e` of a multi-TE series is the single-echo series at `TE_e`, bit for bit, noise off
+/// (both formations); with noise on, echo 1 still is (its receiver salt is zero).
+#[test]
+fn each_echo_is_the_single_echo_series_at_its_echo_time() {
+    for (ge, tes) in [(false, &SE_TES[..3]), (true, &GE_TES[..3])] {
+        for noise in [0.0, 0.5] {
+            let mut p = multi_te("control,label", tes, "", ge);
+            p.acq.noise_variance = noise;
+            let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+            assert_eq!(out.more_echoes.len(), tes.len() - 1);
+            // with noise, only echo 1 shares its receiver noise with the single-echo series
+            let n_cmp = if noise == 0.0 { tes.len() } else { 1 };
+            for (e, &te) in tes.iter().enumerate().take(n_cmp) {
+                let mut q = multi_te("control,label", &[te], "", ge);
+                q.acq.noise_variance = noise;
+                assert!(!q.p6_active());
+                let one = simulate_with(&q, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+                let (m, ph) = if e == 0 { (&out.mag, &out.phase) } else { (&out.more_echoes[e - 1].mag, &out.more_echoes[e - 1].phase) };
+                assert_eq!(bits(m), bits(&one.mag), "ge {ge} noise {noise} echo {e} magnitude");
+                assert_eq!(bits(ph), bits(&one.phase), "ge {ge} noise {noise} echo {e} phase");
+            }
+        }
+    }
+}
+
+/// Solve the per-voxel decomposition of the first `k` echoes into parts with known decays
+/// `d[part][echo]` (relative to echo 1), predict the next echo, and return the worst prediction
+/// error over the peak, with the parts recovered (summed real parts, for the ratio checks).
+#[allow(clippy::needless_range_loop)] // voxel-wise across the echoes and the k x k system
+fn fit_parts(s: &[Vec<(f64, f64)>], d: &[Vec<f64>]) -> (f64, Vec<f64>) {
+    let k = d.len();
+    let peak = s[k].iter().map(|z| z.0.hypot(z.1)).fold(0.0f64, f64::max);
+    let mut worst = 0.0f64;
+    let mut sums = vec![0.0f64; k];
+    for vox in 0..s[0].len() {
+        for re_im in 0..2 {
+            // k x k system A x = y, A[e][part] = d[part][e]
+            let mut a: Vec<Vec<f64>> = (0..k).map(|e| (0..k).map(|q| d[q][e]).collect()).collect();
+            let mut y: Vec<f64> = (0..k).map(|e| if re_im == 0 { s[e][vox].0 } else { s[e][vox].1 }).collect();
+            for c in 0..k {
+                let piv = (c..k).max_by(|&i, &j| a[i][c].abs().total_cmp(&a[j][c].abs())).unwrap();
+                a.swap(c, piv);
+                y.swap(c, piv);
+                for r in 0..k {
+                    if r != c {
+                        let f = a[r][c] / a[c][c];
+                        for cc in 0..k {
+                            a[r][cc] -= f * a[c][cc];
+                        }
+                        y[r] -= f * y[c];
+                    }
+                }
+            }
+            let x: Vec<f64> = (0..k).map(|q| y[q] / a[q][q]).collect();
+            let pred: f64 = (0..k).map(|q| x[q] * d[q][k]).sum();
+            let got = if re_im == 0 { s[k][vox].0 } else { s[k][vox].1 };
+            worst = worst.max((pred - got).abs() / peak);
+            if re_im == 0 {
+                for q in 0..k {
+                    sums[q] += x[q];
+                }
+            }
+        }
+    }
+    (worst, sums)
+}
+
+/// The crop with one T2 and one T2* for every tissue voxel, so each compartment's echo-time decay
+/// is one number.
+fn uniform_crop() -> Phantom {
+    let mut ph = crop();
+    for i in 0..ph.dseg.len() {
+        if ph.dseg[i] > 0 {
+            ph.t2[i] = 0.08;
+            ph.t2star[i] = 0.05;
+        }
+    }
+    ph
+}
+
+fn decay(tes: &[f64], t2_s: f64) -> Vec<f64> {
+    tes.iter().map(|te| (-(te - tes[0]) / t2_s).exp()).collect()
+}
+
+/// Spin echo, exchange on, uniform relaxation: the delta-M of a `deltam` row is the
+/// intravascular part at blood T2 plus the extravascular part at tissue T2, at the object level.
+/// Two echoes determine both parts per voxel and predict the third; the recovered parts' ratio
+/// is the ground truth's. A label row's blood part is the deltam row's, negated; wiring the label
+/// row's extravascular part into the blood (the negative control) breaks that by the
+/// extravascular part.
+#[test]
+fn spin_echo_delta_m_is_two_compartments() {
+    let ph = uniform_crop();
+    let tes = &SE_TES[..3];
+    let run = |row: &str, ov: RowOverride| {
+        let p = multi_te(row, tes, "[kinetic]\nexchange_time = 0.5\n", false);
+        let out = simulate_with(&p, &ph, T2Mode::Class, &phase(), ov).unwrap();
+        (p, out)
+    };
+    let (p, out) = run("deltam", RowOverride::None);
+    let t2b = p.t2_blood_s.0;
+    let d = vec![decay(tes, t2b), decay(tes, 0.08)];
+    let (worst, parts) = fit_parts(&echo_images(&out), &d);
+    println!("two compartments: worst prediction error {worst:e}, parts {parts:?}");
+    assert!(worst < 1e-5, "{worst}");
+    // the ratio of the parts at echo 1 against the truth's (sums over the grid, which the
+    // reconstruction preserves at the k-space centre)
+    let gt = &out.ground_truth;
+    let iv: f64 = gt.delta_m_iv.as_ref().unwrap().iter().map(|&x| x as f64).sum();
+    let all: f64 = gt.delta_m.iter().map(|&x| x as f64).sum();
+    let want = (all - iv) / iv * (-tes[0] / 0.08).exp() / (-tes[0] / t2b).exp();
+    let got = parts[1] / parts[0];
+    println!("extravascular / intravascular at echo 1: {got:.4} (truth {want:.4})");
+    assert!((got - want).abs() < 0.05 * want, "{got} vs {want}");
+    // a label row: the same blood part, negated (its tissue part adds the tissue magnetization)
+    let blood = parts[0];
+    let (_, label) = run("label", RowOverride::None);
+    let (worst, lp) = fit_parts(&echo_images(&label), &d);
+    assert!(worst < 1e-5, "{worst}");
+    assert!((lp[0] + blood).abs() < 1e-3 * blood.abs(), "label blood part {} vs deltam {blood}", lp[0]);
+    // negative control: the label row's extravascular part in the blood compartment
+    let (_, bad) = run("label", RowOverride::ExtravascularIntoBlood);
+    let (_, bp) = fit_parts(&echo_images(&bad), &d);
+    assert!((bp[0] + blood).abs() > 5.0 * blood.abs(), "mis-wired blood part {} vs deltam {blood}", bp[0]);
+}
+
+/// Gradient echo, uniform relaxation, no fieldmap: each part decays with its own T2*; the
+/// arterial compartment adds a third part at arterial T2. Three echoes determine the parts and
+/// predict the fourth.
+#[test]
+fn gradient_echo_delta_m_with_the_arterial_term() {
+    let ph = uniform_crop();
+    let tes = &GE_TES[..];
+    // (the overlay continues the [signal] table: the arterial T2 away from the blood's 0.165 s,
+    // or the two parts' decays coincide)
+    let macro_ov = "t2_arterial = 0.25\n[kinetic]\nexchange_time = 0.5\n\
+                    [macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
+                    arterial_transit_time = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n";
+    let p = multi_te("deltam", tes, macro_ov, true);
+    let out = simulate_with(&p, &ph, T2Mode::Class, &phase(), RowOverride::None).unwrap();
+    // T2' of the tissue labels: 1/T2' = 1/T2* - 1/T2, which the blood and arterial parts share
+    let t2p = 1.0 / (1.0 / 0.05 - 1.0 / 0.08);
+    let star = |t2: f64| 1.0 / (1.0 / t2 + 1.0 / t2p);
+    let t2a = p.macrovascular.as_ref().unwrap().t2_arterial.0;
+    let d = vec![decay(tes, star(p.t2_blood_s.0)), decay(tes, star(0.08)), decay(tes, star(t2a))];
+    let (worst, parts) = fit_parts(&echo_images(&out), &d);
+    println!("three parts (gradient echo): worst prediction error {worst:e}, parts {parts:?}");
+    assert!(worst < 1e-4, "{worst}");
+    // the arterial term is present (its bolus is passing at t = 3.6 s)
+    assert!(parts[2].abs() > 0.01 * parts[0].abs(), "{parts:?}");
+}
+
+/// The identity I_C - I_L = I_B holds at every echo.
+#[test]
+fn linearity_holds_at_every_echo() {
+    for (ge, tes) in [(false, &SE_TES[..2]), (true, &GE_TES[..2])] {
+        let run = |row: &str| {
+            let out = simulate_with(&multi_te(row, tes, "", ge), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+            echo_images(&out)
+        };
+        let (c, l, b) = (run("control"), run("label"), run("deltam"));
+        for e in 0..tes.len() {
+            let worst = residual_of(&c[e], &l[e], &b[e]);
+            assert!(worst <= 1.0, "ge {ge} echo {e}: {worst}");
+        }
+    }
+}
+
+/// Under compat each echo has its own image set, bounded before it is built.
+#[test]
+fn compat_multi_te_images_are_bounded() {
+    let sidecars: Vec<Value> = [0.015, 0.030].iter().map(|te| json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
+        "EchoTime": te, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.0], "PhaseEncodingDirection": "j-",
+        "TotalReadoutTime": 0.012
+    })).collect();
+    let parse_ov = |ov: &str| {
+        let ov: Overlay = toml::from_str(ov).unwrap();
+        aslscan::protocol::parse_echoes(&sidecars, "volume_type\ncontrol\nlabel\n", Some(&ov), crop().params.as_ref()).unwrap()
+    };
+    let p = parse_ov("[compat]\nasldro = true\n[multi_te]\nmax_image_memory_gib = 1e-9\n");
+    let e = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap_err();
+    assert!(e.contains("max_image_memory_gib") && e.contains("GiB"), "{e}");
+    // within the limit, echo 2 is compat's single-echo series at its echo time, noise off
+    let p = parse_ov("[compat]\nasldro = true\n");
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let ov: Overlay = toml::from_str("[compat]\nasldro = true\n").unwrap();
+    let one = aslscan::protocol::parse_echoes(&sidecars[1..], "volume_type\ncontrol\nlabel\n", Some(&ov), crop().params.as_ref()).unwrap();
+    let one = simulate_with(&one, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert_eq!(bits(&out.more_echoes[0].mag), bits(&one.mag));
+    assert_eq!(bits(&out.more_echoes[0].phase), bits(&one.phase));
+    assert_ne!(bits(&out.mag), bits(&one.mag));
+}
+
+/// The echo-N dataset: one series per echo from its own sidecar, one aslcontext, a separate M0
+/// per echo naming its own series, the ground truth once.
+#[test]
+fn multi_te_dataset_layout() {
+    let mut sidecars: Vec<Value> = Vec::new();
+    for te in &SE_TES[..2] {
+        let mut s = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+            "BackgroundSuppression": false, "M0Type": "Separate", "RepetitionTimePreparation": 4.0,
+            "EchoTime": te, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+            "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.07], "PhaseEncodingDirection": "j-",
+            "TotalReadoutTime": 0.012
+        });
+        s["EchoTime"] = json!(te);
+        sidecars.push(s);
+    }
+    let ov: Overlay = toml::from_str("seed = 3\n[acquisition]\noversample = 2\n[m0]\nrepetition_time = 6.0\n").unwrap();
+    let p = aslscan::protocol::parse_echoes(&sidecars, "volume_type\ncontrol\nlabel\n", Some(&ov), crop().params.as_ref()).unwrap();
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-multite-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let perf = dir.join("sub-01/perf");
+    let read = |f: &str| -> Value { serde_json::from_str(&std::fs::read_to_string(perf.join(f)).unwrap()).unwrap() };
+    let mut names: Vec<String> = std::fs::read_dir(&perf).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    names.sort();
+    assert_eq!(names, [
+        "ground-truth", "sub-01_aslcontext.tsv",
+        "sub-01_echo-1_m0scan.json", "sub-01_echo-1_m0scan.nii.gz",
+        "sub-01_echo-1_part-mag_asl.json", "sub-01_echo-1_part-mag_asl.nii.gz",
+        "sub-01_echo-1_part-phase_asl.json", "sub-01_echo-1_part-phase_asl.nii.gz",
+        "sub-01_echo-2_m0scan.json", "sub-01_echo-2_m0scan.nii.gz",
+        "sub-01_echo-2_part-mag_asl.json", "sub-01_echo-2_part-mag_asl.nii.gz",
+        "sub-01_echo-2_part-phase_asl.json", "sub-01_echo-2_part-phase_asl.nii.gz",
+    ]);
+    for (e, te) in SE_TES[..2].iter().enumerate() {
+        let side = read(&format!("sub-01_echo-{}_part-mag_asl.json", e + 1));
+        assert_eq!(side["EchoTime"], json!(te));
+        let me = &side["AslscanSimulation"]["MultiEcho"];
+        assert_eq!((me["Echo"].clone(), me["EchoTimes"].clone()), (json!(e + 1), json!(&SE_TES[..2])));
+        assert_eq!(me["ReceiverSeeds"][0], json!(3u64));
+        assert_ne!(me["ReceiverSeeds"][1], json!(3u64));
+        let m0 = read(&format!("sub-01_echo-{}_m0scan.json", e + 1));
+        assert_eq!(m0["EchoTime"], json!(te));
+        assert_eq!(m0["IntendedFor"][0], json!(format!("bids::sub-01/perf/sub-01_echo-{}_part-mag_asl.nii.gz", e + 1)));
+    }
+    // the two echoes and the two M0 scans differ
+    assert_ne!(std::fs::read(perf.join("sub-01_echo-1_m0scan.nii.gz")).unwrap(), std::fs::read(perf.join("sub-01_echo-2_m0scan.nii.gz")).unwrap());
+    let gt: Vec<String> = std::fs::read_dir(perf.join("ground-truth")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    assert!(gt.iter().all(|n| !n.contains("echo")), "{gt:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

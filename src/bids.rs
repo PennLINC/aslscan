@@ -80,6 +80,59 @@ mod writer {
         json!({ "Value": v.0, "Source": v.1.as_str() })
     }
 
+    /// P6 part C: the multi-TE record of echo `e` (from 0), `None` with one echo.
+    fn multi_echo_block(p: &Protocol, out: &SeriesOutput, e: usize) -> Option<Value> {
+        let m = p.multi_te.as_ref()?;
+        let seed = out.seeds.0;
+        let salts: Vec<u64> = (0..p.echo_times_s.len()).map(mrsim_acq::kspace::echo_salt).collect();
+        let gradient = p.contrast == crate::mrsignal::Contrast::GradientEcho;
+        let decay = match (p.compat.is_some(), gradient) {
+            (true, _) => "compat: simasl's exp(-TE/T2) per phantom voxel (exp(-TE/T2*) under gradient echo) in the \
+                          signal stage, one image set per echo; the readout applies no relaxation",
+            (false, false) => "per compartment, by the readout, on the object before encoding: spin echo \
+                               exp(-(TE + t)/T2 - |t|/T2') about each echo, so delta-M(TE) = dM_iv exp(-TE/T2_blood) + \
+                               dM_ev exp(-TE/T2_tissue) [+ the arterial term at T2_arterial]; perfect refocusing",
+            (false, true) => "per compartment, by the readout, on the object before encoding: gradient echo \
+                              exp(-(TE + t)(1/T2 + 1/T2')) exp(i 2 pi fmap TE), so delta-M(TE) = dM_iv \
+                              exp(-TE/T2*_blood) + dM_ev exp(-TE/T2*_tissue) [+ the arterial term], with the fieldmap phase",
+        };
+        let mut b = json!({
+            "Echo": e + 1,
+            "EchoTimes": p.echo_times_s,
+            "EchoFormation": if gradient { "gradient" } else { "spin" },
+            "EchoTrain": "each echo an independent 2D EPI readout of the same excitation at its own echo time; the \
+                          echo train's own k-space trajectory is not modeled",
+            "ExcitationSeed": seed,
+            "ReceiverSeeds": salts.iter().map(|s| seed ^ s).collect::<Vec<u64>>(),
+            "ReceiverSeedRule": "seed XOR echo_salt(e), echo_salt(e) = e * 0xD1B54A32D192ED03 (mod 2^64), e from 0: \
+                                 the echoes share the excitation (one shot phase) and draw independent receiver noise",
+            "Decay": decay,
+            "Exchange": if p.exchange_time.is_some() {
+                "on: the intravascular label in the blood compartment, the extravascular label in the tissue's"
+            } else {
+                "off: all label is intravascular (blood relaxation)"
+            },
+            "Kinetics": "P4's single residue T1' after arrival; not a two-compartment T1 exchange model",
+            "Timing": if p.compat.is_some() {
+                "each echo's readout block, the refocusing pulses and the last echo against TR checked; compat \
+                 excites every slice together (equal SliceTiming), so there is no between-group check"
+            } else {
+                "each echo's readout block, the refocusing pulses, the excitation groups in order and the last \
+                 echo against TR checked"
+            },
+        });
+        if let Some(r) = m.refocusing_time_ms {
+            b["RefocusingTime"] = resolved(r);
+        }
+        if let Some(l) = m.max_image_memory_gib {
+            b["MaxImageMemoryGiB"] = resolved(l);
+        }
+        if let Some(m0) = out.seeds.1 {
+            b["SeparateM0ReceiverSeeds"] = json!(salts.iter().map(|s| m0 ^ s).collect::<Vec<u64>>());
+        }
+        Some(b)
+    }
+
     /// The `PulseSequenceType` to publish when the overlay's `[readout] type` changed the readout
     /// the input's `PulseSequenceType` describes (P5 part B): the readout simulated, the input's value
     /// kept under `InputValuesReplaced`.
@@ -493,177 +546,210 @@ mod writer {
             Some(r3) => nifti_tr.map(|tr| r3.n_shots as f64 * tr),
             None => nifti_tr,
         };
-        let info = SidecarInfo {
-            manufacturer: "aslscan".to_string(),
-            phase_encoding_direction: p.phase_encoding_direction.clone(),
-            total_readout_time: p.total_readout_time_s,
-            echo_time: p.echo_time_s,
-            partial_fourier: out.acquisition.partial_fourier,
-            accel: out.acquisition.accel,
-            mb: p.mb,
-            repetition_time_s: nifti_tr,
-            b0_field_source: None,
-        };
-        write_complex_4d(&prefix_s, "asl", out.acq_grid.dims, out.n_volumes, &out.mag, &out.phase, &out.acq_grid, &info)
-            .map_err(|e| e.to_string())?;
-        // The shared writer's part sidecars are DWI-flavoured stubs. Each part gets the complete
-        // ASL sidecar (the phase part with its Units). There is deliberately NO inheritance-level
-        // `_asl.json`: with `part-` entities there is no `_asl.nii.gz`, and bids-validator 3
-        // flags such a file as SIDECAR_WITHOUT_DATAFILE; it also checks required keys per part
-        // file without merging a less specific sidecar in, so each part must be complete.
-        let mut side: Map<String, Value> = p.input_sidecar.as_object().cloned().unwrap_or_default();
-        // Standard keys describe what was SIMULATED, not what the input said: an overlay may
-        // have overridden the sidecar's LabelingEfficiency, and PartialFourier or the
-        // acceleration factor come from the overlay/protocol, not the input. The originals are
-        // kept under AslscanSimulation.InputValuesReplaced so nothing is lost.
-        let mut effective: Vec<(&str, Value)> = vec![
-            ("LabelingEfficiency", json!(p.alpha.0)),
-            ("PartialFourier", json!(out.acquisition.partial_fourier)),
-            ("ParallelReductionFactorInPlane", json!(out.acquisition.accel)),
-            ("MultibandAccelerationFactor", json!(p.mb)),
-            ("TotalAcquiredPairs", json!(p.total_acquired_pairs())),
-        ];
-        if let Some(ir) = &p.ir {
-            // Standard fields; a simasl-legal negative excitation angle is written as its
-            // positive equivalent (BIDS: 0..360), the signed value staying in the block above.
-            effective.push(("InversionTime", json!(ir.params.inversion_time)));
-            effective.push(("FlipAngle", json!(ir.params.excitation_flip_deg.rem_euclid(360.0))));
+        // P6 part C: one series per echo (`echo-N`), each from its own input sidecar; with one echo the
+        // names carry no echo entity and this runs once, as before
+        let n_echo = p.echo_times_s.len();
+        if out.more_echoes.len() + 1 != n_echo {
+            return Err(format!("{n_echo} echo times but {} echo series simulated", out.more_echoes.len() + 1));
         }
-        if let Some(g) = &p.ge {
-            effective.push(("FlipAngle", json!(g.flip_deg.rem_euclid(360.0))));
-        }
-        // P5 part B: a 3D readout's standard keys as resolved (the effective spacing BIDS defines,
-        // TotalReadoutTime = it x (ny - 1), the direction, the shots, the refocusing angle)
-        if let (Some(r3), Some(rs)) = (&out.readout, &p.readout) {
-            if let Some(sp) = &r3.spiral {
-                // a spiral has no phase-encode readout (its EES, TRT and PED were refused)
-                effective.push(("DwellTime", json!(sp.dwell_ms / 1000.0)));
-            } else {
-                let ny = out.acq_grid.dims[1];
-                let ees = r3.effective_spacing_s.unwrap_or(r3.t_line_ms / 1000.0 / rs.ky_segments.0 as f64);
-                effective.push(("EffectiveEchoSpacing", json!(ees)));
-                effective.push(("TotalReadoutTime", json!(ees * (ny as f64 - 1.0))));
-                effective.push(("PhaseEncodingDirection", json!(p.phase_encoding_direction)));
-            }
-            if let Some(t) = overridden_sequence_type(p) {
-                effective.push(("PulseSequenceType", json!(t)));
-            }
-            effective.push(("NumberShots", json!(r3.n_shots)));
-            effective.push(("FlipAngle", json!(rs.refocusing_flip_deg.0)));
-        }
-        if let Some(s) = &p.suppression {
-            // BIDS carries the first PLD's pulse times; an overlay override must be what is
-            // published, with the input kept under InputValuesReplaced.
-            effective.push(("BackgroundSuppressionNumberPulses", json!(s.first_pld_pulses.len())));
-            effective.push(("BackgroundSuppressionPulseTime", json!(s.first_pld_pulses)));
-        }
-        let mut replaced = Map::new();
-        for (k, v) in effective {
-            if let Some(old) = side.get(k) {
-                if !same_number(old, &v) {
-                    replaced.insert(k.to_string(), old.clone());
-                }
-            }
-            side.insert(k.to_string(), v);
-        }
-        let mut sim = simulation_block(p, out);
-        sim["InputValuesReplaced"] = Value::Object(replaced);
-        side.insert("AslscanSimulation".to_string(), sim);
-        write_json(&PathBuf::from(format!("{prefix_s}_part-mag_asl.json")), &Value::Object(side.clone()))?;
-        side.insert("Units".to_string(), json!("rad"));
-        write_json(&PathBuf::from(format!("{prefix_s}_part-phase_asl.json")), &Value::Object(side))?;
-        std::fs::write(format!("{prefix_s}_aslcontext.tsv"), aslcontext_tsv(&p.rows)).map_err(|e| e.to_string())?;
-
-        // The separate M0 scan.
-        if p.m0_type == M0Type::Separate {
-            let (mag, _phase) = out.m0.as_ref().ok_or("M0Type Separate but no M0 volume was simulated")?;
-            write_3d(&PathBuf::from(format!("{prefix_s}_m0scan.nii.gz")), out.acq_grid.dims, mag, &out.acq_grid)
-                .map_err(|e| e.to_string())?;
-            let mut m0side = Map::new();
-            // The readout and the hardware are the ASL series'; BIDS recommends the hardware keys
-            // on every sidecar, so they are carried over when the input has them.
-            for k in ["Manufacturer", "ManufacturersModelName", "DeviceSerialNumber", "StationName",
-                      "SoftwareVersions", "MagneticFieldStrength", "ReceiveCoilName", "ReceiveCoilActiveElements",
-                      "GradientSetType", "MRTransmitCoilSequence", "MatrixCoilMode", "CoilCombinationMethod",
-                      "InstitutionName", "InstitutionAddress", "InstitutionalDepartmentName",
-                      "MRAcquisitionType", "PhaseEncodingDirection", "TotalReadoutTime", "EchoTime",
-                      "SliceTiming", "SliceEncodingDirection", "AcquisitionVoxelSize", "FlipAngle"] {
-                if let Some(v) = p.input_sidecar.get(k) {
-                    m0side.insert(k.to_string(), v.clone());
-                }
-            }
-            // The M0 scan shares the ASL readout, so its effective readout values are the same.
-            m0side.insert("PartialFourier".to_string(), json!(out.acquisition.partial_fourier));
-            m0side.insert("ParallelReductionFactorInPlane".to_string(), json!(out.acquisition.accel));
-            m0side.insert("MultibandAccelerationFactor".to_string(), json!(p.mb));
-            m0side.insert("RepetitionTimePreparation".to_string(), json!(p.m0_repetition_time_s));
-            m0side.insert("IntendedFor".to_string(), json!([
-                format!("bids::{}", names.rel("_part-mag_asl.nii.gz")),
-                format!("bids::{}", names.rel("_part-phase_asl.nii.gz")),
-            ]));
-            // The M0 scan is simulated with the 90-degree spin-echo equation whatever the ASL
-            // series' excitation angle, except under gradient echo, whose M0 is the same
-            // excitation and readout (P5 part A); its FlipAngle says which, the input kept as
-            // replaced.
-            let (m0_flip, m0_contrast, m0_note) = match (&p.ge, &p.readout) {
-                (Some(g), _) => (g.flip_deg.rem_euclid(360.0), "ge",
-                                 "the series' gradient-echo readout at its own repetition time: no suppression, no motion"),
-                // P5 part B: the same echo train, its FlipAngle the refocusing angle
-                (None, Some(rs)) => (rs.refocusing_flip_deg.0, "se",
-                                     "the series' 3D echo train at its own repetition time, excited at its start: no \
-                                      labeling, no suppression, no motion"),
-                (None, None) => (90.0, "se", "a plain spin-echo readout at its own repetition time: no suppression, no inversion, no motion"),
+        for e in 0..n_echo {
+            let echo_tag = if n_echo > 1 { format!("_echo-{}", e + 1) } else { String::new() };
+            let prefix_e = format!("{prefix_s}{echo_tag}");
+            let input_e: &Value = match &p.multi_te {
+                Some(m) => &m.sidecars[e],
+                None => &p.input_sidecar,
             };
+            let echo_time_s = p.echo_times_s[e];
+            let (mag_e, phase_e, m0_e) = if e == 0 {
+                (&out.mag[..], &out.phase[..], out.m0.as_ref())
+            } else {
+                let x = &out.more_echoes[e - 1];
+                (&x.mag[..], &x.phase[..], x.m0.as_ref())
+            };
+            let info = SidecarInfo {
+                manufacturer: "aslscan".to_string(),
+                phase_encoding_direction: p.phase_encoding_direction.clone(),
+                total_readout_time: p.total_readout_time_s,
+                echo_time: echo_time_s,
+                partial_fourier: out.acquisition.partial_fourier,
+                accel: out.acquisition.accel,
+                mb: p.mb,
+                repetition_time_s: nifti_tr,
+                b0_field_source: None,
+            };
+            write_complex_4d(&prefix_e, "asl", out.acq_grid.dims, out.n_volumes, mag_e, phase_e, &out.acq_grid, &info)
+                .map_err(|e| e.to_string())?;
+            // The shared writer's part sidecars are DWI-flavoured stubs. Each part gets the complete
+            // ASL sidecar (the phase part with its Units). There is deliberately NO inheritance-level
+            // `_asl.json`: with `part-` entities there is no `_asl.nii.gz`, and bids-validator 3
+            // flags such a file as SIDECAR_WITHOUT_DATAFILE; it also checks required keys per part
+            // file without merging a less specific sidecar in, so each part must be complete.
+            let mut side: Map<String, Value> = input_e.as_object().cloned().unwrap_or_default();
+            // Standard keys describe what was SIMULATED, not what the input said: an overlay may
+            // have overridden the sidecar's LabelingEfficiency, and PartialFourier or the
+            // acceleration factor come from the overlay/protocol, not the input. The originals are
+            // kept under AslscanSimulation.InputValuesReplaced so nothing is lost.
+            let mut effective: Vec<(&str, Value)> = vec![
+                ("LabelingEfficiency", json!(p.alpha.0)),
+                ("PartialFourier", json!(out.acquisition.partial_fourier)),
+                ("ParallelReductionFactorInPlane", json!(out.acquisition.accel)),
+                ("MultibandAccelerationFactor", json!(p.mb)),
+                ("TotalAcquiredPairs", json!(p.total_acquired_pairs())),
+            ];
+            if let Some(ir) = &p.ir {
+                // Standard fields; a simasl-legal negative excitation angle is written as its
+                // positive equivalent (BIDS: 0..360), the signed value staying in the block above.
+                effective.push(("InversionTime", json!(ir.params.inversion_time)));
+                effective.push(("FlipAngle", json!(ir.params.excitation_flip_deg.rem_euclid(360.0))));
+            }
+            if let Some(g) = &p.ge {
+                effective.push(("FlipAngle", json!(g.flip_deg.rem_euclid(360.0))));
+            }
+            // P5 part B: a 3D readout's standard keys as resolved (the effective spacing BIDS defines,
+            // TotalReadoutTime = it x (ny - 1), the direction, the shots, the refocusing angle)
             if let (Some(r3), Some(rs)) = (&out.readout, &p.readout) {
                 if let Some(sp) = &r3.spiral {
-                    m0side.insert("DwellTime".to_string(), json!(sp.dwell_ms / 1000.0));
+                    // a spiral has no phase-encode readout (its EES, TRT and PED were refused)
+                    effective.push(("DwellTime", json!(sp.dwell_ms / 1000.0)));
                 } else {
                     let ny = out.acq_grid.dims[1];
                     let ees = r3.effective_spacing_s.unwrap_or(r3.t_line_ms / 1000.0 / rs.ky_segments.0 as f64);
-                    m0side.insert("EffectiveEchoSpacing".to_string(), json!(ees));
-                    m0side.insert("TotalReadoutTime".to_string(), json!(ees * (ny as f64 - 1.0)));
-                    m0side.insert("PhaseEncodingDirection".to_string(), json!(p.phase_encoding_direction));
+                    effective.push(("EffectiveEchoSpacing", json!(ees)));
+                    effective.push(("TotalReadoutTime", json!(ees * (ny as f64 - 1.0))));
+                    effective.push(("PhaseEncodingDirection", json!(p.phase_encoding_direction)));
                 }
-                m0side.insert("NumberShots".to_string(), json!(r3.n_shots));
                 if let Some(t) = overridden_sequence_type(p) {
-                    m0side.insert("PulseSequenceType".to_string(), json!(t));
+                    effective.push(("PulseSequenceType", json!(t)));
                 }
+                effective.push(("NumberShots", json!(r3.n_shots)));
+                effective.push(("FlipAngle", json!(rs.refocusing_flip_deg.0)));
             }
-            let mut m0_replaced = Map::new();
-            if let Some(old) = m0side.get("FlipAngle") {
-                if !same_number(old, &json!(m0_flip)) {
-                    m0_replaced.insert("FlipAngle".to_string(), old.clone());
-                }
+            if let Some(s) = &p.suppression {
+                // BIDS carries the first PLD's pulse times; an overlay override must be what is
+                // published, with the input kept under InputValuesReplaced.
+                effective.push(("BackgroundSuppressionNumberPulses", json!(s.first_pld_pulses.len())));
+                effective.push(("BackgroundSuppressionPulseTime", json!(s.first_pld_pulses)));
             }
-            // the shared readout's values the M0 sidecar states in place of the input's
-            for k in ["DwellTime", "PulseSequenceType"] {
-                if let (Some(old), Some(new)) = (p.input_sidecar.get(k), m0side.get(k)) {
-                    if !same_number(old, new) {
-                        m0_replaced.insert(k.to_string(), old.clone());
+            let mut replaced = Map::new();
+            for (k, v) in effective {
+                if let Some(old) = side.get(k) {
+                    if !same_number(old, &v) {
+                        replaced.insert(k.to_string(), old.clone());
                     }
                 }
+                side.insert(k.to_string(), v);
             }
-            m0side.insert("FlipAngle".to_string(), json!(m0_flip));
-            let mut m0sim = json!({
-                "Seed": out.seeds.1, "Magnitude": true, "Contrast": m0_contrast,
-                "Note": m0_note,
-                "InputValuesReplaced": m0_replaced,
-            });
-            if p.physio.is_some() {
-                m0sim["Physio"] = json!("not applied: the separate M0 scan is not a row of the series' clock");
+            let mut sim = simulation_block(p, out);
+            sim["InputValuesReplaced"] = Value::Object(replaced);
+            if let Some(me) = multi_echo_block(p, out, e) {
+                sim["MultiEcho"] = me;
             }
-            if let Some(r3) = &out.readout {
-                // the series' readout block without its excitation times (the M0 is excited at the
-                // start of its own repetition)
-                let mut ro = simulation_block(p, out)["Readout"].clone();
-                if let Some(o) = ro.as_object_mut() {
-                    o.remove("ExcitationTimes");
-                    o.insert("VolumeDuration".to_string(), json!(r3.n_shots as f64 * p.m0_repetition_time_s.unwrap_or(0.0)));
+            side.insert("AslscanSimulation".to_string(), sim);
+            write_json(&PathBuf::from(format!("{prefix_e}_part-mag_asl.json")), &Value::Object(side.clone()))?;
+            side.insert("Units".to_string(), json!("rad"));
+            write_json(&PathBuf::from(format!("{prefix_e}_part-phase_asl.json")), &Value::Object(side))?;
+            // one aslcontext for every echo (BIDS inheritance: it carries no echo entity)
+            if e == 0 {
+                std::fs::write(format!("{prefix_s}_aslcontext.tsv"), aslcontext_tsv(&p.rows)).map_err(|e| e.to_string())?;
+            }
+
+            // The separate M0 scan.
+            if p.m0_type == M0Type::Separate {
+                let (mag, _phase) = m0_e.ok_or("M0Type Separate but no M0 volume was simulated")?;
+                write_3d(&PathBuf::from(format!("{prefix_e}_m0scan.nii.gz")), out.acq_grid.dims, mag, &out.acq_grid)
+                    .map_err(|e| e.to_string())?;
+                let mut m0side = Map::new();
+                // The readout and the hardware are the ASL series'; BIDS recommends the hardware keys
+                // on every sidecar, so they are carried over when the input has them.
+                for k in ["Manufacturer", "ManufacturersModelName", "DeviceSerialNumber", "StationName",
+                          "SoftwareVersions", "MagneticFieldStrength", "ReceiveCoilName", "ReceiveCoilActiveElements",
+                          "GradientSetType", "MRTransmitCoilSequence", "MatrixCoilMode", "CoilCombinationMethod",
+                          "InstitutionName", "InstitutionAddress", "InstitutionalDepartmentName",
+                          "MRAcquisitionType", "PhaseEncodingDirection", "TotalReadoutTime", "EchoTime",
+                          "SliceTiming", "SliceEncodingDirection", "AcquisitionVoxelSize", "FlipAngle"] {
+                    if let Some(v) = input_e.get(k) {
+                        m0side.insert(k.to_string(), v.clone());
+                    }
                 }
-                m0sim["Readout"] = ro;
+                // The M0 scan shares the ASL readout, so its effective readout values are the same.
+                m0side.insert("PartialFourier".to_string(), json!(out.acquisition.partial_fourier));
+                m0side.insert("ParallelReductionFactorInPlane".to_string(), json!(out.acquisition.accel));
+                m0side.insert("MultibandAccelerationFactor".to_string(), json!(p.mb));
+                m0side.insert("RepetitionTimePreparation".to_string(), json!(p.m0_repetition_time_s));
+                m0side.insert("IntendedFor".to_string(), json!([
+                    format!("bids::{}", names.rel(&format!("{echo_tag}_part-mag_asl.nii.gz"))),
+                    format!("bids::{}", names.rel(&format!("{echo_tag}_part-phase_asl.nii.gz"))),
+                ]));
+                // The M0 scan is simulated with the 90-degree spin-echo equation whatever the ASL
+                // series' excitation angle, except under gradient echo, whose M0 is the same
+                // excitation and readout (P5 part A); its FlipAngle says which, the input kept as
+                // replaced.
+                let (m0_flip, m0_contrast, m0_note) = match (&p.ge, &p.readout) {
+                    (Some(g), _) => (g.flip_deg.rem_euclid(360.0), "ge",
+                                     "the series' gradient-echo readout at its own repetition time: no suppression, no motion"),
+                    // P5 part B: the same echo train, its FlipAngle the refocusing angle
+                    (None, Some(rs)) => (rs.refocusing_flip_deg.0, "se",
+                                         "the series' 3D echo train at its own repetition time, excited at its start: no \
+                                          labeling, no suppression, no motion"),
+                    (None, None) => (90.0, "se", "a plain spin-echo readout at its own repetition time: no suppression, no inversion, no motion"),
+                };
+                if let (Some(r3), Some(rs)) = (&out.readout, &p.readout) {
+                    if let Some(sp) = &r3.spiral {
+                        m0side.insert("DwellTime".to_string(), json!(sp.dwell_ms / 1000.0));
+                    } else {
+                        let ny = out.acq_grid.dims[1];
+                        let ees = r3.effective_spacing_s.unwrap_or(r3.t_line_ms / 1000.0 / rs.ky_segments.0 as f64);
+                        m0side.insert("EffectiveEchoSpacing".to_string(), json!(ees));
+                        m0side.insert("TotalReadoutTime".to_string(), json!(ees * (ny as f64 - 1.0)));
+                        m0side.insert("PhaseEncodingDirection".to_string(), json!(p.phase_encoding_direction));
+                    }
+                    m0side.insert("NumberShots".to_string(), json!(r3.n_shots));
+                    if let Some(t) = overridden_sequence_type(p) {
+                        m0side.insert("PulseSequenceType".to_string(), json!(t));
+                    }
+                }
+                let mut m0_replaced = Map::new();
+                if let Some(old) = m0side.get("FlipAngle") {
+                    if !same_number(old, &json!(m0_flip)) {
+                        m0_replaced.insert("FlipAngle".to_string(), old.clone());
+                    }
+                }
+                // the shared readout's values the M0 sidecar states in place of the input's
+                for k in ["DwellTime", "PulseSequenceType"] {
+                    if let (Some(old), Some(new)) = (input_e.get(k), m0side.get(k)) {
+                        if !same_number(old, new) {
+                            m0_replaced.insert(k.to_string(), old.clone());
+                        }
+                    }
+                }
+                m0side.insert("FlipAngle".to_string(), json!(m0_flip));
+                let mut m0sim = json!({
+                    "Seed": out.seeds.1, "Magnitude": true, "Contrast": m0_contrast,
+                    "Note": m0_note,
+                    "InputValuesReplaced": m0_replaced,
+                });
+                if let (Some(m), Some(seed)) = (&p.multi_te, out.seeds.1) {
+                    m0sim["MultiEcho"] = json!({
+                        "Echo": e + 1, "EchoTimes": p.echo_times_s, "ExcitationSeed": seed,
+                        "ReceiverSeed": seed ^ mrsim_acq::kspace::echo_salt(e), "Echoes": m.sidecars.len(),
+                    });
+                }
+                if p.physio.is_some() {
+                    m0sim["Physio"] = json!("not applied: the separate M0 scan is not a row of the series' clock");
+                }
+                if let Some(r3) = &out.readout {
+                    // the series' readout block without its excitation times (the M0 is excited at the
+                    // start of its own repetition)
+                    let mut ro = simulation_block(p, out)["Readout"].clone();
+                    if let Some(o) = ro.as_object_mut() {
+                        o.remove("ExcitationTimes");
+                        o.insert("VolumeDuration".to_string(), json!(r3.n_shots as f64 * p.m0_repetition_time_s.unwrap_or(0.0)));
+                    }
+                    m0sim["Readout"] = ro;
+                }
+                m0side.insert("AslscanSimulation".to_string(), m0sim);
+                write_json(&PathBuf::from(format!("{prefix_e}_m0scan.json")), &Value::Object(m0side))?;
             }
-            m0side.insert("AslscanSimulation".to_string(), m0sim);
-            write_json(&PathBuf::from(format!("{prefix_s}_m0scan.json")), &Value::Object(m0side))?;
         }
 
         // Ground truth.

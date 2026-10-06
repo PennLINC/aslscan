@@ -53,6 +53,8 @@ pub const M0_SEED_SALT: u64 = 0x4D30_5343_414E;
 /// noise realization unchanged.
 pub const MOTION_SEED_SALT: u64 = 0x4D4F_5449_4F4E;
 
+mod p6;
+
 /// Ground-truth maps on the acquisition grid (`resample` rules per map, see the spec).
 #[derive(Debug, Clone)]
 pub struct GroundTruth {
@@ -147,6 +149,18 @@ pub struct SeriesOutput {
     /// P5 part C: a spiral's certified time segmentations, per slice and mode, as the acquisition
     /// used them (`None` unless a spiral).
     pub spiral_segmentation: Option<Vec<mrsim_acq::kspace3d::SpiralSegmentation>>,
+    /// P6 part C: echoes 2.. of a multi-TE series (echo 1 is `mag`, `phase` and `m0`); empty with one.
+    pub more_echoes: Vec<EchoSeries>,
+}
+
+/// One later echo of a multi-TE series (P6 part C).
+#[derive(Debug, Clone)]
+pub struct EchoSeries {
+    pub echo_time_s: f64,
+    pub mag: Vec<f32>,
+    pub phase: Vec<f32>,
+    /// That echo's separate M0 scan.
+    pub m0: Option<(Vec<f32>, Vec<f32>)>,
 }
 
 /// The compat noise resolution (P2 addendum, part A).
@@ -422,18 +436,10 @@ fn simulate_core(
     p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, ov: RowOverride, capture: Option<&mut Vec<Vec<f32>>>,
 ) -> Result<SeriesOutput, String> {
     if p.p6_active() {
-        simulate_p6(p, ph, mode, phase, ov, capture)
+        p6::simulate_p6(p, ph, mode, phase, ov, capture)
     } else {
         simulate_legacy(p, ph, mode, phase, ov, capture)
     }
-}
-
-/// The series of a protocol with a P6 feature, driven by its [`Schedule`](crate::schedule::Schedule).
-fn simulate_p6(
-    _p: &Protocol, _ph: &Phantom, _mode: T2Mode, _phase: &PhaseModel, _ov: RowOverride,
-    _capture: Option<&mut Vec<Vec<f32>>>,
-) -> Result<SeriesOutput, String> {
-    Err("P6 series (Hadamard, Look-Locker, multi-TE) are not implemented yet".to_string())
 }
 
 /// The series of every protocol without a P6 feature: the P1-P5 code, unchanged.
@@ -1257,6 +1263,7 @@ fn simulate_legacy(
         readout: res3d.clone(),
         echo_amplitudes,
         spiral_segmentation,
+        more_echoes: Vec::new(),
         ge_rule: ge_flip.map(|fa| match (p.compat.is_some(), fa == 90.0, ge_propagated.is_some(), p.suppression.is_some()) {
             (true, ..) => "simasl's coherent steady state per volume (compat)",
             (_, true, ..) => "90 degrees: the slab is saturated, each row independent (P3's timeline, sin(a) = 1)",
