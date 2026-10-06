@@ -9,7 +9,7 @@
 use super::*;
 use mrsim_acq::kspace::simulate_acquisition_echoes;
 use crate::kinetic::{delta_m_read, Kinetic};
-use crate::longitudinal::{tissue_mz_ll_series, LlCycle};
+use crate::longitudinal::{ll_legacy_dispatch, tissue_mz_ll_series, LlCycle};
 use crate::protocol::{check_excitation_timing, HadamardSpec};
 use crate::schedule::{Output, Schedule};
 
@@ -305,9 +305,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
     // P6 part B: Look-Locker readouts. One readout per cycle at one flip is P5's series, which this
     // body already is (the legacy dispatch); every other Look-Locker series takes the readout
     // timeline for the tissue and the depleted label for the blood, each readout its own flip.
-    let ll = p.look_locker.as_ref().filter(|l| {
-        !(l.cycles.iter().all(|c| c.rows.len() == 1) && l.flip_deg.iter().all(|&f| f == l.flip_deg[0]))
-    });
+    let ll = p.look_locker.as_ref().filter(|l| !ll_legacy_dispatch(l.cycles.iter().map(|c| c.rows.len()), l.flip_array));
     let tissue_steady = |m0: f64, t1: f64, t2: f64, tr: f64, se: bool| -> f64 {
         match (p.contrast, ir, ge_flip, se) {
             (Contrast::InversionRecovery, Some(q), _, false) => tissue_ir(m0, t1, tr, &q),
@@ -521,7 +519,8 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
         let pslab = pnx * pny;
         let mut out = vec![vec![vec![0.0f32; nvox_sim]; k]; n];
         let m0scan: Vec<bool> = l.cycles.iter().map(|c| c.m0scan).collect();
-        let mut mz_mean = vec![vec![vec![0.0f64; k]; nz]; n];
+        let n_labels = ph.labels.len();
+        let mut mz_mean = vec![vec![vec![0.0f64; n_labels]; nz]; n];
         for z in 0..nz {
             let cycles: Vec<LlCycle> = l.cycles.iter().enumerate().map(|(c, cy)| LlCycle {
                 tr: rows[cy.rows[0]].tr,
@@ -535,16 +534,17 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                 pos * pslab + i % pslab
             };
             let mut seq = vec![vec![0.0f64; cells.len() * pslab]; n];
-            let mut counts = vec![0usize; k];
+            let mut counts = vec![0usize; n_labels];
             for (pos, &zs) in cells.iter().enumerate() {
                 for xy in 0..pslab {
                     let i = zs * pslab + xy;
                     if ph.dseg[i] <= 0 {
                         continue;
                     }
-                    let c = masks.iter().position(|m| m[i]).unwrap_or(0);
+                    // the report is per phantom label (voxel mode has one compartment for all of them)
+                    let c = ph.labels.iter().position(|(l, _)| *l == ph.dseg[i]).expect("labels come from dseg");
                     counts[c] += 1;
-                    let mz = tissue_mz_ll_series(ph.m0[i] as f64, ph.t1[i] as f64, &cycles, &m0scan, false);
+                    let mz = tissue_mz_ll_series(ph.m0[i] as f64, ph.t1[i] as f64, &cycles, &m0scan, None, false);
                     for (v, x) in mz.into_iter().flatten().enumerate() {
                         seq[v][pos * pslab + xy] = l.flip_deg[v].to_radians().sin() * x;
                         mz_mean[v][z][c] += x;
@@ -574,7 +574,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                     let t_read = if cy.m0scan { off } else { rows[v].t + off };
                     ll_lines.push(LlLine {
                         cycle: c, readout: rd, group: g, time: first_prep(v).start_s + t_read, flip_deg: l.flip_deg[v],
-                        tissue_mz: (0..k).map(|lab| zs.iter().map(|&z| mz_mean[v][z][lab]).sum::<f64>() / zs.len() as f64).collect(),
+                        tissue_mz: (0..n_labels).map(|lab| zs.iter().map(|&z| mz_mean[v][z][lab]).sum::<f64>() / zs.len() as f64).collect(),
                     });
                 }
             }
@@ -1092,17 +1092,17 @@ pub(super) fn simulate_p6(
 ) -> Result<SeriesOutput, String> {
     let tes = p.echo_times_s.clone();
     let sched = Schedule::new(p);
-    let Built {
-        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines,
-    } = build(p, ph, mode, ov, tes[0], &sched)?;
-    // P6 part C: every echo's readout block on explicit intervals, on the acquired grid
-    if tes.len() > 1 || p.look_locker.is_some() {
-        check_excitation_timing(p, acq_grid.dims)?;
-    }
     // P6 part C, compat: the echo-time decay is the signal stage's, so each echo has its own image
-    // set, bounded before it is built
-    let mut echo_images: Vec<Vec<Vec<f32>>> = Vec::new();
+    // set, bounded before any is built: the grids and the compartment count resolved alone
     if p.compat.is_some() && tes.len() > 1 {
+        let ag = acquisition_grid(&ph.grid, p.voxel_size_mm, p.acq.matrix, p.grid_origin)?;
+        let sg = hires_grid(&ag, p.acq.oversample);
+        let k = match ph.relaxation_for(mode, false)?.0 {
+            Relaxation::Class { .. } => ph.labels.len(),
+            Relaxation::Voxel { .. } => 1,
+        };
+        // compat refuses the arterial compartment and 3D, so tissue and blood per label
+        let (ncomp, nvox_sim, n) = (2 * k, sg.dims.iter().product::<usize>(), sched.raw_rows.len());
         let bytes = 4.0 * tes.len() as f64 * ncomp as f64 * nvox_sim as f64 * n as f64;
         let limit = p.multi_te.as_ref().and_then(|m| m.max_image_memory_gib).map_or(4.0, |l| l.0);
         if bytes > limit * (1u64 << 30) as f64 {
@@ -1111,6 +1111,16 @@ pub(super) fn simulate_p6(
                  voxels x {n} volumes x 4 bytes), over the limit of {limit} GiB (overlay multi_te.max_image_memory_gib)",
                 bytes / (1u64 << 30) as f64, tes.len()));
         }
+    }
+    let Built {
+        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines,
+    } = build(p, ph, mode, ov, tes[0], &sched)?;
+    // P6 part C: every echo's readout block on explicit intervals, on the acquired grid
+    if tes.len() > 1 || p.look_locker.is_some() {
+        check_excitation_timing(p, acq_grid.dims)?;
+    }
+    let mut echo_images: Vec<Vec<Vec<f32>>> = Vec::new();
+    if p.compat.is_some() && tes.len() > 1 {
         for &te in &tes[1..] {
             echo_images.push(build(p, ph, mode, ov, te, &sched)?.images);
         }
@@ -1245,7 +1255,7 @@ pub(super) fn simulate_p6(
     // ---- P6 part A: the tissue leakage. The tissue-only raw volumes and one reference volume
     // per cycle (its unsuppressed steady state) in one call with noise, spikes and GRAPPA off,
     // decoded per cycle; the norms over the brain mask ----
-    let leakage: Option<Vec<HadamardLeakage>> = match (&p.hadamard, tissue_only) {
+    let leakage: Option<Vec<Vec<HadamardLeakage>>> = match (&p.hadamard, tissue_only) {
         (Some(h), Some(to)) => {
             let nc = sched.cycles.len();
             let nt = n + nc;
@@ -1262,11 +1272,19 @@ pub(super) fn simulate_p6(
             }
             drop(to);
             let quiet = Acquisition { noise_variance: 0.0, n_spikes: 0, accel: 1, ..acq.clone() };
-            let (tm, tp) = match &res3d {
-                None => simulate_acquisition_oversampled(
+            // every echo's (P6 part C: Hadamard x multi-TE), each acquired at its own TE
+            let per_echo: Vec<(Vec<f32>, Vec<f32>)> = match &res3d {
+                None if tes.len() > 1 => {
+                    let per: Vec<&[Vec<f32>]> = vec![&imgs[..]; tes.len()];
+                    simulate_acquisition_echoes(
+                        sim_grid.dims, acq_grid.dims, nt, &per, &t2_vols, &fmap_sim, Some(&ti_vols), &quiet, &echo_ms,
+                        &vec![None; nt], &vec![None; nt], phase, p.seed, None, None,
+                    )
+                }
+                None => vec![simulate_acquisition_oversampled(
                     sim_grid.dims, acq_grid.dims, nt, &imgs, &t2_vols, &fmap_sim, Some(&ti_vols), &quiet,
                     &vec![None; nt], &vec![None; nt], phase, p.seed, None, None,
-                ),
+                )],
                 Some(r3) => {
                     let lw = line_weights.as_ref().map(|l| {
                         let mut w = l.w.clone();
@@ -1275,11 +1293,11 @@ pub(super) fn simulate_p6(
                     });
                     let mut sets = tissue_shot_sets;
                     sets.extend(std::iter::repeat_n(Vec::new(), nc));
-                    simulate_acquisition_3d(
+                    vec![simulate_acquisition_3d(
                         sim_grid.dims, acq_grid.dims, nt, &imgs, &t2_vols, t1_vols.as_deref(), &fmap_sim, Some(&ti_vols),
                         &quiet, &r3.train, &r3.readout, lw.as_ref(), sets.iter().any(|s| !s.is_empty()).then_some(&sets[..]),
                         phase, p.seed,
-                    )
+                    )]
                 }
             };
             let brain: Vec<bool> = r_acq.majority(&ph.dseg).iter().map(|l| *l > 0).collect();
@@ -1287,16 +1305,16 @@ pub(super) fn simulate_p6(
                 img.iter().zip(&brain).filter(|(_, b)| **b).map(|(z, _)| z.0 * z.0 + z.1 * z.1).sum::<f64>().sqrt()
             };
             let eps = 1e-12 * acq.signal_scale;
-            Some(sched.cycles.iter().enumerate().map(|(cy, c)| {
-                let raw: Vec<Vec<(f64, f64)>> = c.raws.clone().map(|r| complex_volume(&tm, &tp, nt, r)).collect();
+            Some(per_echo.iter().map(|(tm, tp)| sched.cycles.iter().enumerate().map(|(cy, c)| {
+                let raw: Vec<Vec<(f64, f64)>> = c.raws.clone().map(|r| complex_volume(tm, tp, nt, r)).collect();
                 let refs: Vec<&[(f64, f64)]> = raw.iter().map(|v| v.as_slice()).collect();
-                let reference = norm(&complex_volume(&tm, &tp, nt, n + cy));
+                let reference = norm(&complex_volume(tm, tp, nt, n + cy));
                 let per_subbolus = crate::hadamard::decode(&refs, h.order).iter().map(|l| {
                     let a = norm(l);
                     (a, a / reference.max(eps))
                 }).collect();
                 HadamardLeakage { reference_norm: reference, per_subbolus }
-            }).collect())
+            }).collect()).collect())
         }
         _ => None,
     };
@@ -1380,9 +1398,13 @@ pub(super) fn simulate_p6(
             }).collect();
             let series = HadamardSeries {
                 n_raw: n, raw_mag: mag, raw_phase: phase_out, raw_more_echoes: more_mag,
-                raw_delta_m: delta_m_gt, raw_delta_m_static: delta_m_static,
+                raw_delta_m: if res3d.is_some() { delta_m_static.clone().unwrap_or(delta_m_gt) } else { delta_m_gt },
+                raw_delta_m_static: if res3d.is_some() { None } else { delta_m_static },
                 raw_delta_m_iv: gt_iv, raw_delta_m_suppressed: gt_sup, raw_delta_m_arterial: gt_art,
-                schedule: sched.clone(), leakage, prep_factors,
+                schedule: sched.clone(),
+                leakage: leakage.as_ref().map(|l| l[0].clone()),
+                leakage_more_echoes: leakage.map(|l| l[1..].to_vec()).unwrap_or_default(),
+                prep_factors,
                 flags: HadamardFlags {
                     grappa: acq.accel > 1, spikes: acq.n_spikes > 0, motion: p.motion.is_some(),
                     shot_factors: line_weights.is_some(), transients: ge_propagated_some, physiology: p.physio.is_some(),
@@ -1432,7 +1454,7 @@ pub(super) fn simulate_p6(
         look_locker: p.look_locker.as_ref().map(|l| LookLockerSeries {
             delta_m_read: gt_read,
             lines: ll_lines,
-            legacy_dispatch: l.cycles.iter().all(|c| c.rows.len() == 1) && l.flip_deg.iter().all(|&f| f == l.flip_deg[0]),
+            legacy_dispatch: ll_legacy_dispatch(l.cycles.iter().map(|c| c.rows.len()), l.flip_array),
         }),
         ge_rule: ge_flip.map(|fa| match (p.compat.is_some(), fa == 90.0, ge_propagated_some, p.suppression.is_some()) {
             (true, ..) => "simasl's coherent steady state per volume (compat)",
@@ -1986,5 +2008,51 @@ mod tests {
             assert!(abs > 1e-4 * l.reference_norm, "sub-bolus {j}: no leakage");
             assert!((norm - abs).abs() <= 1e-4 * abs, "sub-bolus {j}: {norm} vs {abs}");
         }
+    }
+
+    /// Review fixes: a 3D Hadamard raw volume's kinetic truth is static under volume motion (its
+    /// shots have their own poses), so it equals the motionless series' raw truth; and each echo's
+    /// leakage is acquired at its own TE, equal to the one-echo series' at that TE.
+    #[test]
+    fn three_d_raw_truth_is_static_and_leakage_is_per_echo() {
+        let ph = crop();
+        let order = 4;
+        let n_sub = order - 1;
+        let (ld, pld): (Vec<f64>, Vec<f64>) = (0..n_sub).map(|j| (TAU, PLD + TAU * (n_sub - 1 - j) as f64)).unzip();
+        let ctx = format!("volume_type\n{}", "deltam\n".repeat(n_sub));
+        let run3d = |motion: &str| {
+            let p = parse_echoes(&[sidecar3d(ld.clone(), pld.clone(), vec![4.0; n_sub])], &ctx,
+                                 Some(&overlay(&format!("[hadamard]\norder = {order}\n{motion}"), false)), None).unwrap();
+            simulate_p6(&p, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).unwrap()
+        };
+        let still = run3d("");
+        let moved = run3d("[motion]\nmode = \"random\"\ntrans_mm = [1.0, 1.0, 0.0]\nrot_deg = [0.0, 0.0, 2.0]\n");
+        let (hs, hm) = (still.hadamard.as_ref().unwrap(), moved.hadamard.as_ref().unwrap());
+        assert!(hm.raw_delta_m_static.is_none());
+        assert_eq!(hm.raw_delta_m, hs.raw_delta_m);
+        assert!(moved.poses.iter().all(|q| *q != Pose::IDENTITY));
+
+        // two echoes after an included M0 (a gradient-echo transient, so leakage is nonzero)
+        let (mut ld2, mut pld2, mut tr2) = (vec![0.0], vec![0.0], vec![6.0]);
+        ld2.extend(&ld);
+        pld2.extend(&pld);
+        tr2.extend(vec![4.0; n_sub]);
+        let side = |te: f64| {
+            let mut s = sidecar(ld2.clone(), pld2.clone(), tr2.clone(), "Included", true);
+            s["EchoTime"] = json!(te);
+            s["SliceTiming"] = json!([0.0, 0.07]);
+            s
+        };
+        let ctx2 = format!("volume_type\nm0scan\n{}", "deltam\n".repeat(n_sub));
+        let ov = overlay(&format!("[hadamard]\norder = {order}\n"), true);
+        let two = parse_echoes(&[side(0.013), side(0.032)], &ctx2, Some(&ov), None).unwrap();
+        let out = simulate_p6(&two, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).unwrap();
+        let h = out.hadamard.as_ref().unwrap();
+        let one = parse_echoes(&[side(0.032)], &ctx2, Some(&ov), None).unwrap();
+        let o1 = simulate_p6(&one, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).unwrap();
+        let (e2, single) = (&h.leakage_more_echoes[0], o1.hadamard.as_ref().unwrap().leakage.as_ref().unwrap());
+        assert_eq!(e2, single);
+        assert!(e2[0].per_subbolus[0].0 > 0.0);
+        assert_ne!(h.leakage.as_ref().unwrap()[0].per_subbolus[0].0, e2[0].per_subbolus[0].0);
     }
 }

@@ -219,18 +219,24 @@ pub fn tissue_mz_ll_sequence(m0: f64, t1: f64, cycles: &[LlCycle]) -> Vec<Vec<f6
     out
 }
 
-/// The Look-Locker tissue of a series, with the legacy dispatch (P6 addendum, part B): when every
-/// cycle has one readout and the series one flip, P5's [`tissue_mz_ge`] (one cycle repeated) and
-/// [`tissue_mz_ge_sequence`] themselves, so the result is P5's bit for bit; `m0scan` cycles then
-/// take P5's convention (read at the end of their repetition, `t_read = tr`). Every other series
-/// takes the generalized timeline, where an `m0scan` cycle is read at the start of its repetition
-/// (its own `t_read`). `uniform` says the cycles' preparations are all the same (P5's closed form).
-pub fn tissue_mz_ll_series(m0: f64, t1: f64, cycles: &[LlCycle], m0scan: &[bool], uniform: bool) -> Vec<Vec<f64>> {
-    let one_flip = cycles.first().and_then(|c| c.flip_deg.first()).copied();
-    let legacy = cycles.iter().all(|c| c.t_read.len() == 1)
-        && cycles.iter().all(|c| c.flip_deg.first().copied() == one_flip);
-    match (legacy, one_flip) {
-        (true, Some(fa)) => {
+/// Whether a Look-Locker series takes the legacy dispatch (P6 addendum, part B): every cycle one
+/// readout and one scalar `FlipAngle` for the whole series (P5's sequence takes one flip; an array,
+/// even of equal values, gives every volume its own excitation and takes the generalized timeline).
+pub fn ll_legacy_dispatch(readouts_per_cycle: impl IntoIterator<Item = usize>, flip_array: bool) -> bool {
+    !flip_array && readouts_per_cycle.into_iter().all(|m| m == 1)
+}
+
+/// The Look-Locker tissue of a series. With `legacy_flip` (the series' scalar flip, given when
+/// [`ll_legacy_dispatch`] holds) it is P5's [`tissue_mz_ge`] (one cycle repeated, `uniform`) or
+/// [`tissue_mz_ge_sequence`] themselves, so the result is P5's bit for bit, `m0scan` cycles taking
+/// P5's convention (read at the end of their repetition, `t_read = tr`). Otherwise the generalized
+/// timeline, where an `m0scan` cycle is read at the start of its repetition (its own `t_read`).
+pub fn tissue_mz_ll_series(m0: f64, t1: f64, cycles: &[LlCycle], m0scan: &[bool], legacy_flip: Option<f64>, uniform: bool)
+    -> Vec<Vec<f64>>
+{
+    match legacy_flip {
+        Some(fa) => {
+            assert!(cycles.iter().all(|c| c.t_read.len() == 1), "the legacy dispatch has one readout per cycle");
             let empty = Suppression::new(vec![], 0.0, false);
             if uniform {
                 cycles.iter().map(|c| vec![tissue_mz_ge(m0, t1, c.tr, c.t_read[0], c.s.unwrap_or(&empty), fa)]).collect()
@@ -241,7 +247,7 @@ pub fn tissue_mz_ll_series(m0: f64, t1: f64, cycles: &[LlCycle], m0scan: &[bool]
                 tissue_mz_ge_sequence(m0, t1, &preps, fa).into_iter().map(|x| vec![x]).collect()
             }
         }
-        _ => tissue_mz_ll_sequence(m0, t1, cycles),
+        None => tissue_mz_ll_sequence(m0, t1, cycles),
     }
 }
 
@@ -453,21 +459,61 @@ mod tests {
 
     // ---- P6 part B: the Look-Locker timeline
 
-    /// Brute force: the cycles applied event by event from Mz = 0, repeated `reps` times, the
-    /// states before the readouts of the last repetition (or of every cycle of a sequence).
-    fn brute_ll(m0: f64, t1: f64, cycles: &[LlCycle], reps: usize) -> Vec<Vec<f64>> {
+    /// An independent reference, not sharing `ll_cycle`: each cycle written as an explicit
+    /// time-sorted event list (its suppression pulses, then its readouts), `Mz` advanced between
+    /// events by exact exponential recovery; repeated `reps` times from `Mz = 0`, the first cycle
+    /// alone until the last repetition. Returns the states before the readouts of the last
+    /// repetition. `eps_override` replaces the pulses' efficiency (the negative control).
+    fn brute_ll_with(m0: f64, t1: f64, cycles: &[LlCycle], reps: usize, eps_override: Option<f64>) -> Vec<Vec<f64>> {
+        let step = |mz: f64, dt: f64| m0 + (mz - m0) * (-dt / t1).exp();
         let mut mz = 0.0;
         let mut last = Vec::new();
         for r in 0..reps {
             let seq: &[LlCycle] = if r + 1 < reps { &cycles[..1] } else { cycles };
             last.clear();
             for c in seq {
-                let (b, e) = ll_cycle(mz, m0, t1, c);
-                last.push(b);
-                mz = e;
+                let mut events: Vec<(f64, f64, bool)> = Vec::new();
+                if let Some(s) = c.s {
+                    if s.presaturation {
+                        mz = 0.0;
+                    }
+                    for &p in &s.pulse_times {
+                        events.push((p, 1.0 - 2.0 * eps_override.unwrap_or(s.epsilon), false));
+                    }
+                }
+                for (&t, &a) in c.t_read.iter().zip(&c.flip_deg) {
+                    events.push((t, a.to_radians().cos(), true));
+                }
+                events.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let (mut t, mut before) = (0.0, Vec::new());
+                for (te, f, readout) in events {
+                    mz = step(mz, te - t);
+                    t = te;
+                    if readout {
+                        before.push(mz);
+                    }
+                    mz *= f;
+                }
+                mz = step(mz, c.tr - t);
+                last.push(before);
             }
         }
         last
+    }
+
+    fn brute_ll(m0: f64, t1: f64, cycles: &[LlCycle], reps: usize) -> Vec<Vec<f64>> {
+        brute_ll_with(m0, t1, cycles, reps, None)
+    }
+
+    /// The reference detects a changed event: a different pulse efficiency moves the states.
+    #[test]
+    fn the_look_locker_reference_is_sensitive() {
+        let s = Suppression::new(vec![0.5, 0.8], 0.95, false);
+        let t: Vec<f64> = (0..6).map(|n| 1.0 + 0.3 * n as f64).collect();
+        let c = cycle(5.0, Some(&s), &t, &[35.0; 6]);
+        let got = tissue_mz_ll(74.6, 1.33, &c);
+        let other = brute_ll_with(74.6, 1.33, std::slice::from_ref(&c), 400, Some(0.9)).remove(0);
+        assert!(got.iter().zip(&other).any(|(g, w)| (g - w).abs() > 1e-3), "{got:?} vs {other:?}");
     }
 
     fn cycle<'a>(tr: f64, s: Option<&'a Suppression>, t: &[f64], fa: &[f64]) -> LlCycle<'a> {
@@ -476,7 +522,7 @@ mod tests {
 
     #[test]
     fn the_look_locker_fixed_point_is_the_repeated_cycle() {
-        let s = Suppression::new(vec![0.5, 1.1], 0.95, false);
+        let s = Suppression::new(vec![0.5, 0.8], 0.95, false);
         let t: Vec<f64> = (0..12).map(|n| 1.0 + 0.3 * n as f64).collect();
         for (sup, fa) in [(None, 35.0), (Some(&s), 35.0), (Some(&s), 12.0), (None, 89.0)] {
             let c = cycle(5.0, sup, &t, &[fa; 12]);
@@ -509,16 +555,16 @@ mod tests {
         let fa = 35.0;
         let cycles = [cycle(4.0, Some(&s), &[3.6], &[fa]), cycle(4.0, Some(&s), &[2.8], &[fa]), cycle(6.0, None, &[6.0], &[fa])];
         let m0scan = [false, false, true];
-        let got = tissue_mz_ll_series(74.6, 1.33, &cycles, &m0scan, false);
+        let got = tissue_mz_ll_series(74.6, 1.33, &cycles, &m0scan, Some(fa), false);
         let preps = [Prep { tr: 4.0, t_read: 3.6, s: Some(&s) }, Prep { tr: 4.0, t_read: 2.8, s: Some(&s) },
                      Prep { tr: 6.0, t_read: 6.0, s: None }];
         let want = tissue_mz_ge_sequence(74.6, 1.33, &preps, fa);
         assert_eq!(got.iter().map(|v| v[0].to_bits()).collect::<Vec<_>>(), want.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
-        let uni = tissue_mz_ll_series(74.6, 1.33, &cycles[..1], &[false], true);
+        let uni = tissue_mz_ll_series(74.6, 1.33, &cycles[..1], &[false], Some(fa), true);
         assert_eq!(uni[0][0].to_bits(), tissue_mz_ge(74.6, 1.33, 4.0, 3.6, &s, fa).to_bits());
         // M = 1 with varying flips: the generalized timeline
         let vary = [cycle(4.0, Some(&s), &[3.6], &[35.0]), cycle(4.0, Some(&s), &[3.6], &[50.0])];
-        let got = tissue_mz_ll_series(74.6, 1.33, &vary, &[false, false], false);
+        let got = tissue_mz_ll_series(74.6, 1.33, &vary, &[false, false], None, false);
         let want = brute_ll(74.6, 1.33, &vary, 400);
         for (g, w) in got.iter().flatten().zip(want.iter().flatten()) {
             assert!((g - w).abs() <= 1e-12, "{g} vs {w}");
@@ -534,7 +580,7 @@ mod tests {
         let ll = cycle(4.5, Some(&s), &t, &[30.0; 6]);
         let m0c = cycle(4.5, None, &[0.02], &[15.0]);
         let cycles = [ll.clone(), m0c, ll];
-        let got = tissue_mz_ll_series(74.6, 1.33, &cycles, &[false, true, false], false);
+        let got = tissue_mz_ll_series(74.6, 1.33, &cycles, &[false, true, false], None, false);
         let want = brute_ll(74.6, 1.33, &cycles, 400);
         for (g, w) in got.iter().flatten().zip(want.iter().flatten()) {
             assert!((g - w).abs() <= 1e-12, "{g} vs {w}");

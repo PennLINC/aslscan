@@ -1808,3 +1808,58 @@ fn the_look_locker_fixture_loads_and_runs() {
     let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
     assert_eq!(out.look_locker.as_ref().unwrap().lines.len(), 2 * 12 * 2);
 }
+
+/// Review fixes, end to end: Hadamard motion covers every raw volume; a constant FlipAngle array
+/// takes the generalized Look-Locker timeline (the legacy dispatch is a scalar flip); the
+/// Look-Locker table is per phantom label in voxel mode; the preparation table's header; each
+/// echo's acquisition record carries its own TE.
+#[test]
+fn review_fixes_end_to_end() {
+    // every raw volume moves (default volumes: all 8 raw volumes of one H4 x 2 cycle series)
+    let p = hadamard_crop(4, 2, false, "[motion]\nmode = \"random\"\ntrans_mm = [1.0, 1.0, 0.0]\nrot_deg = [0.0, 0.0, 2.0]\n", false);
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert_eq!(out.poses.len(), 8);
+    assert!(out.poses.iter().all(|q| q.trans_mm != [0.0; 3]), "{:?}", out.poses);
+
+    // one readout per cycle with a constant FlipAngle array: the generalized timeline
+    let mut arr = look_locker(&["control", "label"], 1, 35.0, 4.5, "");
+    {
+        let l = arr.look_locker.as_mut().unwrap();
+        l.flip_array = true;
+    }
+    let o = simulate_with(&arr, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert!(!o.look_locker.as_ref().unwrap().legacy_dispatch);
+    let sc = simulate_with(&look_locker(&["control", "label"], 1, 35.0, 4.5, ""), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert!(sc.look_locker.as_ref().unwrap().legacy_dispatch);
+
+    // voxel mode: the table has one mean per phantom label, and they differ
+    let v = simulate_with(&look_locker(&["control"], 4, 35.0, 4.5, ""), &crop(), T2Mode::Voxel, &phase(), RowOverride::None).unwrap();
+    let lines = &v.look_locker.as_ref().unwrap().lines;
+    assert!(lines.iter().all(|l| l.tissue_mz.len() == v.labels.len()));
+    assert!((lines[0].tissue_mz[0] - lines[0].tissue_mz[1]).abs() > 1e-6, "{:?}", lines[0].tissue_mz);
+
+    // the preparation table's header, by name
+    let p = hadamard_crop(4, 1, false, "", false);
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-review-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let prep = std::fs::read_to_string(dir.join("sourcedata/sub-01/perf/ground-truth/sub-01_desc-preparations_gt.tsv")).unwrap();
+    assert_eq!(prep.lines().next().unwrap().split('\t').collect::<Vec<_>>(),
+               ["preparation", "raw_volume", "shot", "encoding_row", "labeled_subboli", "start", "labeling_window_start",
+                "labeling_window_end", "label_factor", "tissue_factor", "suppression_factor", "shot_gain"]);
+    let raw = std::fs::read_to_string(dir.join("sourcedata/sub-01/perf/sub-01_rawvolumes.tsv")).unwrap();
+    assert_eq!(raw.lines().next().unwrap().split('\t').count(), 7);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // each echo's sidecar: its EchoTime and its acquisition TE agree
+    let p = multi_te("control,label", &SE_TES[..2], "", false);
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    for (e, te) in SE_TES[..2].iter().enumerate() {
+        let side: Value = serde_json::from_str(&std::fs::read_to_string(
+            dir.join(format!("sub-01/perf/sub-01_echo-{}_part-mag_asl.json", e + 1))).unwrap()).unwrap();
+        assert!((side["AslscanSimulation"]["Acquisition"]["TEchoMs"].as_f64().unwrap() - te * 1000.0).abs() < 1e-9);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -645,7 +645,11 @@ mod writer {
                 side.insert(k.to_string(), v);
             }
             let mut sim = simulation_block(p, out);
-            if let Some(hb) = hadamard_block(p, out) {
+            if e > 0 {
+                // the acquisition record of this echo (the one Acquisition is echo 1's)
+                sim["Acquisition"]["TEchoMs"] = json!(echo_time_s * 1000.0);
+            }
+            if let Some(hb) = hadamard_block(p, out, e) {
                 sim["Hadamard"] = hb;
             }
             if let Some(lb) = look_locker_block(p, out) {
@@ -985,17 +989,24 @@ mod writer {
             "PoseIndex": "motion poses are indexed by volume (each readout its own), not by time",
             "Pixdim4": "the NIfTI time step is the first non-m0scan row's RepetitionTimePreparation, a storage \
                         convention; the readout schedule is Cycles",
-            "GroundTruth": "desc-deltam_gt: the undepleted delta_m at each slice's excitation; desc-deltamRead_gt: what each \
-                            readout read; desc-lookLocker_gt.tsv: one line per readout and excitation group with the mean \
-                            tissue Mz before the pulse per label",
+            "GroundTruth": if ls.legacy_dispatch {
+                "desc-deltam_gt: the delta_m at each slice's excitation, which one readout per cycle reads undepleted; the \
+                 legacy dispatch writes no desc-deltamRead_gt or desc-lookLocker_gt.tsv"
+            } else {
+                "desc-deltam_gt: the undepleted delta_m at each slice's excitation; desc-deltamRead_gt: what each readout \
+                 read; desc-lookLocker_gt.tsv: one line per readout and excitation group with the mean tissue Mz before \
+                 the pulse per phantom label"
+            },
         }))
     }
 
     /// `AslscanSimulation.Hadamard` (P6 part A, "Outputs").
-    fn hadamard_block(p: &Protocol, out: &SeriesOutput) -> Option<Value> {
+    fn hadamard_block(p: &Protocol, out: &SeriesOutput, e: usize) -> Option<Value> {
         let (h, hs) = (p.hadamard.as_ref()?, out.hadamard.as_ref()?);
         let sched = &hs.schedule;
-        let leakage = match &hs.leakage {
+        // echo e's leakage, acquired at its own TE
+        let echo_leakage = if e == 0 { hs.leakage.clone() } else { hs.leakage_more_echoes.get(e - 1).cloned() };
+        let leakage = match &echo_leakage {
             Some(l) => json!(l.iter().enumerate().map(|(c, x)| json!({
                 "Cycle": c + 1,
                 "ReferenceNorm": x.reference_norm,
@@ -1093,18 +1104,16 @@ mod writer {
                 "RepetitionTimePreparation": sched.raw_rows.iter().map(|r| r.tr).collect::<Vec<f64>>(),
                 "RawVolumes": h.n_raw,
                 "RawVolumeTable": format!("{}_rawvolumes.tsv", names.stem()),
-                "AslscanSimulation": { "Hadamard": hadamard_block(p, out) },
+                "AslscanSimulation": { "Hadamard": hadamard_block(p, out, e) },
             });
             write_json(&PathBuf::from(format!("{prefix_e}_part-mag_asl.json")), &side)?;
             let mut ph_side = side.clone();
             ph_side["Units"] = json!("rad");
             write_json(&PathBuf::from(format!("{prefix_e}_part-phase_asl.json")), &ph_side)?;
         }
-        let mut tsv = String::from("raw_volume	kind	cycle	encoding_row	labeled_subboli	first_preparation	preparations
-");
+        let mut tsv = String::from("raw_volume\tkind\tcycle\tencoding_row\tlabeled_subboli\tfirst_preparation\tpreparations\n");
         for (r, rv) in sched.raws.iter().enumerate() {
-            tsv.push_str(&format!("{r}	{}	{}	{}	{}	{}	{}
-",
+            tsv.push_str(&format!("{r}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 if rv.encoding_row.is_some() { "encoded" } else { sched.raw_rows[r].kind.as_str() },
                 rv.cycle.map_or("n/a".to_string(), |c| (c + 1).to_string()),
                 rv.encoding_row.map_or("n/a".to_string(), |i| i.to_string()),
@@ -1137,17 +1146,15 @@ mod writer {
                 write_4d(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.nii.gz")), out.acq_grid.dims, h.n_raw, d, &out.acq_grid)
                     .map_err(|e| e.to_string())?;
                 write_json(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.json")), &json!({
-                    "Units": "arbitrary (same as M0map)", "Description": "per raw volume, the encoded sum of its labeled                      sub-boli's part (P4's definition per row)", "Resampling": mean,
+                    "Units": "arbitrary (same as M0map)", "Description": "per raw volume, the encoded sum of its labeled sub-boli's part (P4's definition per row)", "Resampling": mean,
                 }))?;
             }
         }
         write_volume_tables(&gt_prefix, p, out)?;
         let mut tsv = String::from(
-            "preparation	raw_volume	shot	encoding_row	labeled_subboli	start	labeling_window_start	             labeling_window_end	label_factor	tissue_factor	suppression_factor	shot_gain
-");
+            "preparation\traw_volume\tshot\tencoding_row\tlabeled_subboli\tstart\tlabeling_window_start\tlabeling_window_end\tlabel_factor\ttissue_factor\tsuppression_factor\tshot_gain\n");
         for (i, f) in h.prep_factors.iter().enumerate() {
-            tsv.push_str(&format!("{i}	{}	{}	{}	{}	{}	{}	{}	{}	{}	{}	{}
-", f.raw, f.shot,
+            tsv.push_str(&format!("{i}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", f.raw, f.shot,
                 f.encoding_row.map_or("n/a".to_string(), |r| r.to_string()),
                 labeled(spec.order, f.encoding_row).iter().map(|j| j.to_string()).collect::<Vec<_>>().join(","),
                 f.start_s, f.labeling_window[0], f.labeling_window[1], f.label,

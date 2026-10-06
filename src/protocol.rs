@@ -1266,6 +1266,10 @@ fn look_locker_spec(i: LlInputs) -> Result<Option<LookLockerSpec>, String> {
     }
     let n = i.rows.len();
     let flip_array = i.flips.is_some();
+    if !flip_array && i.ge.is_some_and(|g| g.flip == Source::Default) {
+        return Err("LookLocker: true requires FlipAngle (the readouts' excitation, a scalar or one per volume); \
+                    without it the gradient-echo default of 90 degrees would saturate every readout".to_string());
+    }
     if flip_array && i.ge.is_some_and(|g| g.flip == Source::Overlay) {
         return Err("overlay: signal.excitation_flip_angle with a FlipAngle array: the array gives every volume its \
                     own excitation".to_string());
@@ -2224,7 +2228,17 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
         None
     };
 
-    let motion = overlay_motion(overlay.and_then(|o| o.motion.as_ref()), n, mb, readout.as_ref().map(|r| r.number_shots.0))?;
+    // P6 part A: under [hadamard] the motion indexes the raw volumes, H per cycle of H - 1 deltam
+    // rows (an inconsistent count is hadamard_spec's error, below)
+    let n_motion = match overlay.and_then(|o| o.hadamard.as_ref()).and_then(|h| h.order) {
+        Some(order) if order > 1 => {
+            let m0 = kinds.iter().filter(|k| **k == RowKind::M0scan).count();
+            let d = kinds.iter().filter(|k| **k == RowKind::Deltam).count();
+            if d % (order - 1) == 0 { m0 + d / (order - 1) * order } else { n }
+        }
+        _ => n,
+    };
+    let motion = overlay_motion(overlay.and_then(|o| o.motion.as_ref()), n_motion, mb, readout.as_ref().map(|r| r.number_shots.0))?;
 
     // ---- P4 (addendum; plan Task 4): activation and refusal, in the plan's order ----
     // 1. The arterial compartment: on with [macrovascular] or either map; then each quantity
@@ -4681,5 +4695,22 @@ mod tests {
             assert_eq!(sch.outputs[r], Output::Raw(r));
             assert_eq!(sch.raw_rows[r], p.rows[r]);
         }
+    }
+
+    /// Review fixes: under [hadamard] motion volumes index the raw volumes (8 for one H8 cycle,
+    /// 7 decoded rows); Look-Locker refuses a missing FlipAngle.
+    #[test]
+    fn hadamard_motion_and_look_locker_flip_rules() {
+        let (s, ctx) = hadamard_input(8, 1, &[0.25; 7], 0.2);
+        let ov = |v: &str| overlay(&format!(
+            "[hadamard]\norder = 8\n[motion]\nmode = \"random\"\ntrans_mm = [1.0, 0.0, 0.0]\nrot_deg = [0.0, 0.0, 0.0]\nvolumes = [{v}]\n"));
+        // an m0scan row and eight raw volumes: indices 0..9
+        parse(&s, &ctx, Some(&ov("0, 8")), None).unwrap();
+        assert!(parse(&s, &ctx, Some(&ov("9")), None).unwrap_err().contains("outside the 9 volumes"));
+        let (mut l, lctx) = ll_input(4, None);
+        l.as_object_mut().unwrap().remove("FlipAngle");
+        assert!(parse(&l, &lctx, Some(&overlay(GE)), None).unwrap_err().contains("requires FlipAngle"));
+        // the overlay's excitation angle gives it as well
+        parse(&l, &lctx, Some(&overlay(&format!("{GE}excitation_flip_angle = 30\n"))), None).unwrap();
     }
 }

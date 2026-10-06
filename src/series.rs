@@ -199,8 +199,10 @@ pub struct HadamardSeries {
     pub raw_delta_m_suppressed: Option<Vec<f32>>,
     pub raw_delta_m_arterial: Option<Vec<f32>>,
     pub schedule: crate::schedule::Schedule,
-    /// Per cycle, with `report_leakage`.
+    /// Per cycle, with `report_leakage` (echo 1's).
     pub leakage: Option<Vec<HadamardLeakage>>,
+    /// Echoes 2.. of a multi-TE series: each echo's leakage per cycle, at its own TE.
+    pub leakage_more_echoes: Vec<Vec<HadamardLeakage>>,
     /// Per preparation, the factors actually applied.
     pub prep_factors: Vec<PrepFactors>,
     pub flags: HadamardFlags,
