@@ -139,6 +139,112 @@ pub fn tissue_mz_ge_sequence(m0: f64, t1: f64, preps: &[Prep], flip_deg: f64) ->
     out
 }
 
+// ---- P6 part B: Look-Locker readouts ----
+
+/// One Look-Locker cycle of one slice (P6 addendum, part B): a preparation (its suppression,
+/// pulses before the first readout) followed by readouts at `t_read[n]` (s from the start of the
+/// labeling, this slice's, increasing) with flips `flip_deg[n]`, every one an event on `Mz`: the
+/// readout's signal is `sin(a) Mz` just before it and it leaves `cos(a) Mz`. The cycle lasts `tr`.
+/// An `m0scan` cycle is one readout at the start of its own repetition, no labeling, no pulses.
+#[derive(Debug, Clone)]
+pub struct LlCycle<'a> {
+    pub tr: f64,
+    pub s: Option<&'a Suppression>,
+    pub t_read: Vec<f64>,
+    pub flip_deg: Vec<f64>,
+}
+
+/// One cycle from `Mz(0) = mz0` at its start: the pulses before the first readout with recovery
+/// between them, then each readout (recovery to it, the state recorded, the `cos(a)` applied),
+/// then recovery to `tr`. Returns `Mz` before each readout and `Mz` at the end. Affine in `mz0`.
+fn ll_cycle(mz0: f64, m0: f64, t1: f64, c: &LlCycle) -> (Vec<f64>, f64) {
+    let empty = Suppression::new(vec![], 0.0, false);
+    let s = c.s.unwrap_or(&empty);
+    let first = c.t_read.first().copied().unwrap_or(c.tr);
+    let mut mz = if s.presaturation { 0.0 } else { mz0 };
+    let mut t = 0.0;
+    for &p in s.pulse_times.iter().filter(|&&p| p < first) {
+        mz = recover(mz, m0, t1, p - t);
+        mz *= 1.0 - 2.0 * s.epsilon;
+        t = p;
+    }
+    let mut before = Vec::with_capacity(c.t_read.len());
+    for (&tr_n, &fa) in c.t_read.iter().zip(&c.flip_deg) {
+        mz = recover(mz, m0, t1, tr_n - t);
+        before.push(mz);
+        mz *= fa.to_radians().cos();
+        t = tr_n;
+    }
+    (before, recover(mz, m0, t1, c.tr - t))
+}
+
+/// Signed tissue `Mz` before each readout of a Look-Locker cycle repeated to its steady state:
+/// the cycle maps its starting `Mz` affinely, `end = A Mz(0) + B`, so the steady state is
+/// `Mz(0) = B / (1 - A)` (a presaturated cycle starts from zero and needs none). A zero T1 gives
+/// zeros, as [`tissue_mz`] does.
+pub fn tissue_mz_ll(m0: f64, t1: f64, c: &LlCycle) -> Vec<f64> {
+    if t1 == 0.0 {
+        return vec![0.0; c.t_read.len()];
+    }
+    let (_, b) = ll_cycle(0.0, m0, t1, c);
+    let (_, ab) = ll_cycle(1.0, m0, t1, c);
+    let a = ab - b;
+    // |a| < 1: every readout and pulse scales by at most 1 and the recovery by exp(-tr/t1) < 1
+    let mz0 = b / (1.0 - a);
+    ll_cycle(mz0, m0, t1, c).0
+}
+
+/// Signed tissue `Mz` before each readout of each cycle of a series whose cycles differ: the first
+/// cycle starts from its own steady state ([`tissue_mz_ll`]'s, the dummy cycles taken to have run
+/// it) and each later one from the end state of the cycle before (a presaturated one from zero).
+pub fn tissue_mz_ll_sequence(m0: f64, t1: f64, cycles: &[LlCycle]) -> Vec<Vec<f64>> {
+    if t1 == 0.0 {
+        return cycles.iter().map(|c| vec![0.0; c.t_read.len()]).collect();
+    }
+    let mut out = Vec::with_capacity(cycles.len());
+    let mut mz = None;
+    for c in cycles {
+        let start = match mz {
+            None => {
+                let (_, b) = ll_cycle(0.0, m0, t1, c);
+                let (_, ab) = ll_cycle(1.0, m0, t1, c);
+                b / (1.0 - (ab - b))
+            }
+            Some(m) => m,
+        };
+        let (before, end) = ll_cycle(start, m0, t1, c);
+        out.push(before);
+        mz = Some(end);
+    }
+    out
+}
+
+/// The Look-Locker tissue of a series, with the legacy dispatch (P6 addendum, part B): when every
+/// cycle has one readout and the series one flip, P5's [`tissue_mz_ge`] (one cycle repeated) and
+/// [`tissue_mz_ge_sequence`] themselves, so the result is P5's bit for bit; `m0scan` cycles then
+/// take P5's convention (read at the end of their repetition, `t_read = tr`). Every other series
+/// takes the generalized timeline, where an `m0scan` cycle is read at the start of its repetition
+/// (its own `t_read`). `uniform` says the cycles' preparations are all the same (P5's closed form).
+pub fn tissue_mz_ll_series(m0: f64, t1: f64, cycles: &[LlCycle], m0scan: &[bool], uniform: bool) -> Vec<Vec<f64>> {
+    let one_flip = cycles.first().and_then(|c| c.flip_deg.first()).copied();
+    let legacy = cycles.iter().all(|c| c.t_read.len() == 1)
+        && cycles.iter().all(|c| c.flip_deg.first().copied() == one_flip);
+    match (legacy, one_flip) {
+        (true, Some(fa)) => {
+            let empty = Suppression::new(vec![], 0.0, false);
+            if uniform {
+                cycles.iter().map(|c| vec![tissue_mz_ge(m0, t1, c.tr, c.t_read[0], c.s.unwrap_or(&empty), fa)]).collect()
+            } else {
+                let preps: Vec<Prep> = cycles.iter().zip(m0scan).map(|(c, &m)| Prep {
+                    tr: c.tr, t_read: if m { c.tr } else { c.t_read[0] }, s: c.s,
+                }).collect();
+                tissue_mz_ge_sequence(m0, t1, &preps, fa).into_iter().map(|x| vec![x]).collect()
+            }
+        }
+        _ => tissue_mz_ll_sequence(m0, t1, cycles),
+    }
+}
+
 /// The blood difference signal's factor: `prod (1 - 2 epsilon)` over every pulse. `(-1)^N` for
 /// perfect pulses; an odd count flips `control - label`.
 pub fn label_factor(s: &Suppression) -> f64 {
@@ -343,5 +449,98 @@ mod tests {
         // 90 degrees: independent rows, P3's values
         let v90 = tissue_mz_ge_sequence(m0, t1, &preps[..4], 90.0);
         assert_eq!(v90[1].to_bits(), tissue_mz(m0, t1, 4.0, 3.0, &b).to_bits());
+    }
+
+    // ---- P6 part B: the Look-Locker timeline
+
+    /// Brute force: the cycles applied event by event from Mz = 0, repeated `reps` times, the
+    /// states before the readouts of the last repetition (or of every cycle of a sequence).
+    fn brute_ll(m0: f64, t1: f64, cycles: &[LlCycle], reps: usize) -> Vec<Vec<f64>> {
+        let mut mz = 0.0;
+        let mut last = Vec::new();
+        for r in 0..reps {
+            let seq: &[LlCycle] = if r + 1 < reps { &cycles[..1] } else { cycles };
+            last.clear();
+            for c in seq {
+                let (b, e) = ll_cycle(mz, m0, t1, c);
+                last.push(b);
+                mz = e;
+            }
+        }
+        last
+    }
+
+    fn cycle<'a>(tr: f64, s: Option<&'a Suppression>, t: &[f64], fa: &[f64]) -> LlCycle<'a> {
+        LlCycle { tr, s, t_read: t.to_vec(), flip_deg: fa.to_vec() }
+    }
+
+    #[test]
+    fn the_look_locker_fixed_point_is_the_repeated_cycle() {
+        let s = Suppression::new(vec![0.5, 1.1], 0.95, false);
+        let t: Vec<f64> = (0..12).map(|n| 1.0 + 0.3 * n as f64).collect();
+        for (sup, fa) in [(None, 35.0), (Some(&s), 35.0), (Some(&s), 12.0), (None, 89.0)] {
+            let c = cycle(5.0, sup, &t, &[fa; 12]);
+            let got = tissue_mz_ll(74.6, 1.33, &c);
+            let want = brute_ll(74.6, 1.33, std::slice::from_ref(&c), 400).remove(0);
+            for (g, w) in got.iter().zip(&want) {
+                assert!((g - w).abs() <= 1e-15 * 74.6 * 10.0, "{sup:?} {fa}: {g} vs {w}");
+            }
+        }
+        // varying flips within the cycle (QUASAR-like ramps)
+        let fa: Vec<f64> = (0..12).map(|n| 20.0 + 5.0 * n as f64).collect();
+        let c = cycle(5.0, Some(&s), &t, &fa);
+        let got = tissue_mz_ll(74.6, 1.33, &c);
+        let want = brute_ll(74.6, 1.33, std::slice::from_ref(&c), 400).remove(0);
+        assert!(got.iter().zip(&want).all(|(g, w)| (g - w).abs() <= 1e-12), "{got:?} vs {want:?}");
+        // each readout leaves cos(a) of the state it read, and recovery runs from there
+        let next = recover(got[0] * 20f64.to_radians().cos(), 74.6, 1.33, 0.3);
+        assert!((got[1] - next).abs() <= 1e-12 && (next - recover(got[0], 74.6, 1.33, 0.3)).abs() > 1e-3);
+        // presaturation starts from zero
+        let ps = Suppression::new(vec![0.5], 0.95, true);
+        let c = cycle(5.0, Some(&ps), &t, &[35.0; 12]);
+        assert_eq!(tissue_mz_ll(74.6, 1.33, &c), ll_cycle(123.0, 74.6, 1.33, &c).0);
+    }
+
+    /// One readout per cycle and one flip: P5's functions themselves, bit for bit, through the
+    /// series dispatch; with varying flips the generalized timeline, against brute force.
+    #[test]
+    fn one_readout_dispatches_to_p5() {
+        let s = Suppression::new(vec![2.0, 2.7], 0.9, false);
+        let fa = 35.0;
+        let cycles = [cycle(4.0, Some(&s), &[3.6], &[fa]), cycle(4.0, Some(&s), &[2.8], &[fa]), cycle(6.0, None, &[6.0], &[fa])];
+        let m0scan = [false, false, true];
+        let got = tissue_mz_ll_series(74.6, 1.33, &cycles, &m0scan, false);
+        let preps = [Prep { tr: 4.0, t_read: 3.6, s: Some(&s) }, Prep { tr: 4.0, t_read: 2.8, s: Some(&s) },
+                     Prep { tr: 6.0, t_read: 6.0, s: None }];
+        let want = tissue_mz_ge_sequence(74.6, 1.33, &preps, fa);
+        assert_eq!(got.iter().map(|v| v[0].to_bits()).collect::<Vec<_>>(), want.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+        let uni = tissue_mz_ll_series(74.6, 1.33, &cycles[..1], &[false], true);
+        assert_eq!(uni[0][0].to_bits(), tissue_mz_ge(74.6, 1.33, 4.0, 3.6, &s, fa).to_bits());
+        // M = 1 with varying flips: the generalized timeline
+        let vary = [cycle(4.0, Some(&s), &[3.6], &[35.0]), cycle(4.0, Some(&s), &[3.6], &[50.0])];
+        let got = tissue_mz_ll_series(74.6, 1.33, &vary, &[false, false], false);
+        let want = brute_ll(74.6, 1.33, &vary, 400);
+        for (g, w) in got.iter().flatten().zip(want.iter().flatten()) {
+            assert!((g - w).abs() <= 1e-12, "{g} vs {w}");
+        }
+    }
+
+    /// An m0scan cycle between two Look-Locker cycles: its own readout at the start of its
+    /// repetition, the state carried across it, against brute-force propagation.
+    #[test]
+    fn an_m0scan_between_cycles_carries_the_state() {
+        let s = Suppression::new(vec![0.8], 0.95, false);
+        let t: Vec<f64> = (0..6).map(|n| 1.2 + 0.4 * n as f64).collect();
+        let ll = cycle(4.5, Some(&s), &t, &[30.0; 6]);
+        let m0c = cycle(4.5, None, &[0.02], &[15.0]);
+        let cycles = [ll.clone(), m0c, ll];
+        let got = tissue_mz_ll_series(74.6, 1.33, &cycles, &[false, true, false], false);
+        let want = brute_ll(74.6, 1.33, &cycles, 400);
+        for (g, w) in got.iter().flatten().zip(want.iter().flatten()) {
+            assert!((g - w).abs() <= 1e-12, "{g} vs {w}");
+        }
+        // the cycle after the m0scan starts from a different state than the first
+        assert!((got[2][0] - got[0][0]).abs() > 1e-6);
+        assert_eq!((got[0].len(), got[1].len(), got[2].len()), (6, 1, 6));
     }
 }
