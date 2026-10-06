@@ -138,6 +138,17 @@ pub struct Overlay {
     pub physio: Option<PhysioOverlay>,
     pub readout: Option<ReadoutOverlay>,
     pub multi_te: Option<MultiTeOverlay>,
+    pub hadamard: Option<HadamardOverlay>,
+}
+
+/// `[hadamard]` (P6 addendum, part A): its presence turns time encoding on.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HadamardOverlay {
+    /// The Sylvester order `H` (4, 8, 16 or 32), required: `H - 1` sub-boli per cycle.
+    pub order: Option<usize>,
+    /// Decode the tissue-only images too and report the leakage (default true).
+    pub report_leakage: Option<bool>,
 }
 
 /// `[multi_te]` (P6 addendum, part C): read only with more than one echo.
@@ -568,6 +579,27 @@ pub struct MotionSpec {
     pub within: Option<WithinVolume>,
 }
 
+/// One Hadamard encoding cycle (P6 addendum, part A): its `deltam` rows, in sub-bolus order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HadamardCycle {
+    pub rows: Vec<usize>,
+}
+
+/// Hadamard time-encoded labeling (P6 addendum, part A), resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HadamardSpec {
+    pub order: usize,
+    pub report_leakage: (bool, Source),
+    /// Each sub-bolus's duration (s), in labeling order (sub-bolus 1 is labeled first).
+    pub tau: Vec<f64>,
+    /// Each sub-bolus's span `[a_j, b_j]` within the labeling `[0, tau_tot]` (s).
+    pub spans: Vec<(f64, f64)>,
+    pub tau_tot: f64,
+    /// The delay from the end of the labeling to the excitation (s): the last sub-bolus's PLD.
+    pub pld: f64,
+    pub cycles: Vec<HadamardCycle>,
+}
+
 /// Multi-TE (P6 addendum, part C): one input sidecar per echo.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultiTeSpec {
@@ -625,6 +657,8 @@ pub struct Protocol {
     pub echo_times_s: Vec<f64>,
     /// `Some` with more than one echo.
     pub multi_te: Option<MultiTeSpec>,
+    /// `Some` under `[hadamard]` (P6 part A); `rows` are then the decoded rows.
+    pub hadamard: Option<HadamardSpec>,
     pub total_readout_time_s: f64,
     pub accel: usize,
     pub mb: usize,
@@ -1018,6 +1052,124 @@ fn same_json(a: &Value, b: &Value) -> bool {
             _ => a == b,
         },
     }
+}
+
+/// Hadamard time encoding (P6 addendum, part A, "Inputs" and "Refusals"): the rows describe the
+/// decoded dataset (`deltam` rows `H - 1` per cycle in sub-bolus order, `m0scan` rows only between
+/// cycles); the sub-boli's durations are the same in every cycle, every row's PostLabelingDelay is
+/// its sub-bolus's effective delay `PLD + sum_{k>j} tau_k`, and the repetition time, the
+/// suppression pulse set and the crushing VENC are each one per cycle.
+fn hadamard_spec(
+    ho: Option<&HadamardOverlay>, label_type: LabelType, rows: &[Row], pld: &[f64], suppression: Option<&SuppressionSpec>,
+    crushing: Option<&CrushSpec>, compat: bool,
+) -> Result<Option<HadamardSpec>, String> {
+    let Some(ho) = ho else { return Ok(None) };
+    let order = ho.order.ok_or("overlay: [hadamard] needs order (4, 8, 16 or 32)")?;
+    if !crate::hadamard::ORDERS.contains(&order) {
+        return Err(format!("overlay: hadamard.order {order}: the Sylvester orders 4, 8, 16 and 32 are supported"));
+    }
+    if label_type == LabelType::Pasl {
+        return Err("[hadamard] with PASL: time encoding switches the labeling during the bolus, which a pulsed \
+                    label cannot; (P)CASL only".to_string());
+    }
+    if compat {
+        return Err("[hadamard] under [compat] asldro = true: simasl has no time-encoded labeling".to_string());
+    }
+    if let Some(i) = rows.iter().position(|r| matches!(r.kind, RowKind::Control | RowKind::Label)) {
+        return Err(format!(
+            "aslcontext.tsv row {i} is {}: with [hadamard] the context lists the decoded volumes, deltam rows {} per \
+             cycle and m0scan rows between cycles", rows[i].kind.as_str(), order - 1));
+    }
+    let n_sub = order - 1;
+    let mut cycles = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        if rows[i].kind == RowKind::M0scan {
+            i += 1;
+            continue;
+        }
+        let run = rows[i..].iter().take_while(|r| r.kind == RowKind::Deltam).count();
+        if run % n_sub != 0 {
+            return Err(format!(
+                "aslcontext.tsv rows {i}..{} are {run} deltam rows, not a whole number of order-{order} cycles of {n_sub} \
+                 sub-boli; m0scan rows go only between cycles", i + run - 1));
+        }
+        for c in 0..run / n_sub {
+            cycles.push(HadamardCycle { rows: (i + c * n_sub..i + (c + 1) * n_sub).collect() });
+        }
+        i += run;
+    }
+    if cycles.is_empty() {
+        return Err("[hadamard] with no deltam rows: nothing is encoded".to_string());
+    }
+    let tau: Vec<f64> = cycles[0].rows.iter().map(|&r| rows[r].tau).collect();
+    for (c, cy) in cycles.iter().enumerate() {
+        for (j, &r) in cy.rows.iter().enumerate() {
+            if (rows[r].tau - tau[j]).abs() > 1e-9 {
+                return Err(format!(
+                    "LabelingDuration of row {r} (cycle {}, sub-bolus {}) is {} s, but {} s in cycle 1: the sub-boli \
+                     are the same in every cycle", c + 1, j + 1, rows[r].tau, tau[j]));
+            }
+        }
+    }
+    let tau_tot: f64 = tau.iter().sum();
+    let mut spans = Vec::with_capacity(n_sub);
+    let mut a = 0.0;
+    for &t in &tau {
+        spans.push((a, a + t));
+        a += t;
+    }
+    let pld_n = pld[cycles[0].rows[n_sub - 1]];
+    for (c, cy) in cycles.iter().enumerate() {
+        for (j, &r) in cy.rows.iter().enumerate() {
+            let want = pld_n + tau[j + 1..].iter().sum::<f64>();
+            if (pld[r] - want).abs() > 1e-6 {
+                return Err(format!(
+                    "PostLabelingDelay of row {r} (cycle {}, sub-bolus {}) is {} s; with [hadamard] each row's delay is \
+                     its sub-bolus's effective delay PLD + the later sub-boli's durations = {want} s (PLD {pld_n} s, the \
+                     last sub-bolus's)", c + 1, j + 1, pld[r]));
+            }
+        }
+        let tr0 = rows[cy.rows[0]].tr;
+        if let Some(&r) = cy.rows.iter().find(|&&r| rows[r].tr != tr0) {
+            return Err(format!(
+                "RepetitionTimePreparation of row {r} is {} s, but {tr0} s elsewhere in cycle {}: one repetition per cycle",
+                rows[r].tr, c + 1));
+        }
+        if let Some(s) = suppression {
+            let set = &s.per_row[cy.rows[0]];
+            if cy.rows.iter().any(|&r| s.per_row[r] != *set) {
+                return Err(format!(
+                    "background suppression in cycle {}: its deltam rows map to different pulse sets (by their \
+                     PostLabelingDelay), but a cycle's preparations share one; list the same set for its delays",
+                    c + 1));
+            }
+            if let Some(&p) = set.iter().find(|&&p| p >= tau_tot + pld_n) {
+                return Err(format!(
+                    "background-suppression pulse at {p} s in cycle {} is at or after the readout at {} s (the encoded \
+                     labeling's {tau_tot} s plus PLD {pld_n} s); P3 models pulses before the first excitation only",
+                    c + 1, tau_tot + pld_n));
+            }
+            let early_ok = matches!(s.model, SuppressionModel::BolusPosition(r) if !matches!(r, Region::Global));
+            if let Some(&p) = set.iter().find(|&&p| p < tau_tot && !early_ok) {
+                return Err(format!(
+                    "background-suppression pulse at {p} s falls inside the encoded labeling [0, {tau_tot}] s of cycle {}; \
+                     a global pulse there inverts sub-boli and inflowing blood alike, which is not modeled (use \
+                     pulse_region = \"slab\" under the bolus-position model)", c + 1));
+            }
+        }
+        if let Some(cr) = crushing {
+            let v0 = cr.venc[cy.rows[0]];
+            if cy.rows.iter().any(|&r| cr.venc[r] != v0) {
+                return Err(format!("VascularCrushingVENC varies within cycle {}: one VENC per cycle", c + 1));
+            }
+        }
+    }
+    let report_leakage = match ho.report_leakage {
+        Some(b) => (b, Source::Overlay),
+        None => (true, Source::Default),
+    };
+    Ok(Some(HadamardSpec { order, report_leakage, tau, spans, tau_tot, pld: pld_n, cycles }))
 }
 
 /// The echo times of a multi-TE protocol (P6 addendum, part C): one sidecar per echo, each with
@@ -1797,7 +1949,11 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
                     "overlay: background_suppression.model {other:?}: expected \"global-bolus\" or \"bolus-position\""))
             }
         };
-        for (i, r) in rows.iter().enumerate() {
+        // P6 part A: a Hadamard row is a decoded sub-bolus, whose PostLabelingDelay runs from its own
+        // end, while the pulses run from the start of the whole encoded labeling; hadamard_spec
+        // checks them against the raw volumes' timing instead
+        let hadamard_rows = overlay.is_some_and(|o| o.hadamard.is_some());
+        for (i, r) in rows.iter().enumerate().filter(|_| !hadamard_rows) {
             for &p in &per_row[i] {
                 if p >= r.t {
                     return Err(format!(
@@ -2166,6 +2322,11 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
         None
     };
 
+    let hadamard = hadamard_spec(
+        overlay.and_then(|o| o.hadamard.as_ref()), label_type, &rows, &pld, suppression.as_ref(), crushing.as_ref(),
+        compat.is_some(),
+    )?;
+
     let mo = overlay.and_then(|o| o.multi_te.as_ref());
     let multi_te = if !multi_echo {
         if mo.is_some() {
@@ -2195,7 +2356,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     };
 
     Ok(Protocol {
-        echo_times_s, multi_te,
+        echo_times_s, multi_te, hadamard,
         compat, grid_origin, exchange_time, macrovascular, crushing, physio, row_start,
         label_type, rows, m0_type, background_suppression, suppression, ir, ge, readout, motion, mb_interleaved,
         slice_offsets, field_strength, voxel_size_mm, reverse_phase, phase_encoding_direction: ped,
@@ -2259,7 +2420,7 @@ impl Protocol {
     /// echo). Decided once, here: false sends the series down today's code unchanged (the legacy
     /// dispatch). Each P6 part adds its condition as it is parsed.
     pub fn p6_active(&self) -> bool {
-        self.echo_times_s.len() > 1
+        self.echo_times_s.len() > 1 || self.hadamard.is_some()
     }
 
     /// The kinetic constants for `row`.
@@ -3968,5 +4129,156 @@ mod tests {
         };
         compat(&[0.020, 0.045]).unwrap();
         assert!(compat(&[0.020, 0.037]).unwrap_err().contains("between echoes 1 and 2"));
+    }
+
+    // ---- P6 part A: Hadamard protocols
+
+    /// A Hadamard protocol of `order` and `cycles` cycles, an m0scan row first: its sidecar,
+    /// aslcontext, and the sub-bolus durations given, PLD = `pld`.
+    pub(crate) fn hadamard_input(order: usize, cycles: usize, tau: &[f64], pld: f64) -> (Value, String) {
+        let n = order - 1;
+        assert_eq!(tau.len(), n);
+        let mut ld = vec![0.0];
+        let mut plds = vec![0.0];
+        for _ in 0..cycles {
+            for j in 0..n {
+                ld.push(tau[j]);
+                plds.push(pld + tau[j + 1..].iter().sum::<f64>());
+            }
+        }
+        let s = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": ld, "PostLabelingDelay": plds,
+            "BackgroundSuppression": false, "M0Type": "Included", "RepetitionTimePreparation": 4.0,
+            "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [3.5, 3.5, 5],
+            "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05, 0.10], "PhaseEncodingDirection": "j-",
+            "TotalReadoutTime": 0.016
+        });
+        let ctx = format!("volume_type\nm0scan\n{}", "deltam\n".repeat(n * cycles));
+        (s, ctx)
+    }
+
+    fn h8() -> (Value, String) {
+        hadamard_input(8, 2, &[0.25; 7], 0.2)
+    }
+
+    #[test]
+    fn hadamard_protocols() {
+        let hov = |extra: &str| overlay(&format!("[hadamard]\norder = 8\n{extra}"));
+        let (s, ctx) = h8();
+        let p = parse(&s, &ctx, Some(&hov("")), None).unwrap();
+        let h = p.hadamard.as_ref().unwrap();
+        assert!(p.p6_active());
+        assert_eq!((h.order, h.tau_tot, h.pld, h.report_leakage), (8, 1.75, 0.2, (true, Source::Default)));
+        assert_eq!(h.cycles.iter().map(|c| c.rows.clone()).collect::<Vec<_>>(), vec![(1..8).collect::<Vec<_>>(), (8..15).collect()]);
+        assert_eq!(h.spans[0], (0.0, 0.25));
+        assert!((h.spans[6].1 - 1.75).abs() < 1e-12);
+        assert_eq!(parse(&s, &ctx, Some(&hov("report_leakage = false\n")), None).unwrap().hadamard.unwrap().report_leakage,
+                   (false, Source::Overlay));
+        // unequal sub-boli, the PLDs following them
+        let (u, uctx) = hadamard_input(4, 1, &[0.5, 0.3, 0.2], 0.4);
+        let hu = parse(&u, &uctx, Some(&overlay("[hadamard]\norder = 4\n")), None).unwrap().hadamard.unwrap();
+        assert_eq!((hu.tau.clone(), hu.spans[1]), (vec![0.5, 0.3, 0.2], (0.5, 0.8)));
+
+        let err = |s: &Value, ctx: &str, ov: &str| parse(s, ctx, Some(&overlay(ov)), None).unwrap_err();
+        assert!(err(&s, &ctx, "[hadamard]\n").contains("order"));
+        assert!(err(&s, &ctx, "[hadamard]\norder = 6\n").contains("order 6"));
+        // the deltam count per cycle
+        assert!(err(&s, &ctx, "[hadamard]\norder = 4\n").contains("cycles"));
+        // m0scan inside a cycle
+        let mid = ctx.replacen("deltam\ndeltam\ndeltam\n", "deltam\ndeltam\nm0scan\n", 1);
+        let mut sm = s.clone();
+        let mut ld = sm["LabelingDuration"].as_array().unwrap().clone();
+        ld[3] = json!(0.0);
+        sm["LabelingDuration"] = json!(ld);
+        let mut pl = sm["PostLabelingDelay"].as_array().unwrap().clone();
+        pl[3] = json!(0.0);
+        sm["PostLabelingDelay"] = json!(pl);
+        assert!(err(&sm, &mid, "[hadamard]\norder = 8\n").contains("m0scan rows go only between cycles"));
+        // control and label rows
+        let cl = ctx.replacen("deltam", "control", 1);
+        assert!(err(&s, &cl, "[hadamard]\norder = 8\n").contains("row 1 is control"));
+        // the sub-boli are the same in every cycle
+        let mut sv = s.clone();
+        sv["LabelingDuration"][9] = json!(0.3);
+        assert!(err(&sv, &ctx, "[hadamard]\norder = 8\n").contains("LabelingDuration of row 9"));
+        // the effective delays
+        let mut sp = s.clone();
+        sp["PostLabelingDelay"][2] = json!(1.0);
+        let e = err(&sp, &ctx, "[hadamard]\norder = 8\n");
+        assert!(e.contains("row 2") && e.contains("effective delay"), "{e}");
+        let mut sp = s.clone();
+        sp["PostLabelingDelay"][2] = json!(1.45 + 5e-7);
+        parse(&sp, &ctx, Some(&hov("")), None).unwrap();
+        // one repetition time per cycle
+        let mut st = s.clone();
+        let mut tr = vec![json!(4.0); 15];
+        tr[5] = json!(4.5);
+        st["RepetitionTimePreparation"] = json!(tr);
+        assert!(err(&st, &ctx, "[hadamard]\norder = 8\n").contains("one repetition per cycle"));
+        // PASL
+        let mut pa = s.clone();
+        pa["ArterialSpinLabelingType"] = json!("PASL");
+        pa["BolusCutOffFlag"] = json!(true);
+        pa["BolusCutOffTechnique"] = json!("Q2TIPS");
+        pa["BolusCutOffDelayTime"] = json!(0.1);
+        pa.as_object_mut().unwrap().remove("LabelingDuration");
+        assert!(err(&pa, &ctx, "[hadamard]\norder = 8\n").contains("PASL"));
+        // compat
+        let mut sc = s.clone();
+        sc["SliceTiming"] = json!([0.0, 0.0, 0.0]);
+        assert!(err(&sc, &ctx, "[hadamard]\norder = 8\n[compat]\nasldro = true\n").contains("compat"));
+        // multi-TE and 3D are allowed
+        let mut s2 = s.clone();
+        s2["EchoTime"] = json!(0.040);
+        assert!(parse_echoes(&[s.clone(), s2], &ctx, Some(&hov("")), None).unwrap().hadamard.is_some());
+        let mut g = grase();
+        let (ld, pl) = (s["LabelingDuration"].clone(), s["PostLabelingDelay"].clone());
+        g["LabelingDuration"] = ld;
+        g["PostLabelingDelay"] = pl;
+        g["M0Type"] = json!("Included");
+        let pg = parse(&g, &ctx, Some(&hov("")), None).unwrap();
+        assert!(pg.hadamard.is_some() && pg.readout.is_some());
+    }
+
+    #[test]
+    fn hadamard_suppression_and_crushing_are_per_cycle() {
+        let (mut s, ctx) = h8();
+        s["BackgroundSuppression"] = json!(true);
+        s["BackgroundSuppressionNumberPulses"] = json!(2);
+        // the readout is at tau_tot + PLD = 1.95 s from the start of the labeling
+        s["BackgroundSuppressionPulseTime"] = json!([1.8, 1.9]);
+        let ov = |extra: &str| overlay(&format!("[hadamard]\norder = 8\n{extra}"));
+        // BIDS's first-PLD times for every row: one set per cycle (the decoded rows' own delays,
+        // 0.2 to 1.7 s, are not the pulses' clock)
+        parse(&s, &ctx, Some(&ov("")), None).unwrap();
+        s["BackgroundSuppressionPulseTime"] = json!([1.8, 1.95]);
+        assert!(parse(&s, &ctx, Some(&ov("")), None).unwrap_err().contains("at or after the readout at 1.95"));
+        s["BackgroundSuppressionPulseTime"] = json!([1.8, 1.9]);
+        // a set per PLD that differs within a cycle
+        let sets: Vec<String> = (0..7).map(|j| format!("[{}, 1.9]", 1.8 + 0.01 * j as f64)).collect();
+        let e = parse(&s, &ctx, Some(&ov(&format!("[background_suppression]\npulse_times_per_pld = [{}]\n", sets.join(", ")))), None)
+            .unwrap_err();
+        assert!(e.contains("cycle 1") && e.contains("pulse sets"), "{e}");
+        // a global pulse inside the encoded labeling (after the shortest sub-bolus's end)
+        s["BackgroundSuppressionPulseTime"] = json!([1.0, 1.9]);
+        let e = parse(&s, &ctx, Some(&ov("[background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n")), None);
+        assert!(e.is_ok(), "{e:?}");
+        s["BackgroundSuppressionPulseTime"] = json!([1.5, 1.9]);
+        let e = parse(&s, &ctx, Some(&ov("")), None).unwrap_err();
+        assert!(e.contains("inside the encoded labeling"), "{e}");
+        // VENC: one per cycle
+        let (mut s, ctx) = h8();
+        s["VascularCrushing"] = json!(true);
+        s["VascularCrushingVENC"] = json!(4.0);
+        let crush = "[vascular_crushing]\nno_arterial_compartment = true\n";
+        parse(&s, &ctx, Some(&ov(crush)), None).unwrap();
+        let mut venc = vec![0.0];
+        venc.extend(vec![4.0; 7]);
+        venc.extend(vec![2.0; 7]);
+        s["VascularCrushingVENC"] = json!(venc);
+        parse(&s, &ctx, Some(&ov(crush)), None).unwrap();
+        venc[10] = 3.0;
+        s["VascularCrushingVENC"] = json!(venc);
+        assert!(parse(&s, &ctx, Some(&ov(crush)), None).unwrap_err().contains("within cycle 2"));
     }
 }
