@@ -83,10 +83,41 @@ pub struct Schedule {
 impl Schedule {
     /// The protocol's schedule: Hadamard's under `[hadamard]`, else the identity.
     pub fn new(p: &Protocol) -> Schedule {
-        match &p.hadamard {
-            Some(h) => Schedule::hadamard(p, h),
-            None => Schedule::identity(p),
+        match (&p.hadamard, &p.look_locker) {
+            (Some(h), _) => Schedule::hadamard(p, h),
+            (None, Some(ll)) => Schedule::look_locker(p, ll),
+            (None, None) => Schedule::identity(p),
         }
+    }
+
+    /// Look-Locker (P6 addendum, part B): one preparation per cycle, its readouts the cycle's raw
+    /// volumes (each its own output, in the input order); an m0scan row is its own one-readout
+    /// cycle; the clock advances one repetition per cycle.
+    pub fn look_locker(p: &Protocol, ll: &crate::protocol::LookLockerSpec) -> Schedule {
+        let mut sched = Schedule { raw_rows: Vec::new(), preps: Vec::new(), raws: Vec::new(), outputs: Vec::new(), cycles: Vec::new() };
+        let mut clock = 0.0;
+        for (c, cy) in ll.cycles.iter().enumerate() {
+            let first = &p.rows[cy.rows[0]];
+            let start = clock;
+            let end = match (cy.m0scan, p.label_type) {
+                (true, _) | (_, LabelType::Pasl) => start,
+                _ => start + first.tau,
+            };
+            let prep = sched.preps.len();
+            let r0 = sched.raws.len();
+            sched.preps.push(Preparation {
+                raw: r0, shot: 0, start_s: start, labeling_window: [start, end], suppression: cy.rows[0],
+                venc: p.crushing.as_ref().map(|cr| cr.venc[cy.rows[0]]),
+            });
+            for (n, &v) in cy.rows.iter().enumerate() {
+                sched.raws.push(RawVolume { prep, n_preps: 1, readout: n, cycle: Some(c), encoding_row: None });
+                sched.raw_rows.push(p.rows[v].clone());
+                sched.outputs.push(Output::Raw(r0 + n));
+            }
+            sched.cycles.push(Cycle { raws: r0..r0 + cy.rows.len(), rows: cy.rows.clone() });
+            clock += first.tr;
+        }
+        sched
     }
 
     /// Hadamard (P6 addendum, part A, "The schedule"): an `m0scan` row is one raw volume, as today;

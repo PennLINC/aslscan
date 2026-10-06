@@ -139,6 +139,15 @@ pub struct Overlay {
     pub readout: Option<ReadoutOverlay>,
     pub multi_te: Option<MultiTeOverlay>,
     pub hadamard: Option<HadamardOverlay>,
+    pub look_locker: Option<LookLockerOverlay>,
+}
+
+/// `[look_locker]` (P6 addendum, part B): read only with `LookLocker: true`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LookLockerOverlay {
+    /// The readouts per cycle, checked against the grouping the arrays give.
+    pub readouts_per_cycle: Option<usize>,
 }
 
 /// `[hadamard]` (P6 addendum, part A): its presence turns time encoding on.
@@ -435,6 +444,9 @@ pub struct AcqOverlay {
 pub struct M0Overlay {
     /// s; the separate M0 scan's repetition time, which nothing in the ASL sidecar carries.
     pub repetition_time: Option<f64>,
+    /// Degrees: a Look-Locker series' separate M0 excitation (P6 part B); required when the
+    /// series' FlipAngle is an array.
+    pub flip_angle: Option<f64>,
 }
 
 /// The resolved background suppression: the pulse set per row (empty for m0scan rows), the
@@ -600,6 +612,26 @@ pub struct HadamardSpec {
     pub cycles: Vec<HadamardCycle>,
 }
 
+/// One Look-Locker cycle (P6 addendum, part B): its rows (the readouts in order, or one m0scan row).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookLockerCycle {
+    pub rows: Vec<usize>,
+    pub m0scan: bool,
+}
+
+/// Look-Locker readouts (P6 addendum, part B), resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookLockerSpec {
+    pub cycles: Vec<LookLockerCycle>,
+    /// The excitation flip per row (degrees, in (0, 90]); an m0scan row's is its own.
+    pub flip_deg: Vec<f64>,
+    /// Whether `FlipAngle` was an array.
+    pub flip_array: bool,
+    pub readouts_per_cycle: Option<usize>,
+    /// The separate M0's excitation (degrees) and where it came from.
+    pub m0_flip_deg: Option<(f64, Source)>,
+}
+
 /// Multi-TE (P6 addendum, part C): one input sidecar per echo.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultiTeSpec {
@@ -659,6 +691,8 @@ pub struct Protocol {
     pub multi_te: Option<MultiTeSpec>,
     /// `Some` under `[hadamard]` (P6 part A); `rows` are then the decoded rows.
     pub hadamard: Option<HadamardSpec>,
+    /// `Some` with `LookLocker: true` (P6 part B); `rows` are then the readout volumes.
+    pub look_locker: Option<LookLockerSpec>,
     pub total_readout_time_s: f64,
     pub accel: usize,
     pub mb: usize,
@@ -1172,6 +1206,186 @@ fn hadamard_spec(
     Ok(Some(HadamardSpec { order, report_leakage, tau, spans, tau_tot, pld: pld_n, cycles }))
 }
 
+/// What [`look_locker_spec`] reads.
+struct LlInputs<'a> {
+    on: bool,
+    overlay: Option<&'a Overlay>,
+    rows: &'a [Row],
+    pld: &'a [f64],
+    flips: Option<Vec<f64>>,
+    contrast: Contrast,
+    ge: Option<&'a GeSpec>,
+    is_3d: bool,
+    hadamard: bool,
+    multi_echo: bool,
+    compat: bool,
+    exchange: bool,
+    macrovascular: bool,
+    crushing: bool,
+    suppression: Option<&'a SuppressionSpec>,
+    m0_type: M0Type,
+}
+
+/// Look-Locker readouts (P6 addendum, part B, "Inputs" and "Refusals"): gradient echo, 2D; the
+/// cycles from the arrays (a maximal run of consecutive non-m0scan rows of one volume type with
+/// strictly increasing PostLabelingDelay and equal RepetitionTimePreparation and
+/// LabelingDuration; an m0scan row is its own cycle), checked against
+/// `[look_locker] readouts_per_cycle`; one suppression pulse set per cycle; flips in (0, 90]; the
+/// separate M0's flip from `[m0] flip_angle`, required with a FlipAngle array.
+fn look_locker_spec(i: LlInputs) -> Result<Option<LookLockerSpec>, String> {
+    let llo = i.overlay.and_then(|o| o.look_locker.as_ref());
+    let m0_flip = i.overlay.and_then(|o| o.m0.as_ref()).and_then(|m| m.flip_angle);
+    if !i.on {
+        if llo.is_some() {
+            return Err("overlay: [look_locker] is read only with LookLocker: true".to_string());
+        }
+        if m0_flip.is_some() {
+            return Err("overlay: m0.flip_angle is the separate M0 excitation of a Look-Locker series (LookLocker: \
+                        true); otherwise the M0 takes the series' own".to_string());
+        }
+        return Ok(None);
+    }
+    for (what, on) in [
+        ("MRAcquisitionType 3D (Look-Locker is modeled for 2D EPI)", i.is_3d),
+        ("[hadamard]", i.hadamard),
+        ("multi-TE (several --asl-json)", i.multi_echo),
+        ("[compat] asldro = true", i.compat),
+        ("[kinetic] exchange_time (P4 part A)", i.exchange),
+        ("the arterial compartment (P4 part B)", i.macrovascular),
+        ("VascularCrushing (P4 part C)", i.crushing),
+        ("background_suppression.model = \"bolus-position\" (P4 part D)",
+         i.suppression.is_some_and(|s| s.model != SuppressionModel::GlobalBolus)),
+    ] {
+        if on {
+            return Err(format!("LookLocker: true with {what}: refused (P6 addendum, part B)"));
+        }
+    }
+    if i.contrast != Contrast::GradientEcho {
+        return Err("LookLocker: true needs [signal] acq_contrast = \"ge\": the readouts are low-flip gradient-echo \
+                    excitations; a spin-echo Look-Locker series is refused".to_string());
+    }
+    let n = i.rows.len();
+    let flip_array = i.flips.is_some();
+    if flip_array && i.ge.is_some_and(|g| g.flip == Source::Overlay) {
+        return Err("overlay: signal.excitation_flip_angle with a FlipAngle array: the array gives every volume its \
+                    own excitation".to_string());
+    }
+    let flip_deg: Vec<f64> = match i.flips {
+        Some(f) => f,
+        None => vec![i.ge.map_or(90.0, |g| g.flip_deg); n],
+    };
+    if let Some((r, fa)) = flip_deg.iter().enumerate().find(|(_, &fa)| !(fa > 0.0 && fa <= 90.0)) {
+        return Err(format!("FlipAngle {fa} for row {r}: a Look-Locker excitation is in (0, 90] degrees"));
+    }
+    let mut cycles = Vec::new();
+    let mut v = 0;
+    while v < n {
+        if i.rows[v].kind == RowKind::M0scan {
+            cycles.push(LookLockerCycle { rows: vec![v], m0scan: true });
+            v += 1;
+            continue;
+        }
+        let mut end = v + 1;
+        while end < n {
+            let (a, b) = (&i.rows[end - 1], &i.rows[end]);
+            if b.kind != a.kind || i.pld[end] <= i.pld[end - 1] || b.tr != a.tr || b.tau != a.tau {
+                break;
+            }
+            end += 1;
+        }
+        cycles.push(LookLockerCycle { rows: (v..end).collect(), m0scan: false });
+        v = end;
+    }
+    let readouts_per_cycle = match llo.and_then(|o| o.readouts_per_cycle) {
+        Some(m) => {
+            if let Some(c) = cycles.iter().find(|c| !c.m0scan && c.rows.len() != m) {
+                return Err(format!(
+                    "overlay: look_locker.readouts_per_cycle = {m}, but the cycle starting at row {} has {} readouts (a \
+                     cycle is a run of one volume type with increasing PostLabelingDelay and equal \
+                     RepetitionTimePreparation and LabelingDuration)", c.rows[0], c.rows.len()));
+            }
+            Some(m)
+        }
+        None => None,
+    };
+    if let Some(s) = i.suppression {
+        for c in cycles.iter().filter(|c| !c.m0scan) {
+            let set = &s.per_row[c.rows[0]];
+            if c.rows.iter().any(|&r| s.per_row[r] != *set) {
+                return Err(format!(
+                    "background suppression in the Look-Locker cycle starting at row {}: its readouts map to different \
+                     pulse sets (by their PostLabelingDelay), but a cycle has one preparation", c.rows[0]));
+            }
+        }
+    }
+    let m0_flip_deg = match (i.m0_type, m0_flip) {
+        (M0Type::Separate, Some(fa)) => {
+            if !(fa > 0.0 && fa <= 90.0) {
+                return Err(format!("overlay: m0.flip_angle {fa}: an excitation in (0, 90] degrees"));
+            }
+            Some((fa, Source::Overlay))
+        }
+        (M0Type::Separate, None) if flip_array => {
+            return Err("a Look-Locker series with a FlipAngle array needs overlay m0.flip_angle for its separate M0 \
+                        (the array gives the series' volumes, not the M0 scan's)".to_string())
+        }
+        (M0Type::Separate, None) => Some((flip_deg[0], Source::Sidecar)),
+        (_, Some(_)) => return Err("overlay: m0.flip_angle describes a separate M0 scan (M0Type \"Separate\")".to_string()),
+        (_, None) => None,
+    };
+    Ok(Some(LookLockerSpec { cycles, flip_deg, flip_array, readouts_per_cycle, m0_flip_deg }))
+}
+
+/// The excitation timing of a Look-Locker series on its acquired grid (P6 addendum, part B,
+/// "Timing on explicit intervals"), in seconds: slice excitations at `t_n + offset` sample
+/// `[e + TE - h, e + TE + h]`; excitation groups in chronological order, each group's block ending
+/// before the next group's excitation, a readout's last group before the next readout's first,
+/// the last readout's before TR, every sample after its excitation; an m0scan cycle is excited at
+/// the start of its repetition; the separate M0 at its own repetition time.
+fn check_look_locker_timing(p: &Protocol, ll: &LookLockerSpec, h: f64) -> Result<(), String> {
+    let te = p.echo_time_s;
+    if te - h < 0.0 {
+        return Err(format!("EchoTime {te} s samples from {} s before its excitation (half readout {h} s)", h - te));
+    }
+    let mut groups: Vec<f64> = p.slice_offsets.clone();
+    groups.sort_by(f64::total_cmp);
+    groups.dedup();
+    let g_last = groups.last().copied().unwrap_or(0.0);
+    let end_of = |e: f64| e + te + h;
+    for c in &ll.cycles {
+        let times: Vec<f64> = if c.m0scan { vec![0.0] } else { c.rows.iter().map(|&r| p.rows[r].t).collect() };
+        let tr = p.rows[c.rows[0]].tr;
+        for (n, &t) in times.iter().enumerate() {
+            for w in groups.windows(2) {
+                if end_of(t + w[0]) > t + w[1] {
+                    return Err(format!(
+                        "row {}: the slices excited at {} s read until {} s, after the next slices' excitation at {} s",
+                        c.rows[n.min(c.rows.len() - 1)], t + w[0], end_of(t + w[0]), t + w[1]));
+                }
+            }
+            if let Some(&next) = times.get(n + 1) {
+                if end_of(t + g_last) > next + groups.first().copied().unwrap_or(0.0) {
+                    return Err(format!(
+                        "row {}: the readout at {t} s reads its last slices until {} s, after the next readout's \
+                         excitation at {next} s", c.rows[n], end_of(t + g_last)));
+                }
+            }
+        }
+        let last = times[times.len() - 1];
+        if end_of(last + g_last) > tr {
+            return Err(format!(
+                "row {}: the last readout's last slices read until {} s, after the cycle's RepetitionTimePreparation {tr} s",
+                c.rows[c.rows.len() - 1], end_of(last + g_last)));
+        }
+    }
+    if let (M0Type::Separate, Some(tr)) = (p.m0_type, p.m0_repetition_time_s) {
+        if end_of(g_last) > tr {
+            return Err(format!("the separate M0 reads its last slices until {} s, after its repetition time {tr} s", end_of(g_last)));
+        }
+    }
+    Ok(())
+}
+
 /// The echo times of a multi-TE protocol (P6 addendum, part C): one sidecar per echo, each with
 /// a scalar `EchoTime`, strictly increasing, and every other key the same in all of them.
 fn echo_times_of(sidecars: &[Value]) -> Result<Vec<f64>, String> {
@@ -1267,9 +1481,8 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     }
 
     // Things P1 does not model must not be silently simulated as if absent.
-    if opt_bool(sidecar, "LookLocker")? {
-        return Err("asl.json: LookLocker is true; Look-Locker readouts arrive with P6".to_string());
-    }
+    // P6 part B: Look-Locker readouts (its rules are look_locker_spec's, once the rest is known)
+    let look_locker = opt_bool(sidecar, "LookLocker")?;
     // (VascularCrushing is P4's, part C, resolved with the other P4 inputs below.)
     // Required by BIDS, and read rather than defaulted: an absent field would be written back
     // absent and the dataset would not validate.
@@ -1561,13 +1774,30 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
         (by_field("t2_blood", 0.165, 0.290)?, Source::Default)
     };
     let contrast = parse_contrast(so.and_then(|s| s.acq_contrast.as_deref()).unwrap_or("se"))?;
+    if look_locker && contrast != Contrast::GradientEcho && !is_3d {
+        return Err("LookLocker: true needs [signal] acq_contrast = \"ge\": the readouts are low-flip gradient-echo \
+                    excitations; a spin-echo Look-Locker series is refused".to_string());
+    }
 
     // Inversion recovery (P3 addendum, part B): InversionTime and FlipAngle are standard BIDS
     // fields, so they are inputs with the usual precedence; the inversion angle is overlay-only.
     let side_ti = opt_num(sidecar, "InversionTime")?;
     // BIDS puts FlipAngle in [0, 360]; simasl's signed [-180, 180] is the internal convention,
     // so 330 becomes -30 (the writer does the reverse).
-    let side_fa = match opt_num(sidecar, "FlipAngle")? {
+    // P6 part B: a FlipAngle array is one excitation per volume, which only Look-Locker reads
+    let ll_flips: Option<Vec<f64>> = match sidecar.get("FlipAngle") {
+        Some(Value::Array(_)) if look_locker => Some(per_row(num_or_array(sidecar, "FlipAngle")?, "FlipAngle", &kinds, false)?),
+        Some(Value::Array(_)) => {
+            return Err("asl.json: FlipAngle is an array, one excitation per volume, which only a Look-Locker series \
+                        (LookLocker: true) has".to_string())
+        }
+        _ => None,
+    };
+    let side_fa = match ll_flips.as_ref().map(|f| {
+        (0..f.len()).find(|&i| kinds[i] != RowKind::M0scan).map_or(f[0], |i| f[i])
+    }) {
+        Some(first) => Some(first),
+        None => match opt_num(sidecar, "FlipAngle")? {
         Some(v) => {
             if !(v.is_finite() && (0.0..=360.0).contains(&v)) {
                 return Err(format!("asl.json: FlipAngle must be in [0, 360] degrees, got {v}"));
@@ -1575,6 +1805,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
             Some(if v > 180.0 { v - 360.0 } else { v })
         }
         None => None,
+        },
     };
     // The 3D readouts are spin-echo trains (P5 part B): a 3D gradient-echo readout and 3D inversion
     // recovery are deferred, and the sidecar's FlipAngle is the refocusing angle there (read below),
@@ -2326,6 +2557,12 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
         overlay.and_then(|o| o.hadamard.as_ref()), label_type, &rows, &pld, suppression.as_ref(), crushing.as_ref(),
         compat.is_some(),
     )?;
+    let look_locker = look_locker_spec(LlInputs {
+        on: look_locker, overlay, rows: &rows, pld: &pld, flips: ll_flips, contrast, ge: ge.as_ref(), is_3d,
+        hadamard: hadamard.is_some(), multi_echo, compat: compat.is_some(), exchange: exchange_time.is_some(),
+        macrovascular: macrovascular.is_some(), crushing: crushing.is_some(), suppression: suppression.as_ref(),
+        m0_type,
+    })?;
 
     let mo = overlay.and_then(|o| o.multi_te.as_ref());
     let multi_te = if !multi_echo {
@@ -2356,7 +2593,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     };
 
     Ok(Protocol {
-        echo_times_s, multi_te, hadamard,
+        echo_times_s, multi_te, hadamard, look_locker,
         compat, grid_origin, exchange_time, macrovascular, crushing, physio, row_start,
         label_type, rows, m0_type, background_suppression, suppression, ir, ge, readout, motion, mb_interleaved,
         slice_offsets, field_strength, voxel_size_mm, reverse_phase, phase_encoding_direction: ped,
@@ -2420,7 +2657,7 @@ impl Protocol {
     /// echo). Decided once, here: false sends the series down today's code unchanged (the legacy
     /// dispatch). Each P6 part adds its condition as it is parsed.
     pub fn p6_active(&self) -> bool {
-        self.echo_times_s.len() > 1 || self.hadamard.is_some()
+        self.echo_times_s.len() > 1 || self.hadamard.is_some() || self.look_locker.is_some()
     }
 
     /// The kinetic constants for `row`.
@@ -2514,6 +2751,9 @@ pub fn half_epi_block_s(p: &Protocol, nx: usize, ny: usize) -> f64 {
 pub fn check_excitation_timing(p: &Protocol, acq_dims: [usize; 3]) -> Result<(), String> {
     let tes = &p.echo_times_s;
     let h = half_epi_block_s(p, acq_dims[0], acq_dims[1]);
+    if let Some(ll) = &p.look_locker {
+        return check_look_locker_timing(p, ll, h);
+    }
     let block = |e: usize| [tes[e] - h, tes[e] + h];
     if block(0)[0] < 0.0 {
         return Err(format!(
@@ -2869,7 +3109,7 @@ mod tests {
         assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("empty"));
         let mut s = base();
         s["LookLocker"] = json!(true);
-        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("P6"));
+        assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("LookLocker: true needs"));
         let mut s = base();
         s["VascularCrushing"] = json!(true);
         // P4 accepts crushing, but not without its VENC (and, part C, an arterial compartment)
@@ -4280,5 +4520,166 @@ mod tests {
         venc[10] = 3.0;
         s["VascularCrushingVENC"] = json!(venc);
         assert!(parse(&s, &ctx, Some(&ov(crush)), None).unwrap_err().contains("within cycle 2"));
+    }
+
+    // ---- P6 part B: Look-Locker protocols
+
+    /// A Look-Locker PCASL sidecar: `m` readouts 0.3 s apart from PLD 0.5 s per cycle, control
+    /// then label cycles, gradient echo at 35 degrees (or the per-volume `flips`).
+    fn ll_input(m: usize, flips: Option<Vec<f64>>) -> (Value, String) {
+        let mut pld = Vec::new();
+        let mut ctx = String::from("volume_type\n");
+        for kind in ["control", "label"] {
+            for n in 0..m {
+                pld.push(0.5 + 0.3 * n as f64);
+                ctx.push_str(kind);
+                ctx.push('\n');
+            }
+        }
+        let s = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.0, "PostLabelingDelay": pld,
+            "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 5.0, "LookLocker": true,
+            "EchoTime": 0.012, "FlipAngle": flips.map_or(json!(35), |f| json!(f)), "MagneticFieldStrength": 3,
+            "AcquisitionVoxelSize": [3.5, 3.5, 5], "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05, 0.10],
+            "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.016
+        });
+        (s, ctx)
+    }
+
+    const GE: &str = "[signal]\nacq_contrast = \"ge\"\n";
+
+    #[test]
+    fn look_locker_protocols() {
+        let (s, ctx) = ll_input(4, None);
+        let ok = |s: &Value, ctx: &str, ov: &str| parse(s, ctx, Some(&overlay(&format!("{GE}{ov}"))), None);
+        let p = ok(&s, &ctx, "").unwrap();
+        let ll = p.look_locker.as_ref().unwrap();
+        assert!(p.p6_active());
+        assert_eq!(ll.cycles.iter().map(|c| c.rows.clone()).collect::<Vec<_>>(), vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
+        assert_eq!((ll.flip_deg.clone(), ll.flip_array), (vec![35.0; 8], false));
+        // the overlay's count is checked against the grouping
+        assert_eq!(ok(&s, &ctx, "[look_locker]\nreadouts_per_cycle = 4\n").unwrap().look_locker.unwrap().readouts_per_cycle, Some(4));
+        assert!(ok(&s, &ctx, "[look_locker]\nreadouts_per_cycle = 3\n").unwrap_err().contains("readouts_per_cycle = 3"));
+        // a non-increasing delay starts a cycle; so do a type change, a TR change and a tau change
+        let mut s2 = s.clone();
+        s2["PostLabelingDelay"] = json!([0.5, 0.8, 0.5, 0.8, 0.5, 0.8, 1.1, 1.4]);
+        let cy: Vec<Vec<usize>> = ok(&s2, &ctx, "").unwrap().look_locker.unwrap().cycles.iter().map(|c| c.rows.clone()).collect();
+        assert_eq!(cy, vec![vec![0, 1], vec![2, 3], vec![4, 5, 6, 7]]);
+        let mut s3 = s.clone();
+        s3["RepetitionTimePreparation"] = json!([5.0, 5.0, 5.5, 5.5, 5.0, 5.0, 5.0, 5.0]);
+        assert_eq!(ok(&s3, &ctx, "").unwrap().look_locker.unwrap().cycles.len(), 3);
+        // an m0scan row is its own cycle
+        let mut s4 = s.clone();
+        s4["M0Type"] = json!("Included");
+        s4["PostLabelingDelay"] = json!([0.0, 0.5, 0.8, 1.1, 1.4, 0.5, 0.8, 1.1, 1.4]);
+        let ctx4 = ctx.replacen("volume_type\n", "volume_type\nm0scan\n", 1);
+        let ll4 = ok(&s4, &ctx4, "").unwrap().look_locker.unwrap();
+        assert_eq!((ll4.cycles.len(), ll4.cycles[0].m0scan, ll4.cycles[0].rows.clone()), (3, true, vec![0]));
+
+        // flips: per volume in (0, 90]; an array only with LookLocker; not with the overlay's
+        let fl: Vec<f64> = (0..8).map(|n| 20.0 + 5.0 * n as f64).collect();
+        let (sa, _) = ll_input(4, Some(fl.clone()));
+        let lla = ok(&sa, &ctx, "").unwrap().look_locker.unwrap();
+        assert_eq!((lla.flip_deg, lla.flip_array), (fl.clone(), true));
+        let mut bad = sa.clone();
+        bad["FlipAngle"][3] = json!(95);
+        assert!(ok(&bad, &ctx, "").unwrap_err().contains("(0, 90]"));
+        assert!(ok(&sa, &ctx, "excitation_flip_angle = 30\n").unwrap_err().contains("FlipAngle array"));
+        let mut nol = sa.clone();
+        nol.as_object_mut().unwrap().remove("LookLocker");
+        assert!(ok(&nol, &ctx, "").unwrap_err().contains("only a Look-Locker series"));
+
+        // the separate M0's flip
+        let mut sep = sa.clone();
+        sep["M0Type"] = json!("Separate");
+        assert!(ok(&sep, &ctx, "[m0]\nrepetition_time = 6.0\n").unwrap_err().contains("m0.flip_angle"));
+        let m0 = ok(&sep, &ctx, "[m0]\nrepetition_time = 6.0\nflip_angle = 25.0\n").unwrap().look_locker.unwrap().m0_flip_deg;
+        assert_eq!(m0, Some((25.0, Source::Overlay)));
+        let mut sep1 = s.clone();
+        sep1["M0Type"] = json!("Separate");
+        assert_eq!(ok(&sep1, &ctx, "[m0]\nrepetition_time = 6.0\n").unwrap().look_locker.unwrap().m0_flip_deg, Some((35.0, Source::Sidecar)));
+        assert!(ok(&s, &ctx, "[m0]\nflip_angle = 25.0\n").unwrap_err().contains("separate M0"));
+        let mut plain = s.clone();
+        plain.as_object_mut().unwrap().remove("LookLocker");
+        assert!(ok(&plain, &ctx, "[m0]\nflip_angle = 25.0\n").unwrap_err().contains("Look-Locker"));
+        assert!(ok(&plain, &ctx, "[look_locker]\nreadouts_per_cycle = 4\n").unwrap_err().contains("LookLocker: true"));
+    }
+
+    #[test]
+    fn look_locker_refusals() {
+        let (s, ctx) = ll_input(4, None);
+        let err = |s: &Value, ov: &str| parse(s, &ctx, Some(&overlay(ov)), None).unwrap_err();
+        assert!(err(&s, "").contains("acq_contrast = \"ge\""));
+        assert!(err(&s, &format!("{GE}[kinetic]\nexchange_time = 0.5\n")).contains("exchange_time"));
+        assert!(err(&s, &format!("{GE}[macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.01, csf = 0.0 }}\narterial_transit_time = {{ grey_matter = 1.0, white_matter = 1.2, csf = 0.0 }}\n"))
+            .contains("arterial"));
+        let mut c = s.clone();
+        c["VascularCrushing"] = json!(true);
+        c["VascularCrushingVENC"] = json!(4.0);
+        assert!(err(&c, &format!("{GE}[vascular_crushing]\nno_arterial_compartment = true\n")).contains("VascularCrushing"));
+        let mut b = s.clone();
+        b["BackgroundSuppression"] = json!(true);
+        b["BackgroundSuppressionNumberPulses"] = json!(1);
+        b["BackgroundSuppressionPulseTime"] = json!([1.2]);
+        assert!(err(&b, &format!("{GE}[background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n"))
+            .contains("bolus-position"));
+        // one pulse set per cycle: sets per PLD that differ within a cycle
+        let e = err(&b, &format!("{GE}[background_suppression]\npulse_times_per_pld = [[1.2], [1.25], [1.3], [1.35]]\n"));
+        assert!(e.contains("one preparation"), "{e}");
+        let mut s2 = s.clone();
+        s2["EchoTime"] = json!(0.030);
+        let multi = parse_echoes(&[s.clone(), s2], &ctx, Some(&overlay(GE)), None).unwrap_err();
+        assert!(multi.contains("multi-TE"), "{multi}");
+        let mut c3 = s.clone();
+        c3["SliceTiming"] = json!([0.0, 0.0, 0.0]);
+        assert!(err(&c3, &format!("{GE}[compat]\nasldro = true\n")).contains("compat"));
+        let mut g = grase();
+        g["LookLocker"] = json!(true);
+        assert!(parse(&g, CTX, Some(&overlay("")), None).unwrap_err().contains("LookLocker"));
+    }
+
+    #[test]
+    fn look_locker_timing_and_schedule() {
+        use crate::schedule::{Output, Schedule};
+        let dims = [32, 32, 3];
+        let run = |s: &Value, ctx: &str| check_excitation_timing(&parse(s, ctx, Some(&overlay(GE)), None).unwrap(), dims);
+        // h = 8 ms, TE 12 ms: a slice group reads until its excitation + 20 ms
+        let (s, ctx) = ll_input(4, None);
+        run(&s, &ctx).unwrap();
+        // slices 15 ms apart: a group's block overruns the next group's excitation
+        let mut a = s.clone();
+        a["SliceTiming"] = json!([0.0, 0.015, 0.03]);
+        assert!(run(&a, &ctx).unwrap_err().contains("next slices' excitation"));
+        // interleaved and reversed orders are the same groups
+        for t in [json!([0.0, 0.10, 0.05]), json!([0.10, 0.05, 0.0])] {
+            let mut b = s.clone();
+            b["SliceTiming"] = t;
+            run(&b, &ctx).unwrap();
+        }
+        // multiband: two groups
+        let mut mb = s.clone();
+        mb["SliceTiming"] = json!([0.0, 0.05, 0.0, 0.05]);
+        mb["MultibandAccelerationFactor"] = json!(2);
+        mb["AcquisitionVoxelSize"] = json!([3.5, 3.5, 5]);
+        run(&mb, &ctx).unwrap();
+        // readouts 0.1 s apart: the last group (0.10 s) reads past the next readout
+        let mut c = s.clone();
+        c["PostLabelingDelay"] = json!([0.5, 0.6, 0.7, 0.8, 0.5, 0.6, 0.7, 0.8]);
+        assert!(run(&c, &ctx).unwrap_err().contains("next readout"));
+        // the last readout before TR: t = 1.0 + 1.4 = 2.4, its last slices read until 2.52 s
+        let mut d = s.clone();
+        d["RepetitionTimePreparation"] = json!(2.51);
+        assert!(run(&d, &ctx).unwrap_err().contains("RepetitionTimePreparation"));
+
+        // the schedule: one preparation per cycle, its readouts the raw volumes, one TR per cycle
+        let p = parse(&s, &ctx, Some(&overlay(GE)), None).unwrap();
+        let sch = Schedule::new(&p);
+        assert_eq!((sch.preps.len(), sch.raws.len(), sch.outputs.len(), sch.cycles.len()), (2, 8, 8, 2));
+        assert_eq!((sch.preps[1].start_s, sch.preps[0].labeling_window), (5.0, [0.0, 1.0]));
+        for (r, raw) in sch.raws.iter().enumerate() {
+            assert_eq!((raw.prep, raw.readout, raw.cycle, raw.n_preps), (r / 4, r % 4, Some(r / 4), 1));
+            assert_eq!(sch.outputs[r], Output::Raw(r));
+            assert_eq!(sch.raw_rows[r], p.rows[r]);
+        }
     }
 }

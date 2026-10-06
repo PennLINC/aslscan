@@ -959,6 +959,9 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
 pub(super) fn simulate_p6(
     p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, ov: RowOverride, capture: Option<&mut Vec<Vec<f32>>>,
 ) -> Result<SeriesOutput, String> {
+    if p.look_locker.is_some() {
+        return Err("LookLocker: the readout series is not simulated yet (P6 plan, Task 15)".to_string());
+    }
     let tes = p.echo_times_s.clone();
     let sched = Schedule::new(p);
     let Built {
