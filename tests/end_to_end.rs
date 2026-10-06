@@ -1658,3 +1658,31 @@ fn hadamard_dataset_layout() {
     assert_eq!(nii(&perf.join("ground-truth/sub-01_desc-deltam_gt.nii.gz")), 7);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The milestone H acceptance fixtures on the crop load from their files and simulate.
+#[test]
+fn the_hadamard_fixtures_load_and_run() {
+    let base = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols"));
+    for (dir, echoes) in [("p6_hadamard", 1usize), ("p6_hadamard_multite", 3)] {
+        let d = base.join(dir);
+        let jsons: Vec<std::path::PathBuf> = if echoes == 1 {
+            vec![d.join("asl.json")]
+        } else {
+            (1..=echoes).map(|e| d.join(format!("asl-echo-{e}.json"))).collect()
+        };
+        let refs: Vec<&Path> = jsons.iter().map(|p| p.as_path()).collect();
+        let p = aslscan::protocol::load_with(&refs, &d.join("aslcontext.tsv"), Some(&d.join("overlay.toml")), crop().params.as_ref(), false)
+            .unwrap();
+        let h = p.hadamard.as_ref().unwrap();
+        assert_eq!((h.order, h.cycles.len(), p.echo_times_s.len()), (8, 2, echoes), "{dir}");
+        let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+        assert_eq!((out.n_volumes, out.hadamard.as_ref().unwrap().n_raw, out.more_echoes.len()), (15, 17, echoes - 1));
+    }
+    // the 3 T variants parse (their phantoms are local)
+    for dir in ["p6_hadamard_3t", "p6_hadamard_grase"] {
+        let d = base.join(dir);
+        let p = aslscan::protocol::load_with(&[d.join("asl.json").as_path()], &d.join("aslcontext.tsv"), Some(&d.join("overlay.toml")),
+                                             None, false).unwrap();
+        assert!(p.hadamard.is_some(), "{dir}");
+    }
+}

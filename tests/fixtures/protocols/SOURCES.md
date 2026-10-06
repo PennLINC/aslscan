@@ -31,3 +31,12 @@ Only the JSON sidecar and aslcontext.tsv are kept; no image data.
   `--asl-json`), one `aslcontext.tsv`, the overlay.
 - `p6_multite_se/`: its spin-echo variant at 15, 30, 45 ms, the 2 ms refocusing reserve fitting
   between the 12 ms EPI blocks.
+- `p6_hadamard/`: written for aslscan (P6 plan, Task 11). H8 PCASL on the crop: seven sub-boli of
+  0.25 s, PLD 1.5 s, each row's PostLabelingDelay its sub-bolus's effective delay; two encoding
+  cycles and an m0scan row before the first (the context lists the decoded volumes); exchange on.
+- `p6_hadamard_3t/`: the same on the 3 T phantom cropped to 97 mm in z (`work/phantom-3t-z97`, 24
+  slices of 4.05 mm), 3.5 mm in plane, slices 35 ms apart, TR 4.5 s.
+- `p6_hadamard_grase/`: the GRASE variant on `work/phantom-3t-z120` with asl005_p5's readout (64 x 64
+  in four ky segments, four shots per raw volume, EchoTime 13.28 ms, DwellTime 3.2 us, 130 degrees).
+- `p6_hadamard_multite/`: Hadamard x multi-TE on the crop: one sidecar per echo (gradient echo at
+  13, 32, 51 ms, 60 degrees, slices 60 ms apart).

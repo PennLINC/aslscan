@@ -1,0 +1,19 @@
+# Hadamard x multi-TE (P6 plan, Task 11) on the crop: p6_hadamard read at three gradient-echo times
+# (asl-echo-{1,2,3}.json, EchoTime 13, 32, 51 ms, FlipAngle 60, slices 60 ms apart).
+# H8 PCASL: seven sub-boli of 0.25 s, PLD 1.5 s (each row's PostLabelingDelay is its sub-bolus's
+# effective delay), two encoding cycles, an m0scan row before the first; exchange on.
+seed = 74
+
+[acquisition]
+oversample = 2
+signal_scale = 100.0
+noise_variance = 0.01
+
+[signal]
+acq_contrast = "ge"
+
+[kinetic]
+exchange_time = 0.5
+
+[hadamard]
+order = 8

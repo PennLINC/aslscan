@@ -1,0 +1,15 @@
+# The P6 Hadamard acceptance case (P6 plan, Task 11) on the crop.
+# H8 PCASL: seven sub-boli of 0.25 s, PLD 1.5 s (each row's PostLabelingDelay is its sub-bolus's
+# effective delay), two encoding cycles, an m0scan row before the first; exchange on.
+seed = 71
+
+[acquisition]
+oversample = 2
+signal_scale = 100.0
+noise_variance = 0.01
+
+[kinetic]
+exchange_time = 0.5
+
+[hadamard]
+order = 8

@@ -1,0 +1,20 @@
+# The GRASE variant of p6_hadamard on the 3 T phantom cropped to 120 mm in z (work/phantom-3t-z120), with
+# asl005_p5's readout: a 64 x 64 matrix in four interleaved ky segments (four shots per raw volume, each
+# repeating its encoding row), EchoTime 13.28 ms, DwellTime 3.2 us, refocusing at 130 degrees.
+# H8 PCASL: seven sub-boli of 0.25 s, PLD 1.5 s (each row's PostLabelingDelay is its sub-bolus's
+# effective delay), two encoding cycles, an m0scan row before the first; exchange on.
+seed = 73
+
+[acquisition]
+matrix = [64, 64]
+noise_variance = 0.01
+
+[readout]
+ky_segments = 4
+kz_segments = 1
+
+[kinetic]
+exchange_time = 0.5
+
+[hadamard]
+order = 8

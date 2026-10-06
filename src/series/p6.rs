@@ -1629,4 +1629,226 @@ mod tests {
         println!("decoded noise SD / raw: {:.4} (2/sqrt(H) = {want:.4}); raw SD {r:.4}", d / r);
         assert!((d / r / want - 1.0).abs() < 0.1, "{} vs {want}", d / r);
     }
+
+    fn sidecar3d(ld: Vec<f64>, pld: Vec<f64>, tr: Vec<f64>) -> Value {
+        json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": ld, "PostLabelingDelay": pld,
+            "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": tr, "EchoTime": 0.012,
+            "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0], "MRAcquisitionType": "3D",
+            "PulseSequenceType": "3Dgrase", "PhaseEncodingDirection": "j-", "EffectiveEchoSpacing": 0.0005,
+            "NumberShots": 2, "FlipAngle": 150
+        })
+    }
+
+    /// 3D GRASE (two shots per raw volume) with exchange, physiology and shot events: every shot of
+    /// a raw volume repeats its encoding row and takes its own physiological factors, gain and pose.
+    /// The reference is built per preparation from single rows without them (the control row's
+    /// tissue, each sub-bolus's intravascular and extravascular label), the recorded factors given
+    /// to the 3D call as line weights and the recorded poses as shot sets, then decoded. The
+    /// negative control gives the extravascular label the tissue factor.
+    #[test]
+    fn three_d_shots_carry_their_own_factors_and_poses() {
+        use mrsim_acq::motion::resample_by_pose;
+        let ph = crop();
+        let order = 4;
+        let kin = "[kinetic]\nexchange_time = 0.5\n";
+        let extra = format!("{kin}[physio]\ntissue_cardiac = 0.2\nlabel_cardiac = 0.08\nlabel_drift = 0.03\n\
+                             [motion]\nwithin_volume = {{ dropout_rate = 0.5, severity = 0.3, jump_mm = [0.6, 0.0, 0.0], jump_deg = [0.0, 0.0, 1.5] }}\n");
+        let n_sub = order - 1;
+        let (ld, pld): (Vec<f64>, Vec<f64>) = (0..n_sub).map(|j| (TAU, PLD + TAU * (n_sub - 1 - j) as f64)).unzip();
+        let ctx = format!("volume_type\n{}", "deltam\n".repeat(n_sub));
+        let p = parse_echoes(&[sidecar3d(ld, pld, vec![4.0; n_sub])], &ctx,
+                             Some(&overlay(&format!("[hadamard]\norder = {order}\n{extra}"), false)), None).unwrap();
+        let out = simulate_p6(&p, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).unwrap();
+        let h = out.hadamard.as_ref().unwrap();
+        let sched = Schedule::new(&p);
+        let b = build(&p, &ph, T2Mode::Class, RowOverride::None, p.echo_times_s[0], &sched).unwrap();
+        let r3 = b.res3d.clone().unwrap();
+        let (n, shots, k, ncomp, nsim) = (order, r3.n_shots, b.k, b.ncomp, b.nvox_sim);
+        assert_eq!((shots, ncomp), (2, 3 * k), "two shots; tissue, blood and the extravascular group");
+        assert!(!out.events.is_empty() && h.flags.shot_factors);
+        let single = |row: &str, tau: f64, pld: f64| -> Vec<Vec<f32>> {
+            let q = parse_echoes(&[sidecar3d(vec![tau], vec![pld], vec![4.0])], &format!("volume_type\n{row}\n"),
+                                 Some(&overlay(kin, false)), None).unwrap();
+            build(&q, &ph, T2Mode::Class, RowOverride::None, 0.012, &Schedule::new(&q)).unwrap().images
+        };
+        let tissue = single("control", TAU * n_sub as f64, PLD);
+        let comps: Vec<Vec<Vec<f32>>> = (0..n_sub).map(|j| single("deltam", TAU, PLD + TAU * (n_sub - 1 - j) as f64)).collect();
+        let enc = crate::hadamard::encoding(order);
+        let mut img = vec![vec![0.0f32; nsim * n]; ncomp];
+        for i in 0..n {
+            let w = crate::hadamard::weights(&enc[i]);
+            for vox in 0..nsim {
+                for c in 0..k {
+                    img[c][vox * n + i] = tissue[c][vox];
+                    let (mut iv, mut ev) = (0.0f64, 0.0f64);
+                    for j in (0..n_sub).filter(|&j| w[j] == 1) {
+                        iv -= comps[j][k + c][vox] as f64;
+                        ev -= comps[j][c][vox] as f64;
+                    }
+                    img[k + c][vox * n + i] = iv as f32;
+                    img[2 * k + c][vox * n + i] = ev as f32;
+                }
+            }
+        }
+        // the poses of each raw volume's shots, from the recorded events, as shot sets
+        let v2w = b.sim_grid.voxel_to_world;
+        let sets: Vec<Vec<ShotSet>> = (0..n).map(|g| {
+            let mut cum = Pose::IDENTITY;
+            let mut pose_of = Vec::new();
+            for s in 0..shots {
+                for e in out.events.iter().filter(|e| e.volume == g && e.shot == s) {
+                    for a in 0..3 {
+                        cum.trans_mm[a] += e.jump_mm[a];
+                        cum.rot_deg[a] += e.jump_deg[a];
+                    }
+                }
+                pose_of.push(cum);
+            }
+            let mut distinct: Vec<Pose> = Vec::new();
+            for &q in &pose_of {
+                if q != Pose::IDENTITY && !distinct.contains(&q) {
+                    distinct.push(q);
+                }
+            }
+            distinct.into_iter().map(|q| ShotSet {
+                shots: (0..shots).filter(|&s| pose_of[s] == q).collect(),
+                images: img.iter().map(|im| {
+                    let vol: Vec<f32> = (0..nsim).map(|vox| im[vox * n + g]).collect();
+                    resample_by_pose(&vol, b.sim_grid.dims, v2w, q)
+                }).collect(),
+            }).collect()
+        }).collect();
+        let Relaxation::Class { t2_ms, t2p_ms } = &b.relax else { panic!("class mode") };
+        let t1_of: Vec<f32> = ph.labels.iter().map(|(l, _)| ph.t1[ph.dseg.iter().position(|d| d == l).unwrap()] * 1000.0).collect();
+        let group = |t: &dyn Fn(usize) -> f32, blood: f32| -> Vec<T2Volume<'static>> {
+            (0..k).map(|i| T2Volume::Uniform(t(i))).chain((0..k).map(|_| T2Volume::Uniform(blood)))
+                .chain((0..k).map(|i| T2Volume::Uniform(t(i)))).collect()
+        };
+        let t2v = group(&|i| t2_ms[i], b.t2_blood_ms);
+        let tiv: Vec<T2Volume> = (0..3).flat_map(|_| (0..k).map(|i| T2Volume::Uniform(t2p_ms[i]))).collect();
+        let t1v = group(&|i| t1_of[i], (p.t1b.0 * 1000.0) as f32);
+        let acquire = |ev_takes_tissue_factor: bool| {
+            let mut w = Vec::with_capacity(n * shots * ncomp);
+            for g in 0..n {
+                for s in 0..shots {
+                    let f = &h.prep_factors[g * shots + s];
+                    assert_eq!((f.raw, f.shot), (g, s));
+                    for c in 0..ncomp {
+                        let x = if c < k || (c >= 2 * k && ev_takes_tissue_factor) { f.tissue } else { f.label };
+                        w.push(x * f.shot_gain);
+                    }
+                }
+            }
+            let lw = LineWeights { n_shots: shots, n_compartments: ncomp, w };
+            simulate_acquisition_3d(b.sim_grid.dims, b.acq_grid.dims, n, &img, &t2v, Some(&t1v), &b.fmap_sim, Some(&tiv), &b.acq,
+                                    &r3.train, &r3.readout, Some(&lw), Some(&sets), &zero_phase(), p.seed)
+        };
+        let decoded_of = |(m, ph_): (Vec<f32>, Vec<f32>)| -> Vec<Vec<(f64, f64)>> {
+            let raw: Vec<Vec<(f64, f64)>> = (0..n).map(|i| cvol(&m, &ph_, n, i)).collect();
+            let refs: Vec<&[(f64, f64)]> = raw.iter().map(|v| v.as_slice()).collect();
+            crate::hadamard::decode(&refs, order)
+        };
+        let series: Vec<Vec<(f64, f64)>> = (0..n_sub).map(|j| cvol(&out.mag, &out.phase, out.n_volumes, j)).collect();
+        let smax = (0..n).flat_map(|i| cvol(&h.raw_mag, &h.raw_phase, n, i)).map(|z| z.0.hypot(z.1)).fold(0.0f64, f64::max);
+        let worst = |d: &[Vec<(f64, f64)>]| -> f64 {
+            series.iter().zip(d).map(|(a, r)| {
+                let max_ref = r.iter().map(|z| z.0.hypot(z.1)).fold(0.0f64, f64::max);
+                a.iter().zip(r).map(|(x, y)| (x.0 - y.0).hypot(x.1 - y.1)).fold(0.0f64, f64::max) / (1e-6 * smax + 1e-4 * max_ref)
+            }).fold(0.0f64, f64::max)
+        };
+        let good = worst(&decoded_of(acquire(false)));
+        let bad = worst(&decoded_of(acquire(true)));
+        println!("3D per preparation: worst {good:.3e} of the bound; extravascular with the tissue factor {bad:.3e}");
+        assert!(good <= 1.0, "{good}");
+        assert!(bad > 10.0, "{bad}");
+        // the preparation table: one row per shot with the factors actually applied, which differ
+        assert_eq!(h.prep_factors.len(), n * shots);
+        assert!(h.prep_factors.iter().all(|f| f.tissue.is_finite() && f.tissue != 1.0));
+        assert!(h.prep_factors.chunks(2).any(|c| c[0].tissue != c[1].tissue && c[0].label != c[1].label));
+        assert!(h.prep_factors.iter().any(|f| f.shot_gain != 1.0));
+    }
+
+    /// Hadamard x multi-TE: each echo's raw series is decoded separately, and echo e is the
+    /// one-echo Hadamard series at TE_e bit for bit (noise off).
+    #[test]
+    fn each_echo_decodes_as_its_own_series() {
+        let ph = crop();
+        let order = 4;
+        let n_sub = order - 1;
+        let (ld, pld): (Vec<f64>, Vec<f64>) = (0..n_sub).map(|j| (TAU, PLD + TAU * (n_sub - 1 - j) as f64)).unzip();
+        let ctx = format!("volume_type\n{}", "deltam\n".repeat(n_sub));
+        let side = |te: f64| {
+            let mut s = sidecar(ld.clone(), pld.clone(), vec![4.0; n_sub], "Absent", true);
+            s["EchoTime"] = json!(te);
+            s["SliceTiming"] = json!([0.0, 0.07]);
+            s
+        };
+        let ov = overlay(&format!("[hadamard]\norder = {order}\n"), true);
+        let tes = [0.013, 0.032];
+        let p = parse_echoes(&[side(tes[0]), side(tes[1])], &ctx, Some(&ov), None).unwrap();
+        let out = simulate_p6(&p, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).unwrap();
+        assert_eq!(out.more_echoes.len(), 1);
+        for (e, &te) in tes.iter().enumerate() {
+            let q = parse_echoes(&[side(te)], &ctx, Some(&ov), None).unwrap();
+            let one = simulate_p6(&q, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).unwrap();
+            let (m, phs) = if e == 0 { (&out.mag, &out.phase) } else { (&out.more_echoes[0].mag, &out.more_echoes[0].phase) };
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(m), bits(&one.mag), "echo {e}");
+            assert_eq!(bits(phs), bits(&one.phase), "echo {e}");
+        }
+        assert_eq!(out.hadamard.as_ref().unwrap().raw_more_echoes.len(), 1);
+    }
+
+    /// The transient with shot motion (2D, multiband shot events, gradient echo after an included
+    /// M0): the leakage the series reports is the decoded tissue part of its own data, i.e. the
+    /// decoded full images minus the decoded blood alone (the acquisition is linear in its
+    /// compartments), so the tissue-only path carries the same poses and events as the images.
+    #[test]
+    fn the_leakage_is_the_decoded_tissue_part_under_shot_motion() {
+        let ph = crop();
+        let order = 4;
+        let n_sub = order - 1;
+        let (mut ld, mut pld, mut tr) = (vec![0.0], vec![0.0], vec![6.0]);
+        for j in 0..n_sub {
+            ld.push(TAU);
+            pld.push(PLD + TAU * (n_sub - 1 - j) as f64);
+            tr.push(4.0);
+        }
+        let mut s = sidecar(ld, pld, tr, "Included", true);
+        s["SliceTiming"] = json!([0.0, 0.0]);
+        s["MultibandAccelerationFactor"] = json!(2);
+        let ctx = format!("volume_type\nm0scan\n{}", "deltam\n".repeat(n_sub));
+        let ov = overlay(&format!("[hadamard]\norder = {order}\n[motion]\nwithin_volume = {{ dropout_rate = 0.6, severity = 0.4, \
+                                   jump_mm = [0.8, 0.0, 0.0], jump_deg = [0.0, 0.0, 2.0] }}\n"), true);
+        let p = parse_echoes(&[s], &ctx, Some(&ov), None).unwrap();
+        let out = simulate_p6(&p, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).unwrap();
+        let h = out.hadamard.as_ref().unwrap();
+        assert!(h.flags.transients && h.flags.motion && !out.events.is_empty());
+        let sched = Schedule::new(&p);
+        let b = build(&p, &ph, T2Mode::Class, RowOverride::None, p.echo_times_s[0], &sched).unwrap();
+        let n = sched.raw_rows.len();
+        let to = b.tissue_only.as_ref().unwrap();
+        let blood: Vec<Vec<f32>> = b.images.iter().zip(to).map(|(a, t)| a.iter().zip(t).map(|(x, y)| x - y).collect()).collect();
+        let (t2v, tiv) = class_volumes(&b);
+        let acquire = |img: &[Vec<f32>]| simulate_acquisition_oversampled(
+            b.sim_grid.dims, b.acq_grid.dims, n, img, &t2v, &b.fmap_sim, Some(&tiv), &b.acq, &vec![None; n], &vec![None; n],
+            &zero_phase(), p.seed, None, None);
+        let decoded = |(m, ph_): (Vec<f32>, Vec<f32>)| -> Vec<Vec<(f64, f64)>> {
+            let raw: Vec<Vec<(f64, f64)>> = sched.cycles[0].raws.clone().map(|i| cvol(&m, &ph_, n, i)).collect();
+            let refs: Vec<&[(f64, f64)]> = raw.iter().map(|v| v.as_slice()).collect();
+            crate::hadamard::decode(&refs, order)
+        };
+        let (full, bl) = (decoded(acquire(&b.images)), decoded(acquire(&blood)));
+        let brain: Vec<bool> = b.r_acq.majority(&ph.dseg).iter().map(|l| *l > 0).collect();
+        let l = &h.leakage.as_ref().unwrap()[0];
+        for j in 0..n_sub {
+            let norm = full[j].iter().zip(&bl[j]).zip(&brain).filter(|(_, m)| **m)
+                .map(|((a, c), _)| (a.0 - c.0).powi(2) + (a.1 - c.1).powi(2)).sum::<f64>().sqrt();
+            let (abs, _) = l.per_subbolus[j];
+            println!("shot motion: sub-bolus {j} leakage {abs:.4}, decoded full - blood {norm:.4}");
+            assert!(abs > 1e-4 * l.reference_norm, "sub-bolus {j}: no leakage");
+            assert!((norm - abs).abs() <= 1e-4 * abs, "sub-bolus {j}: {norm} vs {abs}");
+        }
+    }
 }
