@@ -2125,3 +2125,48 @@ fn multite3d_fixture_writes_every_echo() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// P7 Task 18: 3D Look-Locker x Hadamard (order 4, readouts at 0.5 and 0.8 s, two encoding cycles,
+/// two shots): 12 decoded volumes; TotalAcquiredPairs is the number of encoding cycles with
+/// NumberShots > 1; the Hadamard block names the 3D EPI readout and its two readouts; the raw table
+/// lists the 16 raw volumes; the tissue leakage is reported per cycle and readout.
+#[test]
+fn hadamard3d_writes_its_cycles_and_raw_volumes() {
+    let (mut ld, mut pld, mut ctx) = (Vec::new(), Vec::new(), String::from("volume_type\n"));
+    for _ in 0..2 {
+        for q in [0.5, 0.8] {
+            for j in 0..3 {
+                ld.push(0.6);
+                pld.push(q + 0.6 * (2 - j) as f64);
+                ctx.push_str("deltam\n");
+            }
+        }
+    }
+    let s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": ld, "PostLabelingDelay": pld,
+        "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "EchoTime": 0.012,
+        "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 0.75], "MRAcquisitionType": "3D",
+        "PulseSequenceType": "3D EPI", "PhaseEncodingDirection": "j-", "EffectiveEchoSpacing": 0.0005,
+        "NumberShots": 2, "FlipAngle": 12, "LookLocker": true
+    });
+    let ov: Overlay = toml::from_str("seed = 13\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n\
+        [signal]\nacq_contrast = \"ge\"\n[readout]\nexcitation_spacing = 40.0\nslab_entry_time = 0.5\nkz_segments = 2\n\
+        [hadamard]\norder = 4\n[look_locker]\nreadouts_per_cycle = 2\n").unwrap();
+    let p = aslscan::protocol::parse(&s, &ctx, Some(&ov), crop().params.as_ref()).unwrap();
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert_eq!((out.n_volumes, out.hadamard.as_ref().unwrap().n_raw), (12, 16));
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-p7h3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("sub-01/perf/sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    assert_eq!((side["TotalAcquiredPairs"].clone(), side["NumberShots"].as_u64()), (json!(2), Some(2)));
+    let had = &side["AslscanSimulation"]["Hadamard"];
+    assert_eq!((had["Readout"].clone(), had["Readouts"].clone()), (json!("3D EPI"), json!(2)));
+    assert_eq!(had["TissueLeakage"].as_array().unwrap().len(), 2 * 2);
+    assert_eq!(side["AslscanSimulation"]["Readout"]["Type"], json!("epi3d"));
+    let raw = std::fs::read_dir(dir.join("sourcedata")).unwrap().flat_map(|d| std::fs::read_dir(d.unwrap().path()).unwrap())
+        .flat_map(|d| std::fs::read_dir(d.unwrap().path()).unwrap())
+        .map(|f| f.unwrap().path()).find(|p| p.to_string_lossy().ends_with("_rawvolumes.tsv")).expect("the raw-volume table");
+    assert_eq!(std::fs::read_to_string(raw).unwrap().lines().count(), 1 + 16);
+    let _ = std::fs::remove_dir_all(&dir);
+}

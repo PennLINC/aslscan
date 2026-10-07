@@ -1229,10 +1229,11 @@ mod writer {
                                         the cycle's unsuppressed tissue steady state acquired in the same call",
             "NonExact": { "Grappa": f.grappa, "Spikes": f.spikes, "Motion": f.motion, "ShotFactors": f.shot_factors,
                           "Transients": f.transients, "Physiology": f.physiology },
-            "Readout": match &out.readout {
-                Some(r3) if r3.spiral.is_some() => "3D spiral",
-                Some(_) => "3D GRASE",
-                None => "2D EPI",
+            "Readout": match (&out.readout, &out.ge3d) {
+                (Some(r3), _) if r3.spiral.is_some() => "3D spiral",
+                (Some(_), _) => "3D GRASE",
+                (None, Some(_)) => "3D EPI",
+                (None, None) => "2D EPI",
             },
             "TotalAcquiredPairsConvention": "the number of encoding cycles: each cycle measures every sub-bolus once, \
                                              the role a control-label pair plays for one PLD; a Hadamard acquisition has \
@@ -1328,7 +1329,7 @@ mod writer {
             "Units": "arbitrary (same as M0map)",
             "Description": "+ the encoded kinetic sum of each raw volume's labeled sub-boli (no suppression or \
                             physiological factor), today's conventions; zero for m0scan raw volumes",
-            "Frame": if out.readout.is_some() { "static (a 3D raw volume's shots have their own poses)" }
+            "Frame": if out.readout.is_some() || out.ge3d.is_some() { "static (a 3D raw volume's shots have their own poses)" }
                      else if moved { "moved by the raw volume's pose" } else { "static" },
             "Resampling": mean,
         }))?;

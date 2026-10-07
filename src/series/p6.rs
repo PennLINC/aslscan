@@ -17,7 +17,7 @@ use crate::schedule::{Output, Schedule};
 /// (each raw volume's VENC), the physiology horizon and the per-volume label factors and windows
 /// (each from the raw volume's first preparation). On the identity schedule these are P4::new's
 /// own expressions on the same values.
-fn p4_for_schedule(p: &Protocol, ph: &Phantom, bolus_region: Option<Region>, sched: &Schedule) -> Result<P4, String> {
+pub(super) fn p4_for_schedule(p: &Protocol, ph: &Phantom, bolus_region: Option<Region>, sched: &Schedule) -> Result<P4, String> {
     let mut p4 = P4::new(p, ph, bolus_region)?;
     let n = sched.raw_rows.len();
     let start = |v: usize| sched.preps[sched.raws[v].prep].start_s;
@@ -64,7 +64,7 @@ fn p4_for_schedule(p: &Protocol, ph: &Phantom, bolus_region: Option<Region>, sch
 /// A Hadamard cycle's raw volumes by readout (P7 part B): readout `n`'s `H` raw volumes in
 /// encoding-row order (the schedule lays a cycle out encoding-row-major, `M` readouts each).
 /// Without Look-Locker one group, the cycle's raw volumes in order: P6's.
-fn readout_groups(c: &crate::schedule::Cycle, order: usize) -> Vec<Vec<usize>> {
+pub(super) fn readout_groups(c: &crate::schedule::Cycle, order: usize) -> Vec<Vec<usize>> {
     let m = c.raws.len() / order;
     (0..m).map(|n| (0..order).map(|e| c.raws.start + e * m + n).collect()).collect()
 }
@@ -73,7 +73,7 @@ fn readout_groups(c: &crate::schedule::Cycle, order: usize) -> Vec<Vec<usize>> {
 /// volumes are the rows and this is the protocol's spec itself. Under Hadamard each preparation's
 /// raw volumes are one cycle (an m0scan raw volume its own), each readout's flip that of sub-bolus
 /// 1 of its row (the protocol checked they agree).
-fn ll_on_raws(p: &Protocol, sched: &Schedule) -> Option<crate::protocol::LookLockerSpec> {
+pub(super) fn ll_on_raws(p: &Protocol, sched: &Schedule) -> Option<crate::protocol::LookLockerSpec> {
     let l = p.look_locker.as_ref()?;
     let Some(h) = &p.hadamard else { return Some(l.clone()) };
     let mut cycles: Vec<crate::protocol::LookLockerCycle> = Vec::new();
@@ -93,9 +93,9 @@ fn ll_on_raws(p: &Protocol, sched: &Schedule) -> Option<crate::protocol::LookLoc
 }
 
 /// One complex volume, voxel-major.
-type Image = Vec<(f64, f64)>;
+pub(super) type Image = Vec<(f64, f64)>;
 
-fn complex_volume(mag: &[f32], phase: &[f32], n: usize, r: usize) -> Image {
+pub(super) fn complex_volume(mag: &[f32], phase: &[f32], n: usize, r: usize) -> Image {
     (0..mag.len() / n).map(|x| {
         let (m, p) = (mag[x * n + r] as f64, phase[x * n + r] as f64);
         (m * p.cos(), m * p.sin())
@@ -105,7 +105,7 @@ fn complex_volume(mag: &[f32], phase: &[f32], n: usize, r: usize) -> Image {
 /// Decode a raw series (`n_raw` volumes) to the outputs (P6 part A): each cycle's sub-boli by
 /// `hadamard::decode` on the complex images in `f64`, `m0scan` raw volumes passed through as
 /// acquired. Returns the outputs' magnitude and phase, voxel-major.
-fn decode_series(sched: &Schedule, order: usize, mag: &[f32], phase: &[f32], n_raw: usize) -> (Vec<f32>, Vec<f32>) {
+pub(super) fn decode_series(sched: &Schedule, order: usize, mag: &[f32], phase: &[f32], n_raw: usize) -> (Vec<f32>, Vec<f32>) {
     let nvox = mag.len() / n_raw;
     let n_out = sched.outputs.len();
     // per cycle, per readout (P7 part B: one group without Look-Locker), the decoded sub-boli

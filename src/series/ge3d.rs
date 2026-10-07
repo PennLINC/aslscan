@@ -9,7 +9,7 @@
 use super::*;
 use crate::longitudinal::{tissue_mz_ll, tissue_mz_ll_sequence, LlCycle, Suppression};
 use crate::protocol::SlabEntryTime;
-use crate::schedule::Schedule;
+use crate::schedule::{Output, Schedule};
 
 /// One tissue group (P7 addendum, part C, "Tissue is separable"): the phantom voxels of compartment
 /// `compartment` (a label in class mode; every foreground voxel in voxel mode) whose `T1` is `t1_s`.
@@ -243,6 +243,9 @@ pub(super) struct Ge3dBuild<'a> {
     /// gives each readout its own).
     pub flip_deg: f64,
     pub raw_flip: Vec<f64>,
+    /// Per raw volume, the spans of the bolus it labels (P6 part A: an encoded raw volume its
+    /// labeled sub-boli); `None`: the whole bolus.
+    pub spans: Vec<Option<Vec<(f64, f64)>>>,
     pub spacing_s: f64,
     /// Motion (P5 part D, as on the 3D spin-echo path): each raw volume's pose, each shot's pose
     /// within its volume (the cumulative jumps of the events before it), each shot's gain (an
@@ -282,6 +285,15 @@ impl Ge3dBuild<'_> {
     /// (sub-boli with their parcel factors, the exchange split), and the arterial read with its
     /// crushing survival and parcel factor.
     pub fn reads(&self, v: usize, i: usize) -> Vec<Vec<f64>> {
+        let tau = self.p.kinetic(&self.sched.raw_rows[v]).tau;
+        let spans = self.spans[v].clone().unwrap_or_else(|| vec![(0.0, tau)]);
+        self.reads_in(v, i, &spans)
+    }
+
+    /// [`Ge3dBuild::reads`] of the label of `spans` only (P6 part A: a sub-bolus, or an encoded raw
+    /// volume's labeled sub-boli): each bolus-position parcel cut to them, and the arterial parcel
+    /// counted only where its labeling falls in one.
+    pub fn reads_in(&self, v: usize, i: usize, spans: &[(f64, f64)]) -> Vec<Vec<f64>> {
         let p = self.p;
         let ph = self.ph;
         let row = &self.sched.raw_rows[v];
@@ -293,10 +305,19 @@ impl Ge3dBuild<'_> {
             let s = p.suppression.as_ref().unwrap().for_row(self.sched.preps[self.sched.raws[v].prep].suppression);
             (region, s.pulse_times, s.epsilon)
         });
-        let subs = match &bolus {
+        let parcels = match &bolus {
             Some((region, pulses, eps)) => subbolus_factors(pulses, *eps, kin.tau, entry_offset(p.label_type, *region, att)),
             None => vec![(0.0, kin.tau, 1.0)],
         };
+        let mut subs = Vec::with_capacity(parcels.len() * spans.len());
+        for &(aj, bj) in spans {
+            for &(a, b, f) in &parcels {
+                let (lo, hi) = (a.max(aj), b.min(bj));
+                if hi > lo {
+                    subs.push((lo, hi, f));
+                }
+            }
+        }
         let all = crate::kinetic::delta_m_read_all(&kin, f_ml, att, t1t, m0, &e, &flips, &subs, p.exchange_time, self.lead[i]);
         let parts = &all[offset..offset + n];
         self.families.iter().map(|fam| match fam {
@@ -306,6 +327,11 @@ impl Ge3dBuild<'_> {
                 let (Some(abv), Some(aatt)) = (&self.p4.abv, &self.p4.aatt) else { return vec![0.0; n] };
                 let crush = self.p4.crush.as_ref().map_or(1.0, |cr| cr[v][self.p4.label_of[i]]);
                 (offset..offset + n).map(|x| {
+                    // the parcel the arteries hold at e_x counts only where its labeling is in a span
+                    let a = e[x] - aatt[i];
+                    if !spans.iter().any(|&(lo, hi)| lo <= a && a < hi) {
+                        return 0.0;
+                    }
                     let g = match &bolus {
                         Some((region, pulses, eps)) => arterial_factor(pulses, *eps, e[x] - aatt[i],
                                                                        entry_offset(p.label_type, *region, aatt[i])),
@@ -330,6 +356,11 @@ impl Ge3dBuild<'_> {
 /// label's `sin(a) x` its sign and suppression factor `x` its physiological factor `x` the hat
 /// weight of the excitation on the node.
 pub(super) fn volume_inputs(b: &Ge3dBuild, g: usize) -> mrsim_acq::kspace3d::GeVolume {
+    volume_inputs_with(b, g, true)
+}
+
+/// [`volume_inputs`], with `labels` false the tissue alone (P6 part A, the leakage).
+pub(super) fn volume_inputs_with(b: &Ge3dBuild, g: usize, labels: bool) -> mrsim_acq::kspace3d::GeVolume {
     let ph = b.ph;
     let ncomp = b.n_compartments();
     let nk = b.masks.len();
@@ -341,7 +372,7 @@ pub(super) fn volume_inputs(b: &Ge3dBuild, g: usize) -> mrsim_acq::kspace3d::GeV
             images[gi] = im.clone();
         }
     }
-    let labeled = b.labeled(g);
+    let labeled = labels && b.labeled(g);
     if labeled {
         // per family and node, the reads at the node excitation over the phantom
         let nvox = ph.nvox();
@@ -452,13 +483,6 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
     if ov != RowOverride::None {
         return Err("the test-hook row overrides are not available on the 3D gradient-echo series".to_string());
     }
-    for (what, on) in [
-        ("[hadamard] (P7 plan, Task 18)", p.hadamard.is_some()),
-    ] {
-        if on {
-            return Err(format!("[readout] type \"epi3d\" with {what}: not available"));
-        }
-    }
     if let (Some(pf), fs) = (ph.params.and_then(|q| q.field_strength), p.field_strength) {
         if (pf - fs).abs() > 1e-9 {
             return Err(format!("phantom MagneticFieldStrength {pf} disagrees with the protocol's {fs}"));
@@ -511,7 +535,19 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
     // the separate M0's excitation: Look-Locker's [m0] flip_angle, else the series'
     let flip_deg = p.look_locker.as_ref().and_then(|l| l.m0_flip_deg).map_or(ge.flip_deg, |f| f.0);
     // each raw volume's: a Look-Locker FlipAngle array gives each readout (raw volume) its own
-    let raw_flip: Vec<f64> = (0..n).map(|v| p.look_locker.as_ref().map_or(ge.flip_deg, |l| l.flip_deg[v])).collect();
+    // (on the raw volumes: under Hadamard they are not the rows)
+    let ll_raw = super::p6::ll_on_raws(p, &sched);
+    let raw_flip: Vec<f64> = (0..n).map(|v| ll_raw.as_ref().map_or(ge.flip_deg, |l| l.flip_deg[v])).collect();
+    let spans: Vec<Option<Vec<(f64, f64)>>> = match &p.hadamard {
+        None => vec![None; n],
+        Some(h) => {
+            let enc = crate::hadamard::encoding(h.order);
+            sched.raws.iter().map(|r| r.encoding_row.map(|row| {
+                let w = crate::hadamard::weights(&enc[row]);
+                h.spans.iter().zip(&w).filter(|(_, &w)| w == 1).map(|(&s, _)| s).collect()
+            })).collect()
+        }
+    };
     let spacing_s = res.train.exc_spacing_ms / 1000.0;
     let sups: Vec<Option<crate::longitudinal::Suppression>> = sched.preps.iter().map(|pr| {
         let row = &sched.raw_rows[pr.raw];
@@ -530,7 +566,8 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
         Some(SuppressionModel::BolusPosition(r)) => Some(r),
         _ => None,
     };
-    let p4 = P4::new(p, ph, bolus_region)?;
+    // per raw volume (P6: the crushing survival and the label factors on the schedule's raw volumes)
+    let p4 = super::p6::p4_for_schedule(p, ph, bolus_region, &sched)?;
     let mut physio_lines: Vec<PhysioLine> = Vec::new();
     let prep_factors: Vec<(f64, f64)> = sched.preps.iter().map(|pr| {
         let row = &sched.raw_rows[pr.raw];
@@ -609,7 +646,7 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
 
     let mut b = Ge3dBuild {
         p, ph, res, table, sched, r_sim, masks, groups, group_images, group_mz, families, k_nodes: 0, nodes: Vec::new(),
-        prep_factors, label_scale, p4, bolus_region, lead, lead_a, flip_deg, raw_flip, spacing_s, poses, shot_pose, shot_gain,
+        prep_factors, label_scale, p4, bolus_region, lead, lead_a, flip_deg, raw_flip, spans, spacing_s, poses, shot_pose, shot_gain,
         v2w: sim_grid.voxel_to_world, sim_dims: sim_grid.dims,
     };
 
@@ -711,7 +748,7 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
     }
 
     // ---- the acquisition: every echo, volumes on demand ----
-    let echoes = mrsim_acq::kspace3d::simulate_acquisition_3d_ge(
+    let mut echoes = mrsim_acq::kspace3d::simulate_acquisition_3d_ge(
         sim_grid.dims, acq_grid.dims, n, &t2_vols, &fmap_sim, Some(&ti_vols), &acq, &b.res.train, &b.res.readout,
         &|g| volume_inputs(&b, g), phase, p.seed,
     );
@@ -818,6 +855,132 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
     } else {
         (delta_m, None, gt_iv, gt_art)
     };
+    // ---- with Hadamard (P6 part A): the raw series decoded per readout, the decoded truth per output,
+    // the tissue leakage, the raw records for sourcedata ----
+    let (delta_m, delta_m_static, gt_iv, gt_art, hadamard, n_out) = match &p.hadamard {
+        None => (delta_m, delta_m_static, gt_iv, gt_art, None, n),
+        Some(h) => {
+            let order = h.order;
+            let n_out = b.sched.outputs.len();
+            let fam = |x: Family| b.families.iter().position(|y| *y == x);
+            // the decoded truth: sub-bolus j as readout n read it at the kz-centre excitation, static
+            let mut d_dm = vec![0.0f32; nvox_acq * n_out];
+            let mut d_iv = p.exchange_time.map(|_| vec![0.0f32; nvox_acq * n_out]);
+            let mut d_art = p.macrovascular.as_ref().map(|_| vec![0.0f32; nvox_acq * n_out]);
+            for (k, o) in b.sched.outputs.iter().enumerate() {
+                let Output::Decoded { cycle, subbolus, readout } = *o else { continue };
+                let r = super::p6::readout_groups(&b.sched.cycles[cycle], order)[readout][0];
+                let span = [h.spans[subbolus]];
+                let mut per: Vec<Vec<f32>> = vec![vec![0.0f32; ph.nvox()]; b.families.len()];
+                for &i in &fg {
+                    for (f, rr) in b.reads_in(r, i, &span).iter().enumerate() {
+                        per[f][i] = rr[e_c] as f32;
+                    }
+                }
+                let total: Vec<f32> = (0..ph.nvox()).map(|i| per[0][i] + fam(Family::Extravascular).map_or(0.0, |f| per[f][i])).collect();
+                let put = |dst: &mut Vec<f32>, src: &[f32]| {
+                    for (vox, x) in r_acq.mean(src).iter().enumerate() {
+                        dst[vox * n_out + k] = *x;
+                    }
+                };
+                put(&mut d_dm, &total);
+                if let Some(g) = d_iv.as_mut() {
+                    put(g, &per[0]);
+                }
+                if let (Some(g), Some(f)) = (d_art.as_mut(), fam(Family::Arterial)) {
+                    put(g, &per[f]);
+                }
+            }
+            // the leakage: the tissue alone (and one unsuppressed reference per cycle: its train at its
+            // own repetition time, steady state) in one quiet call, decoded per readout
+            let leakage: Option<Vec<Vec<HadamardLeakage>>> = h.report_leakage.0.then(|| {
+                let nc = b.sched.cycles.len();
+                let nt = n + nc;
+                let quiet = Acquisition { noise_variance: 0.0, n_spikes: 0, accel: 1, ..acq.clone() };
+                let ky = b.res.readout.ky_segments;
+                let ref_weights: Vec<Vec<f64>> = b.sched.cycles.iter().map(|c| {
+                    let r0 = c.raws.start;
+                    let row = &b.sched.raw_rows[r0];
+                    let (times, flips, _) = cycle_of(&b.sched, &b.raw_flip, b.res.n_exc, spacing_s, r0);
+                    let mz: Vec<Vec<f64>> = b.groups.iter()
+                        .map(|gr| tissue_mz_ll(1.0, gr.t1_s, &LlCycle { tr: row.tr, s: None, t_read: times.clone(), flip_deg: flips.clone() }))
+                        .collect();
+                    let sin_a = b.raw_flip[r0].to_radians().sin();
+                    let mut w = vec![0.0; nz * ky * ncomp];
+                    for pp in 0..nz {
+                        for sy in 0..ky {
+                            let j = b.table.line(pp, sy).excitation;
+                            for (gi, m) in mz.iter().enumerate() {
+                                w[(pp * ky + sy) * ncomp + gi] = sin_a * m[j];
+                            }
+                        }
+                    }
+                    w
+                }).collect();
+                let builder = |g: usize| {
+                    if g < n {
+                        volume_inputs_with(&b, g, false)
+                    } else {
+                        let mut images = vec![Vec::new(); ncomp];
+                        for (gi, im) in b.group_images.iter().enumerate() {
+                            images[gi] = im.clone();
+                        }
+                        mrsim_acq::kspace3d::GeVolume { images, weights: ref_weights[g - n].clone(), shot_images: None }
+                    }
+                };
+                let per_echo = mrsim_acq::kspace3d::simulate_acquisition_3d_ge(
+                    sim_grid.dims, acq_grid.dims, nt, &t2_vols, &fmap_sim, Some(&ti_vols), &quiet, &b.res.train,
+                    &b.res.readout, &builder, phase, p.seed,
+                );
+                let brain: Vec<bool> = r_acq.majority(&ph.dseg).iter().map(|l| *l > 0).collect();
+                let norm = |img: &[(f64, f64)]| -> f64 {
+                    img.iter().zip(&brain).filter(|(_, b)| **b).map(|(z, _)| z.0 * z.0 + z.1 * z.1).sum::<f64>().sqrt()
+                };
+                let eps = 1e-12 * acq.signal_scale;
+                per_echo.iter().map(|(tm, tp)| b.sched.cycles.iter().enumerate().flat_map(|(cy, c)| {
+                    let reference = norm(&super::p6::complex_volume(tm, tp, nt, n + cy));
+                    super::p6::readout_groups(c, order).into_iter().enumerate().map(move |(readout, g)| {
+                        let raw: Vec<Vec<(f64, f64)>> = g.iter().map(|&r| super::p6::complex_volume(tm, tp, nt, r)).collect();
+                        let refs: Vec<&[(f64, f64)]> = raw.iter().map(|v| v.as_slice()).collect();
+                        let per_subbolus = crate::hadamard::decode(&refs, order).iter().map(|l| {
+                            let a = norm(l);
+                            (a, a / reference.max(eps))
+                        }).collect();
+                        HadamardLeakage { cycle: cy, readout, reference_norm: reference, per_subbolus }
+                    }).collect::<Vec<_>>()
+                }).collect()).collect()
+            });
+            // the decoded series, every echo
+            let raw_echoes = std::mem::take(&mut echoes);
+            echoes = raw_echoes.iter().map(|(m, ph_)| super::p6::decode_series(&b.sched, order, m, ph_, n)).collect();
+            let prep_factors: Vec<PrepFactors> = b.sched.preps.iter().enumerate().map(|(pi, pr)| {
+                let (tf, lf) = b.prep_factors[pi];
+                PrepFactors {
+                    raw: pr.raw, shot: pr.shot, encoding_row: b.sched.raws[pr.raw].encoding_row, start_s: pr.start_s,
+                    labeling_window: pr.labeling_window, label: lf, tissue: tf,
+                    suppression: label_factors.as_ref().map(|f| f[pr.raw]), shot_gain: b.shot_gain[pr.raw][pr.shot],
+                }
+            }).collect();
+            let mut raw_iter = raw_echoes.into_iter();
+            let (raw_mag, raw_phase) = raw_iter.next().expect("one echo at least");
+            let series = HadamardSeries {
+                n_raw: n, raw_mag, raw_phase, raw_more_echoes: raw_iter.collect(),
+                // a 3D raw volume's truth is static (its shots have their own poses), as P6's
+                raw_delta_m: delta_m_static.clone().unwrap_or(delta_m),
+                raw_delta_m_static: None,
+                raw_delta_m_iv: gt_iv, raw_delta_m_suppressed: None, raw_delta_m_arterial: gt_art,
+                schedule: b.sched.clone(),
+                leakage: leakage.as_ref().map(|l| l[0].clone()),
+                leakage_more_echoes: leakage.map(|l| l[1..].to_vec()).unwrap_or_default(),
+                prep_factors,
+                flags: HadamardFlags {
+                    grappa: acq.accel > 1, spikes: acq.n_spikes > 0, motion: p.motion.is_some(),
+                    shot_factors: p.physio.is_some() || !events.is_empty(), transients: true, physiology: p.physio.is_some(),
+                },
+            };
+            (d_dm, None, d_iv, d_art, Some(series), n_out)
+        }
+    };
     let perfused: Vec<bool> = ph.perfusion.iter().map(|f| *f > 0.0).collect();
     let ground_truth = GroundTruth {
         delta_m,
@@ -879,13 +1042,13 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
         echo_time_s: tes[e + 1], mag, phase, m0: m0_iter.as_mut().and_then(|it| it.next()),
     }).collect();
     Ok(SeriesOutput {
-        acq_grid, sim_grid, n_volumes: n, mag, phase: phase_out, m0, mode: mode_used, labels: ph.labels.clone(),
+        acq_grid, sim_grid, n_volumes: n_out, mag, phase: phase_out, m0, mode: mode_used, labels: ph.labels.clone(),
         n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(), seeds: (p.seed, m0_seed), acquisition: acq,
         ground_truth, label_factors, poses: b.poses.clone(), motion_seed, events, dropped, compat: None, crush_survival: b.p4.crush.clone(),
         physio: b.p4.physio.as_ref().map(|_| physio_lines), ge_rule: Some(
             "every excitation of the train an event on the tissue's timeline (spoiled): the first preparation at its \
              steady state, each later one from the end of the one before"),
-        readout: None, echo_amplitudes: None, spiral_segmentation: None, more_echoes, hadamard: None, look_locker: None,
+        readout: None, echo_amplitudes: None, spiral_segmentation: None, more_echoes, hadamard, look_locker: None,
         ge3d: Some(ge3d),
     })
 }
@@ -1479,5 +1642,207 @@ mod tests {
         g["EchoTime"] = json!(0.012);
         let e = crate::protocol::parse_echoes(&[g, g2], "volume_type\nlabel\n", None, None).unwrap_err();
         assert!(e.contains("multi-echo spin-echo"), "{e}");
+    }
+
+    // ---- Task 18: Hadamard, and the P4 parts, in 3D
+
+    const MACRO: &str = "[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
+                         arterial_transit_time = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n";
+    const ABV: [f64; 4] = [0.0, 0.03, 0.015, 0.0];
+    const AATT: [f64; 4] = [0.0, 1.2, 1.8, 0.0];
+
+    /// `ge3d_protocol`'s train, Hadamard order 4 (sub-boli of 0.6 s), `cycles` encoding cycles, each
+    /// row read at every PLD of `plds` (Look-Locker with more than one), no suppression.
+    fn had3d_protocol(plds: &[f64], cycles: usize, extra: &str) -> Protocol {
+        let (mut ld, mut pld, mut ctx) = (Vec::new(), Vec::new(), String::from("volume_type\n"));
+        for _ in 0..cycles {
+            for &q in plds {
+                for j in 0..3 {
+                    ld.push(0.6);
+                    pld.push(q + 0.6 * (2 - j) as f64);
+                    ctx.push_str("deltam\n");
+                }
+            }
+        }
+        let mut s: Value = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": ld, "PostLabelingDelay": pld,
+            "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "EchoTime": 0.012,
+            "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 0.75], "MRAcquisitionType": "3D",
+            "PulseSequenceType": "3D EPI", "PhaseEncodingDirection": "j-", "EffectiveEchoSpacing": 0.0005,
+            "NumberShots": 4, "FlipAngle": 12
+        });
+        let ll = if plds.len() > 1 {
+            s["LookLocker"] = json!(true);
+            format!("[look_locker]\nreadouts_per_cycle = {}\n", plds.len())
+        } else {
+            String::new()
+        };
+        let ov: Overlay = toml::from_str(&format!(
+            "seed = 5\n[acquisition]\noversample = 2\nsignal_scale = 100.0\nnoise_variance = 0.0\n[signal]\nacq_contrast = \"ge\"\n\
+             [readout]\nexcitation_spacing = 40.0\nslab_entry_time = 0.5\nkz_segments = 2\n[kinetic]\nexchange_time = 0.4\n\
+             [hadamard]\norder = 4\n{ll}{extra}")).unwrap();
+        parse(&s, &ctx, Some(&ov), crop().params.as_ref()).unwrap()
+    }
+
+    /// Sub-bolus `j` (of the raw volumes' kinetics `k`: the whole encoded bolus) as the excitation at
+    /// `x` of the cycle's train (`e_all`, 12 degrees) reads it in
+    /// voxel `i`, before `sin(a)`: the parcel reference cut to the sub-bolus, depleted from slab entry
+    /// (0.5 s), with exchange; with `arterial` the arterial parcel where its labeling is in the
+    /// sub-bolus, entered the slab at the same d.
+    fn sub_bolus_ref(k: crate::kinetic::Kinetic, ph: &Phantom, e_all: &[f64], x: usize, span: (f64, f64), arterial: bool, i: usize) -> f64 {
+        let l = ph.dseg[i];
+        if l <= 0 {
+            return 0.0;
+        }
+        let c = Case {
+            k, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
+            m0: ph.m0[i] as f64, t: e_all[x], excitations: e_all[..x].iter().map(|&t| (t, 12.0)).collect(),
+            entry_lead: ph.att[i] as f64 - 0.5, pulses: vec![], epsilon: 0.0, region: PRegion::Global, tau_ex: Some(0.4), span,
+        };
+        let mut v = if ph.perfusion[i] > 0.0 { c.read(4).1 } else { 0.0 };
+        let l = l as usize;
+        let a = e_all[x] - AATT[l];
+        if arterial && ABV[l] > 0.0 && span.0 <= a && a < span.1 {
+            v += c.arterial(ABV[l], AATT[l], AATT[l] - 0.5);
+        }
+        v
+    }
+
+    /// Every readout's raw volumes, decoded at the inputs (the label part, every partition and
+    /// segment checked here), are sin(a) times each sub-bolus's reference read; their tissue decodes
+    /// away (identical preparations); two encoding rows swapped fail it. Returns whether an arterial
+    /// term was seen.
+    fn check_decoded_inputs(p: &Protocol, plds: &[f64]) -> bool {
+        let ph = crop();
+        let pr = prepare_ge3d(p, &ph, T2Mode::Class, RowOverride::None).unwrap();
+        let b = &pr.b;
+        let h = p.hadamard.as_ref().unwrap();
+        let arterial = p.macrovascular.is_some();
+        let kin = p.kinetic(&b.sched.raw_rows[0]);
+        let e_all: Vec<f64> = plds.iter().flat_map(|&q| train_times(h.tau_tot + q, 4, 0.040)).collect();
+        let sin_a = 12f64.to_radians().sin();
+        let ncomp = b.n_compartments();
+        let ky = b.res.readout.ky_segments;
+        let [snx, sny, _] = pr.sim_grid.dims;
+        let sum = |vol: &mrsim_acq::kspace3d::GeVolume, pp: usize, sy: usize| -> Vec<(f64, f64)> {
+            (0..snx * sny * 8).map(|v| {
+                ((0..ncomp).filter(|&c| !vol.images[c].is_empty())
+                    .map(|c| vol.weights[(pp * ky + sy) * ncomp + c] * vol.images[c][v] as f64).sum(), 0.0)
+            }).collect()
+        };
+        let decode = |v: &[Vec<(f64, f64)>]| {
+            let r: Vec<&[(f64, f64)]> = v.iter().map(|x| x.as_slice()).collect();
+            crate::hadamard::decode(&r, 4)
+        };
+        let mut art_seen = false;
+        for cy in &b.sched.cycles {
+            for (n, group) in super::super::p6::readout_groups(cy, 4).into_iter().enumerate() {
+                let vols: Vec<_> = group.iter().map(|&r| (volume_inputs(b, r), volume_inputs_with(b, r, false))).collect();
+                for pp in [0usize, 3, 4, 7] {
+                    for sy in 0..ky {
+                        let x = 4 * n + b.table.line(pp, sy).excitation;
+                        let tissue: Vec<Vec<(f64, f64)>> = vols.iter().map(|(_, t)| sum(t, pp, sy)).collect();
+                        let label: Vec<Vec<(f64, f64)>> = vols.iter().zip(&tissue).map(|((w, _), t)| {
+                            sum(w, pp, sy).iter().zip(t).map(|(a, b)| (a.0 - b.0, 0.0)).collect()
+                        }).collect();
+                        let tissue_peak = tissue[0].iter().fold(0.0f64, |m, z| m.max(z.0.abs()));
+                        let (dec, dec_t) = (decode(&label), decode(&tissue));
+                        let mut swapped = label.clone();
+                        swapped.swap(1, 2);
+                        let dec_s = decode(&swapped);
+                        let mut miss = 0.0f64;
+                        for j in 0..3 {
+                            let per: Vec<f32> = (0..ph.nvox()).map(|i| (sin_a * sub_bolus_ref(kin, &ph, &e_all, x, h.spans[j], arterial, i)) as f32).collect();
+                            if arterial && !art_seen {
+                                art_seen = (0..ph.nvox()).any(|i| {
+                                    let l = ph.dseg[i].max(0) as usize;
+                                    let a = e_all[x] - AATT[l];
+                                    ABV[l] > 0.0 && h.spans[j].0 <= a && a < h.spans[j].1 && AATT[l] <= e_all[x]
+                                });
+                            }
+                            let want = b.r_sim.mean(&per);
+                            let peak = want.iter().fold(0.0f32, |m, x| m.max(x.abs())) as f64;
+                            assert!(peak > 0.0, "cycle readout {n} sub-bolus {j}: an empty reference");
+                            let worst = dec[j].iter().zip(&want).map(|(a, w)| (a.0 - *w as f64).abs()).fold(0.0, f64::max);
+                            assert!(worst <= 3e-4 * peak + 1e-7 * tissue_peak,
+                                    "readout {n} partition {pp} segment {sy} sub-bolus {j}: {worst:e} of {peak:e}");
+                            let leak = dec_t[j].iter().fold(0.0f64, |m, z| m.max(z.0.abs()));
+                            assert!(leak <= 1e-9 * tissue_peak, "tissue decodes away: {leak:e} of {tissue_peak:e}");
+                            miss = miss.max(dec_s[j].iter().zip(&want).map(|(a, w)| (a.0 - *w as f64).abs()).fold(0.0, f64::max) / peak);
+                        }
+                        assert!(miss > 1e-2, "a swapped encoding row still decodes ({miss:e})");
+                    }
+                }
+            }
+        }
+        art_seen
+    }
+
+    /// 3D Hadamard: decoded (j, n) against the independent sub-bolus read, with exchange and the
+    /// arterial term, both entering the slab at d = 0.5 s < aATT; each shot repeats its encoding row.
+    #[test]
+    fn hadamard_decodes_to_each_sub_bolus_with_the_arterial_term() {
+        let p = had3d_protocol(&[0.5], 1, MACRO);
+        let sched = Schedule::new(&p);
+        assert_eq!((sched.raws.len(), sched.preps.len(), sched.outputs.len()), (4, 16, 3));
+        for r in &sched.raws {
+            assert_eq!(r.n_preps, 4);
+        }
+        assert!(check_decoded_inputs(&p, &[0.5]), "the arterial term was never in a sub-bolus");
+    }
+
+    /// 3D Look-Locker x Hadamard: per readout (S-shot cycle groups of P6's context), the decoded
+    /// inputs against the sub-bolus read depleted by every earlier sub-train of the cycle.
+    #[test]
+    fn look_locker_hadamard_decodes_per_readout_in_3d() {
+        let plds = [0.5, 0.8];
+        let p = had3d_protocol(&plds, 1, "");
+        let sched = Schedule::new(&p);
+        assert_eq!((sched.raws.len(), sched.preps.len(), sched.outputs.len()), (8, 16, 6));
+        check_decoded_inputs(&p, &plds);
+    }
+
+    /// The 3D Hadamard series: the output is the raw series decoded per readout; the decoded truth is
+    /// each sub-bolus's reference read at the kz-centre excitation (its intravascular part and the
+    /// arterial term too) on the acquired grid; the tissue leakage of identical preparations is nil.
+    #[test]
+    fn hadamard_series_decodes_its_truth_and_reports_its_leakage() {
+        let ph = crop();
+        let p = had3d_protocol(&[0.5], 1, MACRO);
+        let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
+        let out = simulate_ge3d(&p, &ph, T2Mode::Auto, &phase, RowOverride::None).unwrap();
+        let pr = prepare_ge3d(&p, &ph, T2Mode::Class, RowOverride::None).unwrap();
+        let h = p.hadamard.as_ref().unwrap();
+        let had = out.hadamard.as_ref().expect("a Hadamard series");
+        assert_eq!((out.n_volumes, had.n_raw), (3, 4));
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let (dm, dp) = super::super::p6::decode_series(&had.schedule, 4, &had.raw_mag, &had.raw_phase, 4);
+        assert_eq!((bits(&dm), bits(&dp)), (bits(&out.mag), bits(&out.phase)));
+        for l in had.leakage.as_ref().expect("the leakage") {
+            for &(_, rel) in &l.per_subbolus {
+                assert!(rel < 1e-6, "identical preparations leak {rel:e}");
+            }
+        }
+        // the decoded truth
+        let e_c = pr.b.res.e_c;
+        let kin = p.kinetic(&pr.b.sched.raw_rows[0]);
+        let e_all = train_times(h.tau_tot + 0.5, 4, 0.040);
+        let gt = &out.ground_truth;
+        let (art, iv) = (gt.delta_m_arterial.as_ref().unwrap(), gt.delta_m_iv.as_ref().unwrap());
+        for j in 0..3 {
+            let want = pr.r_acq.mean(&(0..ph.nvox()).map(|i| sub_bolus_ref(kin, &ph, &e_all, e_c, h.spans[j], false, i) as f32).collect::<Vec<_>>());
+            let want_a = pr.r_acq.mean(&(0..ph.nvox()).map(|i| {
+                (sub_bolus_ref(kin, &ph, &e_all, e_c, h.spans[j], true, i) - sub_bolus_ref(kin, &ph, &e_all, e_c, h.spans[j], false, i)) as f32
+            }).collect::<Vec<_>>());
+            let peak = want.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            assert!(peak > 0.0);
+            for (vox, (w, wa)) in want.iter().zip(&want_a).enumerate() {
+                let at = vox * 3 + j;
+                assert!((gt.delta_m[at] - w).abs() <= 1e-5 * peak, "sub-bolus {j} voxel {vox}: {} vs {w}", gt.delta_m[at]);
+                assert!((art[at] - wa).abs() <= 1e-5 * peak, "arterial sub-bolus {j} voxel {vox}: {} vs {wa}", art[at]);
+                assert!(iv[at].abs() <= gt.delta_m[at].abs() + 1e-6 * peak);
+            }
+        }
+        assert!(art.iter().any(|x| *x != 0.0));
     }
 }
