@@ -275,6 +275,232 @@ pub fn delta_m_read(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64,
         .sum()
 }
 
+// ---- P7 part A: the P4 parts under Look-Locker; part C: depletion from slab entry ----
+
+/// The intravascular part of [`delta_m_arrival`] (P7 addendum, part A): the label of the window
+/// `[u1, u2)` not yet exchanged at `t`, the arrival form with `T1'` replaced by
+/// `T1'' = (1/T1' + 1/tau_ex)^-1` (P4 part A's residue). PASL combines its exponents as
+/// [`delta_m_iv`]'s `pasl_stable` does, `exp(kk (t - u_hi)) expm1(kk (u_hi - u_lo))`, which stays
+/// finite where a short `tau_ex` makes `kk` large and negative, and is clamped to
+/// `[0, delta_m_arrival(same window)]` as P4 clamps the whole bolus. (P)CASL is the residue
+/// difference with `T1''`, which never exceeds the whole.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_m_arrival_iv(
+    k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t: f64, u1: f64, u2: f64, tau_ex: f64,
+) -> f64 {
+    let Some((f, m0b, t1pp)) = t1pp(k, f_ml_100g_min, t1t, m0, tau_ex) else { return 0.0 };
+    let (u_lo, u_hi) = (u1.max(dt), u2.min(dt + k.tau).min(t));
+    if u_hi <= u_lo || t1pp == 0.0 {
+        return 0.0;
+    }
+    match k.label_type {
+        LabelType::Pasl => {
+            let kk = (if k.t1b != 0.0 { 1.0 / k.t1b } else { 0.0 }) - div0(1.0, t1pp);
+            let decay = if k.t1b > 0.0 { (-t / k.t1b).exp() } else { 0.0 };
+            let num = (kk * (t - u_hi)).exp() * (kk * (u_hi - u_lo)).exp_m1();
+            let iv = 2.0 * m0b * f * k.alpha * decay * div0(num, kk);
+            iv.min(delta_m_arrival(k, f_ml_100g_min, dt, t1t, m0, t, u1, u2)).max(0.0)
+        }
+        LabelType::Casl | LabelType::Pcasl => {
+            let decay = if k.t1b != 0.0 { (-dt / k.t1b).exp() } else { 0.0 };
+            2.0 * m0b * f * t1pp * k.alpha * decay * ((-(t - u_hi) / t1pp).exp() - (-(t - u_lo) / t1pp).exp())
+        }
+    }
+}
+
+/// [`delta_m_arrival`] of the sub-bolus `a..b` of `[0, tau]`, by [`delta_m_sub`]'s shifts:
+/// (P)CASL a bolus of length `b - a` read at `t - a`, its arrival window shifted by `-a` (a parcel
+/// labeled at `l` arrives at `l + dt`); PASL the arrival delay `dt + a`, the window unshifted. The
+/// uncut sub-bolus calls [`delta_m_arrival`] itself.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_m_arrival_sub(
+    k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, t: f64, u1: f64, u2: f64, a: f64, b: f64,
+) -> f64 {
+    if a == 0.0 && b == k.tau {
+        return delta_m_arrival(k, f, dt, t1t, m0, t, u1, u2);
+    }
+    let ks = Kinetic { tau: b - a, ..*k };
+    match k.label_type {
+        LabelType::Pasl => delta_m_arrival(&ks, f, dt + a, t1t, m0, t, u1, u2),
+        LabelType::Casl | LabelType::Pcasl => delta_m_arrival(&ks, f, dt, t1t, m0, t - a, u1 - a, u2 - a),
+    }
+}
+
+/// [`delta_m_arrival_iv`] of the sub-bolus `a..b`, by the same shifts as [`delta_m_arrival_sub`].
+#[allow(clippy::too_many_arguments)]
+pub fn delta_m_arrival_iv_sub(
+    k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, t: f64, u1: f64, u2: f64, a: f64, b: f64, tau_ex: f64,
+) -> f64 {
+    if a == 0.0 && b == k.tau {
+        return delta_m_arrival_iv(k, f, dt, t1t, m0, t, u1, u2, tau_ex);
+    }
+    let ks = Kinetic { tau: b - a, ..*k };
+    match k.label_type {
+        LabelType::Pasl => delta_m_arrival_iv(&ks, f, dt + a, t1t, m0, t, u1, u2, tau_ex),
+        LabelType::Casl | LabelType::Pcasl => delta_m_arrival_iv(&ks, f, dt, t1t, m0, t - a, u1 - a, u2 - a, tau_ex),
+    }
+}
+
+/// The label a depleted read sees, split as P4 splits it: `iv` the label not yet exchanged (the
+/// blood compartment), `ev` the exchanged rest (the tissue compartment). Without exchange all of
+/// it is `iv` and `ev` is zero (P4: all label intravascular).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ReadParts {
+    pub iv: f64,
+    pub ev: f64,
+}
+
+impl ReadParts {
+    pub fn total(&self) -> f64 {
+        self.iv + self.ev
+    }
+}
+
+/// One window's contribution, every sub-bolus with its factor: `(iv, whole)`.
+#[allow(clippy::too_many_arguments)]
+fn window_parts(
+    k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, t: f64, lo: f64, hi: f64, subs: &[(f64, f64, f64)],
+    tau_ex: Option<f64>,
+) -> (f64, f64) {
+    let (mut iv, mut whole) = (0.0, 0.0);
+    for &(a, b, fac) in subs {
+        let w = delta_m_arrival_sub(k, f, dt, t1t, m0, t, lo, hi, a, b);
+        whole += fac * w;
+        iv += fac * match tau_ex {
+            Some(te) => delta_m_arrival_iv_sub(k, f, dt, t1t, m0, t, lo, hi, a, b, te),
+            None => w,
+        };
+    }
+    (iv, whole)
+}
+
+/// The arrival window `w` of a depleted read with slab-entry shift `delta` (P7 addendum, part C):
+/// `[e_{w-1} + delta, e_w + delta)`, the first starting at `0`. A parcel arriving in it entered
+/// the slab before every excitation from `w` on, so they all deplete it; `delta = 0` is P6's
+/// arrival in the voxel.
+fn window(e: &[f64], w: usize, delta: f64) -> (f64, f64) {
+    (if w == 0 { 0.0 } else { e[w - 1] + delta }, e[w] + delta)
+}
+
+/// The depleted read at the last of the excitations `e` (s from the start of labeling,
+/// increasing), with every P4 part (P7 addendum, parts A and C): the sub-boli `subs` as
+/// `(a, b, factor)` (one `(0, tau, 1)` without bolus-position suppression or Hadamard), the
+/// intravascular split when `tau_ex` is given, and the windows shifted by `delta = ATT - d` for
+/// depletion from slab entry (`0` in 2D). `flips_deg` are the earlier excitations', as in
+/// [`delta_m_read`], which this reduces to (one full sub-bolus, no exchange, `delta = 0`).
+/// Direct: O(n) per read. [`delta_m_read_all`] gives every read of a train in O(n) in all.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_m_read_parts(
+    k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, e: &[f64], flips_deg: &[f64], subs: &[(f64, f64, f64)],
+    tau_ex: Option<f64>, delta: f64,
+) -> ReadParts {
+    let n = e.len();
+    assert!(n >= 1 && flips_deg.len() + 1 == n, "{n} excitations need {} earlier flips, got {}", n.saturating_sub(1), flips_deg.len());
+    let t = e[n - 1];
+    let (mut iv, mut whole) = (0.0, 0.0);
+    for w in 0..n {
+        let (lo, hi) = window(e, w, delta);
+        let depletion: f64 = flips_deg[w..].iter().map(|a| a.to_radians().cos()).product();
+        let (i, h) = window_parts(k, f, dt, t1t, m0, t, lo, hi, subs, tau_ex);
+        iv += depletion * i;
+        whole += depletion * h;
+    }
+    match tau_ex {
+        Some(_) => ReadParts { iv, ev: whole - iv },
+        None => ReadParts { iv: whole, ev: 0.0 },
+    }
+}
+
+/// One component of [`delta_m_read_all`]: the depleted sum at every excitation, where `term(t,
+/// lo, hi)` is the component's window contribution at `t` and decays as `exp(-t/t1x)` once the
+/// window has fully arrived (`hi <= t`). The full windows are carried as one sum, decayed and
+/// depleted per step; each window is evaluated directly once, when it becomes full, and the one
+/// window straddling `t` is evaluated directly at each read. The depletion of window `w` at read
+/// `n` is `exp(lp[n] - lp[w])`, `lp` the prefix sums of `ln cos(a)` (finite: flips are in
+/// `(0, 90]`).
+fn read_all_component(e: &[f64], lp: &[f64], delta: f64, t1x: f64, term: impl Fn(f64, f64, f64) -> f64) -> Vec<f64> {
+    let n = e.len();
+    let mut out = vec![0.0; n];
+    if t1x == 0.0 {
+        // the guarded zero T1': every term is zero (the GKM's guard)
+        return out;
+    }
+    let (mut s, mut full) = (0.0f64, 0usize);
+    for r in 0..n {
+        let t = e[r];
+        if r > 0 {
+            s *= (lp[r] - lp[r - 1]).exp() * (-(t - e[r - 1]) / t1x).exp();
+        }
+        while full <= r && window(e, full, delta).1 <= t {
+            let (lo, hi) = window(e, full, delta);
+            s += (lp[r] - lp[full]).exp() * term(t, lo, hi);
+            full += 1;
+        }
+        let mut v = s;
+        if full <= r {
+            let (lo, hi) = window(e, full, delta);
+            v += (lp[r] - lp[full]).exp() * term(t, lo, hi);
+        }
+        out[r] = v;
+    }
+    out
+}
+
+/// [`delta_m_read_parts`] at every excitation of a train in O(n) in all (P7 plan, Task 1): `e`
+/// the excitations and `flips_deg` every excitation's flip (the last is not read). Every full
+/// window's term is proportional to `exp(-t/T1')` (`exp(-t/T1'')` for the intravascular part):
+/// for (P)CASL directly, for PASL as `exp(-t/T1b) exp(kk t)`. The recursion is carried relative to
+/// the previous excitation, so no exponent spans more than one step.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_m_read_all(
+    k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, e: &[f64], flips_deg: &[f64], subs: &[(f64, f64, f64)],
+    tau_ex: Option<f64>, delta: f64,
+) -> Vec<ReadParts> {
+    let n = e.len();
+    assert_eq!(flips_deg.len(), n, "one flip per excitation");
+    let mut lp = vec![0.0; n + 1];
+    for (m, a) in flips_deg.iter().enumerate() {
+        lp[m + 1] = lp[m] + a.to_radians().cos().ln();
+    }
+    let (_, _, t1p) = gkm_constants(k, f, t1t, m0);
+    let whole = read_all_component(e, &lp, delta, t1p, |t, lo, hi| {
+        subs.iter().map(|&(a, b, fac)| fac * delta_m_arrival_sub(k, f, dt, t1t, m0, t, lo, hi, a, b)).sum()
+    });
+    match tau_ex {
+        None => whole.into_iter().map(|w| ReadParts { iv: w, ev: 0.0 }).collect(),
+        Some(te) => {
+            let t1x = t1pp(k, f, t1t, m0, te).map_or(0.0, |(_, _, x)| x);
+            let iv = read_all_component(e, &lp, delta, t1x, |t, lo, hi| {
+                subs.iter()
+                    .map(|&(a, b, fac)| fac * delta_m_arrival_iv_sub(k, f, dt, t1t, m0, t, lo, hi, a, b, te))
+                    .sum()
+            });
+            iv.into_iter().zip(whole).map(|(i, w)| ReadParts { iv: i, ev: w - i }).collect()
+        }
+    }
+}
+
+/// The arterial read at excitation `e_n` before its `sin(a)` (P7 addendum, parts A and C):
+/// [`arterial_dm`] times `factor` (the crushing survival and the parcel's bolus-position factor,
+/// which the caller evaluates at the parcel `e_n - aATT`), times `cos(a_m)` of every earlier
+/// excitation in `[e_n - delta_a, e_n)`: the parcel entered the slab `delta_a = aATT - d` before
+/// it is read. `delta_a = 0` is part A's fresh arterial blood.
+#[allow(clippy::too_many_arguments)]
+pub fn arterial_read(
+    k: &Kinetic, abv: f64, aatt: f64, m0: f64, e_n: f64, earlier: &[(f64, f64)], delta_a: f64, factor: f64,
+) -> f64 {
+    let (v, _) = arterial_dm(k, abv, aatt, m0, e_n);
+    if v == 0.0 {
+        return 0.0;
+    }
+    let depletion: f64 = earlier
+        .iter()
+        .filter(|&&(e_m, _)| e_n - delta_a <= e_m && e_m < e_n)
+        .map(|&(_, a)| a.to_radians().cos())
+        .product();
+    v * factor * depletion
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,5 +1119,204 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- P7 Task 1 ----
+
+    fn rel_close(a: f64, b: f64, rel: f64) -> bool {
+        (a - b).abs() <= rel * a.abs().max(b.abs()).max(1e-300)
+    }
+
+    /// Windows partitioning `[0, t)`: edges at 0, a few interior points, and `t`.
+    fn edges(t: f64) -> Vec<f64> {
+        let mut v = vec![0.0];
+        v.extend([0.3, 0.7, 1.1, 1.6, 2.2, 2.9, 3.7].iter().copied().filter(|&x| x < t));
+        v.push(t);
+        v
+    }
+
+    /// `tau_ex` so long that `T1''` is `T1'` to the last bits: the intravascular window is the
+    /// whole window.
+    #[test]
+    fn arrival_iv_without_exchange_is_the_arrival() {
+        for k in [K_PCASL, K_PASL] {
+            for t in [1.0, 1.6, 2.5, 3.6, 5.0] {
+                for w in edges(t).windows(2) {
+                    let whole = delta_m_arrival(&k, F, DT, T1T, M0, t, w[0], w[1]);
+                    let iv = delta_m_arrival_iv(&k, F, DT, T1T, M0, t, w[0], w[1], 1e15);
+                    assert!(rel_close(iv, whole, 1e-12), "{:?} t {t} {w:?}: {iv} vs {whole}", k.label_type);
+                }
+            }
+        }
+    }
+
+    /// The intravascular windows partition `delta_m_iv`, for both labeling types, inside and after
+    /// the bolus; for PASL also at a `tau_ex` where the naive exponent form is not finite.
+    #[test]
+    fn arrival_iv_windows_sum_to_delta_m_iv() {
+        for k in [K_PCASL, K_PASL] {
+            for tau_ex in [0.5, 1.5, 0.001] {
+                for t in [1.0, 1.4, 2.5, 3.6, 5.0] {
+                    let sum: f64 = edges(t).windows(2)
+                        .map(|w| delta_m_arrival_iv(&k, F, DT, T1T, M0, t, w[0], w[1], tau_ex)).sum();
+                    let want = delta_m_iv(&k, F, DT, T1T, M0, t, tau_ex);
+                    assert!(sum.is_finite() && rel_close(sum, want, 1e-12),
+                        "{:?} tau_ex {tau_ex} t {t}: {sum} vs {want}", k.label_type);
+                }
+            }
+        }
+        // the naive PASL form overflows there: kk = 1/T1b - 1/T1'' is about -1000
+        let (_, _, t1pp) = t1pp(&K_PASL, F, T1T, M0, 0.001).unwrap();
+        let kk = 1.0 / K_PASL.t1b - 1.0 / t1pp;
+        let (t, u_lo, u_hi) = (3.6, 0.8, 1.5);
+        let naive = (kk * t).exp() * ((-kk * u_lo).exp() - (-kk * u_hi).exp());
+        assert!(!naive.is_finite(), "the naive form is finite here ({naive}): the test does not exercise the stable form");
+    }
+
+    /// No window's intravascular part is negative or exceeds its whole.
+    #[test]
+    fn arrival_iv_is_clamped_to_its_window() {
+        for k in [K_PCASL, K_PASL] {
+            for tau_ex in [0.01, 0.3, 2.0] {
+                for t in [1.0, 2.0, 3.6] {
+                    for w in edges(t).windows(2) {
+                        let whole = delta_m_arrival(&k, F, DT, T1T, M0, t, w[0], w[1]);
+                        let iv = delta_m_arrival_iv(&k, F, DT, T1T, M0, t, w[0], w[1], tau_ex);
+                        assert!(iv >= 0.0 && iv <= whole * (1.0 + 1e-14), "{:?}: {iv} of {whole}", k.label_type);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The sub-boli of a partition of the bolus sum, window by window, to the whole window; and
+    /// over both partitions to `delta_m`.
+    #[test]
+    fn arrival_sub_partitions_sum_to_the_whole() {
+        for k in [K_PCASL, K_PASL] {
+            let cuts = [0.0, 0.2 * k.tau, 0.55 * k.tau, k.tau];
+            for t in [1.0, 1.6, 2.5, 3.6, 5.0] {
+                let mut total = 0.0;
+                for w in edges(t).windows(2) {
+                    let whole = delta_m_arrival(&k, F, DT, T1T, M0, t, w[0], w[1]);
+                    let parts: f64 = cuts.windows(2)
+                        .map(|c| delta_m_arrival_sub(&k, F, DT, T1T, M0, t, w[0], w[1], c[0], c[1])).sum();
+                    assert!((parts - whole).abs() <= 1e-12 * whole.abs().max(1e-12), "{:?} t {t} {w:?}: {parts} vs {whole}", k.label_type);
+                    let iv_parts: f64 = cuts.windows(2)
+                        .map(|c| delta_m_arrival_iv_sub(&k, F, DT, T1T, M0, t, w[0], w[1], c[0], c[1], 0.7)).sum();
+                    let iv = delta_m_arrival_iv(&k, F, DT, T1T, M0, t, w[0], w[1], 0.7);
+                    assert!((iv_parts - iv).abs() <= 1e-12 * iv.abs().max(1e-12), "iv {:?} t {t}: {iv_parts} vs {iv}", k.label_type);
+                    total += parts;
+                }
+                let want = delta_m(&k, F, DT, T1T, M0, t);
+                assert!((total - want).abs() <= 1e-12 * want.abs().max(1e-12), "{:?} t {t}: {total} vs {want}", k.label_type);
+            }
+        }
+    }
+
+    fn train(n: usize, start: f64, step: f64) -> (Vec<f64>, Vec<f64>) {
+        ((0..n).map(|m| start + step * m as f64).collect(), (0..n).map(|m| 20.0 + 3.0 * (m % 7) as f64).collect())
+    }
+
+    /// With one full sub-bolus, no exchange and no shift, the parts read is P6's read.
+    #[test]
+    fn read_parts_reduces_to_delta_m_read() {
+        for k in [K_PCASL, K_PASL] {
+            let (e, flips) = train(10, 0.6, 0.3);
+            for n in 1..=10 {
+                let p = delta_m_read_parts(&k, F, DT, T1T, M0, &e[..n], &flips[..n - 1], &[(0.0, k.tau, 1.0)], None, 0.0);
+                let want = delta_m_read(&k, F, DT, T1T, M0, &e[..n], &flips[..n - 1]);
+                assert_eq!(p.ev, 0.0);
+                assert!(rel_close(p.iv, want, 1e-12), "{:?} n {n}: {} vs {want}", k.label_type, p.iv);
+            }
+        }
+    }
+
+    /// Slab entry by hand: excitations at 1.0 and 1.2 s, `delta = 0.5`. Every parcel arriving
+    /// before the read at 1.2 entered the slab before 1.0 + 0.5, so the first excitation depleted
+    /// all of it: the read is `cos(a0) delta_m(1.2)`. With `delta = 0` the window `[1.0, 1.2)` is
+    /// undepleted.
+    #[test]
+    fn slab_entry_depletes_label_not_yet_arrived() {
+        let k = K_PCASL;
+        let e = [1.0, 1.2];
+        let a0: f64 = 40.0;
+        let full = delta_m(&k, F, 0.3, T1T, M0, 1.2);
+        let shifted = delta_m_read_parts(&k, F, 0.3, T1T, M0, &e, &[a0], &[(0.0, k.tau, 1.0)], None, 0.5);
+        assert!(rel_close(shifted.iv, a0.to_radians().cos() * full, 1e-12), "{} vs {}", shifted.iv, a0.to_radians().cos() * full);
+        let arrival = delta_m_read_parts(&k, F, 0.3, T1T, M0, &e, &[a0], &[(0.0, k.tau, 1.0)], None, 0.0);
+        let late = delta_m_arrival(&k, F, 0.3, T1T, M0, 1.2, 1.0, 1.2);
+        assert!(rel_close(arrival.iv, a0.to_radians().cos() * (full - late) + late, 1e-12));
+        assert!(arrival.iv > shifted.iv);
+    }
+
+    /// Every read of a train in O(n) equals the direct sum at every excitation: both labeling
+    /// types, with and without exchange, with sub-boli and factors, at no shift and two shifts;
+    /// and a long train late on the clock stays finite.
+    #[test]
+    fn read_all_equals_the_direct_reads() {
+        for k in [K_PCASL, K_PASL] {
+            let subs_cut = [(0.0, 0.3 * k.tau, -1.0), (0.3 * k.tau, k.tau, 0.8)];
+            let subs_one = [(0.0, k.tau, 1.0)];
+            for (e, flips) in [train(12, 0.6, 0.3), train(48, 1.0, 0.04), train(64, 30.0, 0.05)] {
+                let dt = if e[0] > 10.0 { 29.5 } else { DT };
+                for subs in [&subs_one[..], &subs_cut[..]] {
+                    for tau_ex in [None, Some(0.6), Some(0.001)] {
+                        for delta in [0.0, 0.17, 0.8] {
+                            let all = delta_m_read_all(&k, F, dt, T1T, M0, &e, &flips, subs, tau_ex, delta);
+                            for n in 1..=e.len() {
+                                let p = delta_m_read_parts(&k, F, dt, T1T, M0, &e[..n], &flips[..n - 1], subs, tau_ex, delta);
+                                let peak = p.iv.abs().max(p.ev.abs()).max(1e-12);
+                                assert!(all[n - 1].iv.is_finite() && all[n - 1].ev.is_finite());
+                                assert!((all[n - 1].iv - p.iv).abs() <= 1e-12 * peak && (all[n - 1].ev - p.ev).abs() <= 1e-12 * peak,
+                                    "{:?} n {n} tau_ex {tau_ex:?} delta {delta}: {:?} vs {p:?}", k.label_type, all[n - 1]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The cost of every read of a train is linear in its length: run with `--ignored
+    /// --nocapture` to record it (P7 plan, Measurements).
+    #[test]
+    #[ignore]
+    fn read_all_cost_is_linear() {
+        let subs = [(0.0, K_PCASL.tau, 1.0)];
+        let mut per = Vec::new();
+        for n in [48, 96] {
+            let (e, flips) = train(n, 1.0, 0.04);
+            let start = std::time::Instant::now();
+            let mut acc = 0.0;
+            for v in 0..100_000 {
+                let f = 40.0 + (v % 50) as f64;
+                acc += delta_m_read_all(&K_PCASL, f, DT, T1T, M0, &e, &flips, &subs, Some(0.6), 0.3)[n - 1].iv;
+            }
+            let s = start.elapsed().as_secs_f64();
+            println!("1e5 voxels x {n} excitations: {s:.2} s ({acc:.3e})");
+            per.push(s);
+        }
+        assert!(per[1] < 3.0 * per[0], "doubling the train more than tripled the time: {per:?}");
+    }
+
+    /// The arterial read: fresh at `delta_a = 0`; the cosines of the excitations inside
+    /// `[e_n - delta_a, e_n)`, the left end included and `e_n` itself not.
+    #[test]
+    fn arterial_read_depletes_from_slab_entry() {
+        let (abv, aatt) = (0.02, 0.5);
+        let e_n = 1.0;
+        let (fresh, _) = arterial_dm(&K_PCASL, abv, aatt, M0, e_n);
+        assert!(fresh > 0.0);
+        let earlier = [(0.55, 30.0), (0.7, 40.0), (0.9, 20.0), (1.0, 50.0)];
+        assert_eq!(arterial_read(&K_PCASL, abv, aatt, M0, e_n, &earlier, 0.0, 1.0), fresh);
+        let c = |a: f64| a.to_radians().cos();
+        let two = arterial_read(&K_PCASL, abv, aatt, M0, e_n, &earlier, 0.3, 1.0);
+        assert!(rel_close(two, fresh * c(40.0) * c(20.0), 1e-15), "{two}");
+        let edge = arterial_read(&K_PCASL, abv, aatt, M0, e_n, &earlier, 0.45, 1.0);
+        assert!(rel_close(edge, fresh * c(30.0) * c(40.0) * c(20.0), 1e-15), "{edge}");
+        assert_eq!(arterial_read(&K_PCASL, abv, aatt, M0, e_n, &earlier, 0.3, 0.25), two * 0.25);
+        // outside the arterial window there is nothing to read
+        assert_eq!(arterial_read(&K_PCASL, abv, aatt, M0, 0.4, &earlier, 0.3, 1.0), 0.0);
     }
 }
