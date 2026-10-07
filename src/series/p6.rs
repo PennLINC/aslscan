@@ -26,7 +26,7 @@ fn p4_for_schedule(p: &Protocol, ph: &Phantom, bolus_region: Option<Region>, sch
             let t = c.arterial_velocity.as_ref().expect("protocol requires it with part B");
             let vel: Vec<f64> = ph.labels.iter().map(|(_, nm)| t[nm]).collect();
             Some((0..n).map(|v| {
-                let venc = sched.preps[sched.raws[v].prep].venc.expect("crushing is on");
+                let venc = sched.raws[v].venc_with(&sched.preps).expect("crushing is on");
                 vel.iter().map(|&vm| survival(vm, venc)).collect()
             }).collect())
         }

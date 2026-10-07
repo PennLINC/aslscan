@@ -50,6 +50,18 @@ pub struct RawVolume {
     /// Hadamard: its row of the encoding (`crate::hadamard::encoding`), which every one of its
     /// preparations repeats.
     pub encoding_row: Option<usize>,
+    /// The crushing VENC (cm/s) of this readout, when it is its own (P7 addendum, part A: under
+    /// Look-Locker each readout carries its bipolar gradients, so `VascularCrushingVENC` is per
+    /// readout). `None` elsewhere: the readout takes its preparation's.
+    pub venc: Option<f64>,
+}
+
+impl RawVolume {
+    /// The VENC this raw volume is read with: its own under Look-Locker, else its first
+    /// preparation's.
+    pub fn venc_with(&self, preps: &[Preparation]) -> Option<f64> {
+        self.venc.or(preps[self.prep].venc)
+    }
 }
 
 /// One output volume.
@@ -110,7 +122,10 @@ impl Schedule {
                 venc: p.crushing.as_ref().map(|cr| cr.venc[cy.rows[0]]),
             });
             for (n, &v) in cy.rows.iter().enumerate() {
-                sched.raws.push(RawVolume { prep, n_preps: 1, readout: n, cycle: Some(c), encoding_row: None });
+                sched.raws.push(RawVolume {
+                    prep, n_preps: 1, readout: n, cycle: Some(c), encoding_row: None,
+                    venc: p.crushing.as_ref().map(|cr| cr.venc[v]),
+                });
                 sched.raw_rows.push(p.rows[v].clone());
                 sched.outputs.push(Output::Raw(r0 + n));
             }
@@ -133,7 +148,7 @@ impl Schedule {
         let mut clock = 0.0;
         let mut push_raw = |sched: &mut Schedule, row: Row, source_row: usize, labeled: bool, cycle: Option<usize>, enc: Option<usize>| {
             let r = sched.raws.len();
-            sched.raws.push(RawVolume { prep: sched.preps.len(), n_preps: shots, readout: 0, cycle, encoding_row: enc });
+            sched.raws.push(RawVolume { prep: sched.preps.len(), n_preps: shots, readout: 0, cycle, encoding_row: enc, venc: None });
             for s in 0..shots {
                 let start = clock + s as f64 * row.tr;
                 sched.preps.push(Preparation {
@@ -182,7 +197,7 @@ impl Schedule {
         let mut preps = Vec::with_capacity(p.rows.len() * shots);
         let mut raws = Vec::with_capacity(p.rows.len());
         for (v, row) in p.rows.iter().enumerate() {
-            raws.push(RawVolume { prep: preps.len(), n_preps: shots, readout: 0, cycle: None, encoding_row: None });
+            raws.push(RawVolume { prep: preps.len(), n_preps: shots, readout: 0, cycle: None, encoding_row: None, venc: None });
             for s in 0..shots {
                 let start = p.row_start[v] + s as f64 * row.tr;
                 let end = match p.label_type {

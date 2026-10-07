@@ -1219,9 +1219,6 @@ struct LlInputs<'a> {
     hadamard: bool,
     multi_echo: bool,
     compat: bool,
-    exchange: bool,
-    macrovascular: bool,
-    crushing: bool,
     suppression: Option<&'a SuppressionSpec>,
     m0_type: M0Type,
 }
@@ -1231,7 +1228,9 @@ struct LlInputs<'a> {
 /// strictly increasing PostLabelingDelay and equal RepetitionTimePreparation and
 /// LabelingDuration; an m0scan row is its own cycle), checked against
 /// `[look_locker] readouts_per_cycle`; one suppression pulse set per cycle; flips in (0, 90]; the
-/// separate M0's flip from `[m0] flip_angle`, required with a FlipAngle array.
+/// separate M0's flip from `[m0] flip_angle`, required with a FlipAngle array. The P4 parts
+/// (exchange, the arterial compartment, crushing, bolus-position suppression) are allowed (P7
+/// addendum, part A), with their own checks; crushing's VENC is per readout (per row).
 fn look_locker_spec(i: LlInputs) -> Result<Option<LookLockerSpec>, String> {
     let llo = i.overlay.and_then(|o| o.look_locker.as_ref());
     let m0_flip = i.overlay.and_then(|o| o.m0.as_ref()).and_then(|m| m.flip_angle);
@@ -1250,11 +1249,6 @@ fn look_locker_spec(i: LlInputs) -> Result<Option<LookLockerSpec>, String> {
         ("[hadamard]", i.hadamard),
         ("multi-TE (several --asl-json)", i.multi_echo),
         ("[compat] asldro = true", i.compat),
-        ("[kinetic] exchange_time (P4 part A)", i.exchange),
-        ("the arterial compartment (P4 part B)", i.macrovascular),
-        ("VascularCrushing (P4 part C)", i.crushing),
-        ("background_suppression.model = \"bolus-position\" (P4 part D)",
-         i.suppression.is_some_and(|s| s.model != SuppressionModel::GlobalBolus)),
     ] {
         if on {
             return Err(format!("LookLocker: true with {what}: refused (P6 addendum, part B)"));
@@ -2573,8 +2567,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     )?;
     let look_locker = look_locker_spec(LlInputs {
         on: look_locker, overlay, rows: &rows, pld: &pld, flips: ll_flips, contrast, ge: ge.as_ref(), is_3d,
-        hadamard: hadamard.is_some(), multi_echo, compat: compat.is_some(), exchange: exchange_time.is_some(),
-        macrovascular: macrovascular.is_some(), crushing: crushing.is_some(), suppression: suppression.as_ref(),
+        hadamard: hadamard.is_some(), multi_echo, compat: compat.is_some(), suppression: suppression.as_ref(),
         m0_type,
     })?;
 
@@ -4624,19 +4617,10 @@ mod tests {
         let (s, ctx) = ll_input(4, None);
         let err = |s: &Value, ov: &str| parse(s, &ctx, Some(&overlay(ov)), None).unwrap_err();
         assert!(err(&s, "").contains("acq_contrast = \"ge\""));
-        assert!(err(&s, &format!("{GE}[kinetic]\nexchange_time = 0.5\n")).contains("exchange_time"));
-        assert!(err(&s, &format!("{GE}[macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.01, csf = 0.0 }}\narterial_transit_time = {{ grey_matter = 1.0, white_matter = 1.2, csf = 0.0 }}\n"))
-            .contains("arterial"));
-        let mut c = s.clone();
-        c["VascularCrushing"] = json!(true);
-        c["VascularCrushingVENC"] = json!(4.0);
-        assert!(err(&c, &format!("{GE}[vascular_crushing]\nno_arterial_compartment = true\n")).contains("VascularCrushing"));
         let mut b = s.clone();
         b["BackgroundSuppression"] = json!(true);
         b["BackgroundSuppressionNumberPulses"] = json!(1);
         b["BackgroundSuppressionPulseTime"] = json!([1.2]);
-        assert!(err(&b, &format!("{GE}[background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n"))
-            .contains("bolus-position"));
         // one pulse set per cycle: sets per PLD that differ within a cycle
         let e = err(&b, &format!("{GE}[background_suppression]\npulse_times_per_pld = [[1.2], [1.25], [1.3], [1.35]]\n"));
         assert!(e.contains("one preparation"), "{e}");
@@ -4650,6 +4634,65 @@ mod tests {
         let mut g = grase();
         g["LookLocker"] = json!(true);
         assert!(parse(&g, CTX, Some(&overlay("")), None).unwrap_err().contains("LookLocker"));
+    }
+
+    const MACRO: &str = "[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.01, csf = 0.0 }\n\
+                         arterial_transit_time = { grey_matter = 1.0, white_matter = 1.2, csf = 0.0 }\n";
+    const VEL: &str = "[vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n";
+
+    /// P7 part A: the P4 parts are read under Look-Locker as they are without it; crushing's VENC
+    /// is per readout; P4's own checks still fire; compat is still refused with each.
+    #[test]
+    fn look_locker_takes_the_p4_parts() {
+        use crate::schedule::Schedule;
+        let (s, ctx) = ll_input(2, None);
+        let ok = |s: &Value, ov: &str| parse(s, &ctx, Some(&overlay(&format!("{GE}{ov}"))), None);
+        // exchange, the arterial compartment
+        let p = ok(&s, "[kinetic]\nexchange_time = 0.5\n").unwrap();
+        assert!(p.look_locker.is_some() && p.exchange_time.is_some());
+        assert!(ok(&s, MACRO).unwrap().macrovascular.is_some());
+        // crushing: a VENC alternation over the readouts of two cycles maps readout by readout,
+        // and one that varies within a cycle is accepted
+        for venc in [json!([0.0, 4.0, 0.0, 4.0]), json!([0.0, 0.0, 4.0, 4.0])] {
+            let mut c = s.clone();
+            c["VascularCrushing"] = json!(true);
+            c["VascularCrushingVENC"] = venc.clone();
+            let p = ok(&c, &format!("{MACRO}{VEL}")).unwrap();
+            assert_eq!(p.look_locker.as_ref().unwrap().cycles.len(), 2);
+            let sch = Schedule::new(&p);
+            let got: Vec<Option<f64>> = sch.raws.iter().map(|r| r.venc_with(&sch.preps)).collect();
+            let want: Vec<Option<f64>> = venc.as_array().unwrap().iter().map(|v| v.as_f64()).collect();
+            assert_eq!(got, want);
+        }
+        // bolus-position, a slab pulse during the labeling
+        let mut b = s.clone();
+        b["BackgroundSuppression"] = json!(true);
+        b["BackgroundSuppressionNumberPulses"] = json!(1);
+        b["BackgroundSuppressionPulseTime"] = json!([0.4]);
+        let bp = "[background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n";
+        assert!(ok(&b, bp).unwrap().suppression.is_some());
+        // P4's own checks under Look-Locker: the VENC floor; the global (P)CASL partial-bolus pulse
+        let mut lowv = s.clone();
+        lowv["VascularCrushing"] = json!(true);
+        lowv["VascularCrushingVENC"] = json!(0.05);
+        assert!(ok(&lowv, &format!("{MACRO}{VEL}")).unwrap_err().contains("0.1"));
+        let global = "[background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"global\"\n";
+        assert!(ok(&b, global).unwrap_err().contains("not yet labeled"));
+        // compat with Look-Locker and each P4 part is refused, naming one of them
+        let mut c3 = s.clone();
+        c3["SliceTiming"] = json!([0.0, 0.0, 0.0]);
+        for part in ["[kinetic]\nexchange_time = 0.5\n", MACRO] {
+            let e = ok(&c3, &format!("[compat]\nasldro = true\n{part}")).unwrap_err();
+            assert!(e.contains("compat") || e.contains("LookLocker"), "{e}");
+        }
+        // without Look-Locker the raw volumes carry no VENC of their own
+        let mut plain = s.clone();
+        plain.as_object_mut().unwrap().remove("LookLocker");
+        plain["PostLabelingDelay"] = json!(1.5);
+        plain["VascularCrushing"] = json!(true);
+        plain["VascularCrushingVENC"] = json!([0.0, 4.0, 0.0, 4.0]);
+        let p = ok(&plain, &format!("{MACRO}{VEL}")).unwrap();
+        assert!(Schedule::new(&p).raws.iter().all(|r| r.venc.is_none()));
     }
 
     #[test]
