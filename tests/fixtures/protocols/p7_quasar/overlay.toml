@@ -1,0 +1,28 @@
+# The P7 QUASAR acceptance case (P7 plan, Task 5) on the crop: Look-Locker PASL (Q2TIPS, 0.7 s),
+# 2D EPI, control and label cycles of 13 gradient-echo readouts at 35 degrees, 0.3 s apart from
+# 0.8 s, TR 4.8 s, uncrushed then crushed at 4 cm/s; exchange, the arterial compartment.
+seed = 83
+
+[acquisition]
+oversample = 2
+signal_scale = 100.0
+noise_variance = 0.01
+
+[signal]
+acq_contrast = "ge"
+
+[look_locker]
+readouts_per_cycle = 13
+
+[kinetic]
+exchange_time = 0.6
+
+[macrovascular]
+arterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }
+arterial_transit_time = { grey_matter = 0.5, white_matter = 0.7, csf = 0.0 }
+
+[vascular_crushing]
+arterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }
+
+[m0]
+repetition_time = 6.0
