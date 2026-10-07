@@ -185,10 +185,10 @@ mod tests {
         }
         let g1 = tissue_groups(&ph, &masks, 16).unwrap();
         assert_eq!(g1.len(), used + 1);
-        for c in 0..masks.len() {
-            for i in 0..ph.dseg.len() {
+        for (c, mask) in masks.iter().enumerate() {
+            for (i, &on) in mask.iter().enumerate() {
                 let n = g1.iter().filter(|g| g.compartment == c && g.mask[i]).count();
-                assert_eq!(n, usize::from(masks[c][i]), "compartment {c} voxel {i}");
+                assert_eq!(n, usize::from(on), "compartment {c} voxel {i}");
             }
         }
         // a smooth T1 map: refused, with the count
