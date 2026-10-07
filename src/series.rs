@@ -54,6 +54,7 @@ pub const M0_SEED_SALT: u64 = 0x4D30_5343_414E;
 pub const MOTION_SEED_SALT: u64 = 0x4D4F_5449_4F4E;
 
 mod p6;
+mod ge3d;
 
 /// Ground-truth maps on the acquisition grid (`resample` rules per map, see the spec).
 #[derive(Debug, Clone)]
