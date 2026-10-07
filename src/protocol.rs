@@ -1217,7 +1217,6 @@ struct LlInputs<'a> {
     ge: Option<&'a GeSpec>,
     is_3d: bool,
     hadamard: bool,
-    multi_echo: bool,
     compat: bool,
     suppression: Option<&'a SuppressionSpec>,
     m0_type: M0Type,
@@ -1247,7 +1246,6 @@ fn look_locker_spec(i: LlInputs) -> Result<Option<LookLockerSpec>, String> {
     for (what, on) in [
         ("MRAcquisitionType 3D (Look-Locker is modeled for 2D EPI)", i.is_3d),
         ("[hadamard]", i.hadamard),
-        ("multi-TE (several --asl-json)", i.multi_echo),
         ("[compat] asldro = true", i.compat),
     ] {
         if on {
@@ -1341,15 +1339,28 @@ fn look_locker_spec(i: LlInputs) -> Result<Option<LookLockerSpec>, String> {
 /// the last readout's before TR, every sample after its excitation; an m0scan cycle is excited at
 /// the start of its repetition; the separate M0 at its own repetition time.
 fn check_look_locker_timing(p: &Protocol, ll: &LookLockerSpec, h: f64) -> Result<(), String> {
-    let te = p.echo_time_s;
+    // P7 part B: with several echoes per readout the first bounds the first sample and the last
+    // every check between excitations; gradient-echo blocks within one excitation must not overlap
+    let tes = &p.echo_times_s;
+    let te = tes[0];
     if te - h < 0.0 {
         return Err(format!("EchoTime {te} s samples from {} s before its excitation (half readout {h} s)", h - te));
     }
+    for e in 1..tes.len() {
+        if tes[e] - h < tes[e - 1] + h {
+            return Err(format!(
+                "gradient echo: echo {} samples [{}, {}] s after each Look-Locker excitation and echo {} [{}, {}] s; the \
+                 readouts overlap (TotalReadoutTime {} s)", e, tes[e - 1] - h, tes[e - 1] + h, e + 1, tes[e] - h,
+                tes[e] + h, p.total_readout_time_s));
+        }
+    }
+    let te_last = tes[tes.len() - 1];
+    let which = if tes.len() > 1 { format!(" (echo {}, the last)", tes.len()) } else { String::new() };
     let mut groups: Vec<f64> = p.slice_offsets.clone();
     groups.sort_by(f64::total_cmp);
     groups.dedup();
     let g_last = groups.last().copied().unwrap_or(0.0);
-    let end_of = |e: f64| e + te + h;
+    let end_of = |e: f64| e + te_last + h;
     for c in &ll.cycles {
         let times: Vec<f64> = if c.m0scan { vec![0.0] } else { c.rows.iter().map(|&r| p.rows[r].t).collect() };
         let tr = p.rows[c.rows[0]].tr;
@@ -1357,14 +1368,14 @@ fn check_look_locker_timing(p: &Protocol, ll: &LookLockerSpec, h: f64) -> Result
             for w in groups.windows(2) {
                 if end_of(t + w[0]) > t + w[1] {
                     return Err(format!(
-                        "row {}: the slices excited at {} s read until {} s, after the next slices' excitation at {} s",
+                        "row {}: the slices excited at {} s read until {} s{which}, after the next slices' excitation at {} s",
                         c.rows[n.min(c.rows.len() - 1)], t + w[0], end_of(t + w[0]), t + w[1]));
                 }
             }
             if let Some(&next) = times.get(n + 1) {
                 if end_of(t + g_last) > next + groups.first().copied().unwrap_or(0.0) {
                     return Err(format!(
-                        "row {}: the readout at {t} s reads its last slices until {} s, after the next readout's \
+                        "row {}: the readout at {t} s reads its last slices until {} s{which}, after the next readout's \
                          excitation at {next} s", c.rows[n], end_of(t + g_last)));
                 }
             }
@@ -1372,7 +1383,7 @@ fn check_look_locker_timing(p: &Protocol, ll: &LookLockerSpec, h: f64) -> Result
         let last = times[times.len() - 1];
         if end_of(last + g_last) > tr {
             return Err(format!(
-                "row {}: the last readout's last slices read until {} s, after the cycle's RepetitionTimePreparation {tr} s",
+                "row {}: the last readout's last slices read until {} s{which}, after the cycle's RepetitionTimePreparation {tr} s",
                 c.rows[c.rows.len() - 1], end_of(last + g_last)));
         }
     }
@@ -2567,7 +2578,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     )?;
     let look_locker = look_locker_spec(LlInputs {
         on: look_locker, overlay, rows: &rows, pld: &pld, flips: ll_flips, contrast, ge: ge.as_ref(), is_3d,
-        hadamard: hadamard.is_some(), multi_echo, compat: compat.is_some(), suppression: suppression.as_ref(),
+        hadamard: hadamard.is_some(), compat: compat.is_some(), suppression: suppression.as_ref(),
         m0_type,
     })?;
 
@@ -4626,8 +4637,9 @@ mod tests {
         assert!(e.contains("one preparation"), "{e}");
         let mut s2 = s.clone();
         s2["EchoTime"] = json!(0.030);
-        let multi = parse_echoes(&[s.clone(), s2], &ctx, Some(&overlay(GE)), None).unwrap_err();
-        assert!(multi.contains("multi-TE"), "{multi}");
+        // P7 part B: Look-Locker with several echoes per readout is accepted
+        let multi = parse_echoes(&[s.clone(), s2], &ctx, Some(&overlay(GE)), None).unwrap();
+        assert!(multi.look_locker.is_some() && multi.echo_times_s.len() == 2);
         let mut c3 = s.clone();
         c3["SliceTiming"] = json!([0.0, 0.0, 0.0]);
         assert!(err(&c3, &format!("{GE}[compat]\nasldro = true\n")).contains("compat"));
@@ -4727,6 +4739,27 @@ mod tests {
         let mut d = s.clone();
         d["RepetitionTimePreparation"] = json!(2.51);
         assert!(run(&d, &ctx).unwrap_err().contains("RepetitionTimePreparation"));
+
+        // P7 part B: echoes at 12 and 30 ms (blocks of +-8 ms; the second ends 38 ms after each
+        // slice group's excitation, inside the 50 ms between groups). Readouts 0.13 s apart fit one
+        // echo (the last slices, at 0.10 s, read until 0.12 s) but not two (until 0.138 s): the
+        // second echo of a readout overlaps the next readout, and the error names both
+        let echoes = |base: &Value, tes: &[f64]| -> Vec<Value> {
+            tes.iter().map(|te| { let mut x = base.clone(); x["EchoTime"] = json!(te); x }).collect()
+        };
+        let run_e = |side: &[Value]| check_excitation_timing(&parse_echoes(side, &ctx, Some(&overlay(GE)), None).unwrap(), dims);
+        let mut tight = s.clone();
+        tight["PostLabelingDelay"] = json!([0.5, 0.63, 0.76, 0.89, 0.5, 0.63, 0.76, 0.89]);
+        run_e(&echoes(&tight, &[0.012])).unwrap();
+        let e2 = run_e(&echoes(&tight, &[0.012, 0.030])).unwrap_err();
+        assert!(e2.contains("echo 2") && e2.contains("next readout"), "{e2}");
+        run_e(&echoes(&s, &[0.012, 0.030])).unwrap();
+        // a third echo at 50 ms overruns the next slice group's excitation
+        let g = run_e(&echoes(&s, &[0.012, 0.030, 0.050])).unwrap_err();
+        assert!(g.contains("echo 3") && g.contains("next slices"), "{g}");
+        // echoes whose blocks overlap within an excitation
+        let ov = run_e(&echoes(&s, &[0.012, 0.025])).unwrap_err();
+        assert!(ov.contains("overlap"), "{ov}");
 
         // the schedule: one preparation per cycle, its readouts the raw volumes, one TR per cycle
         let p = parse(&s, &ctx, Some(&overlay(GE)), None).unwrap();

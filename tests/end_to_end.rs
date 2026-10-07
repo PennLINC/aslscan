@@ -1949,3 +1949,60 @@ fn look_locker_with_p4_parts_writes_the_parts() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// P7 part B: a Look-Locker series read at three echo times. With noise off each echo is the
+/// single-echo Look-Locker series at its echo time, bit for bit; the truths are echo-independent
+/// and written once; compat stays refused.
+#[test]
+fn look_locker_reads_every_echo() {
+    let m = 4;
+    let mut pld = Vec::new();
+    let mut ctx = String::from("volume_type\n");
+    for kind in ["control", "label"] {
+        for n in 0..m {
+            pld.push(0.6 + 0.3 * n as f64);
+            ctx.push_str(kind);
+            ctx.push('\n');
+        }
+    }
+    let base = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.0, "PostLabelingDelay": pld,
+        "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.5, "LookLocker": true,
+        "EchoTime": 0.012, "FlipAngle": 35, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05], "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.012
+    });
+    let tes = [0.012, 0.024, 0.036];
+    let sidecars: Vec<Value> = tes.iter().map(|te| { let mut s = base.clone(); s["EchoTime"] = json!(te); s }).collect();
+    let ov: Overlay = toml::from_str("seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\nnoise_variance = 0.0\n\
+                                      [signal]\nacq_contrast = \"ge\"\n[kinetic]\nexchange_time = 0.5\n").unwrap();
+    let parse_e = |s: &[Value]| aslscan::protocol::parse_echoes(s, &ctx, Some(&ov), crop().params.as_ref()).unwrap();
+    let multi = parse_e(&sidecars);
+    let out = simulate_with(&multi, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert_eq!(out.more_echoes.len(), 2);
+    for (e, s) in sidecars.iter().enumerate() {
+        let one = simulate_with(&parse_e(std::slice::from_ref(s)), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+        let (mag, ph) = if e == 0 { (&out.mag, &out.phase) } else { (&out.more_echoes[e - 1].mag, &out.more_echoes[e - 1].phase) };
+        assert_eq!(bits(mag), bits(&one.mag), "echo {}", e + 1);
+        assert_eq!(bits(ph), bits(&one.phase), "echo {}", e + 1);
+    }
+    // the echoes differ (the test is not comparing one image three times)
+    assert_ne!(bits(&out.mag), bits(&out.more_echoes[1].mag));
+    // one set of truths, no echo entity on them
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-p7b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &multi, &out).unwrap();
+    let gt: Vec<String> = std::fs::read_dir(dir.join("sub-01/perf/ground-truth")).unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    assert_eq!(gt.iter().filter(|f| f.contains("desc-deltamRead_gt.nii.gz")).count(), 1, "{gt:?}");
+    assert_eq!(gt.iter().filter(|f| f.contains("desc-deltamReadIV_gt.nii.gz")).count(), 1, "{gt:?}");
+    assert!(gt.iter().all(|f| !f.contains("echo-")), "{gt:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+    // compat stays refused with Look-Locker, with one echo or several
+    let cov: Overlay = toml::from_str("[signal]\nacq_contrast = \"ge\"\n[compat]\nasldro = true\n").unwrap();
+    let mut c = sidecars.clone();
+    for s in c.iter_mut() {
+        s["SliceTiming"] = json!([0.0, 0.0]);
+    }
+    let err = aslscan::protocol::parse_echoes(&c, &ctx, Some(&cov), crop().params.as_ref()).unwrap_err();
+    assert!(err.contains("compat") || err.contains("asldro"), "{err}");
+}

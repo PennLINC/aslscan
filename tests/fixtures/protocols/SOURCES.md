@@ -43,3 +43,11 @@ Only the JSON sidecar and aslcontext.tsv are kept; no image data.
 - `p6_ll/`: written for aslscan (P6 plan, Task 15). Look-Locker PASL on the crop (Q2TIPS, 0.7 s cutoff),
   2D EPI: a control cycle and a label cycle of twelve gradient-echo readouts at 35 degrees, 0.3 s
   apart from PLD 0.8 s, TR 4.5 s, a separate M0 at the series' flip.
+- `p7_quasar/`: written for aslscan (P7 plan, Task 5) by `tools/make_p7_quasar.py`, not fetched. QUASAR-like
+  Look-Locker PASL on the crop (Q2TIPS, 0.7 s cutoff), 2D EPI: control and label cycles of thirteen
+  gradient-echo readouts at 35 degrees, 0.3 s apart from 0.8 s, TR 4.8 s, uncrushed then crushed at 4 cm/s
+  (`VascularCrushingVENC` per readout); exchange, the arterial compartment with per-label arterial
+  velocities, a separate M0.
+- `p7_ll_multite/`: written for aslscan (P7 plan, Task 6). `p6_ll` read at three echo times, 12, 26 and
+  40 ms (`asl-echo-{1,2,3}.json`, identical except `EchoTime`; pass them as repeated `--asl-json`), the
+  third echo's block ending inside the 50 ms between slice groups.

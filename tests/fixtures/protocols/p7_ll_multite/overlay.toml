@@ -1,0 +1,17 @@
+# The P7 Look-Locker multi-TE case (P7 plan, Task 6): p6_ll (PASL, two cycles of twelve readouts at
+# 35 degrees, a separate M0) read at three echo times, 12, 26 and 40 ms, one sidecar per echo.
+seed = 81
+
+[acquisition]
+oversample = 2
+signal_scale = 100.0
+noise_variance = 0.01
+
+[signal]
+acq_contrast = "ge"
+
+[look_locker]
+readouts_per_cycle = 12
+
+[m0]
+repetition_time = 6.0
