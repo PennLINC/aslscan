@@ -502,6 +502,9 @@ pub fn arterial_read(
 }
 
 #[cfg(test)]
+mod parcel_ref;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1318,5 +1321,113 @@ mod tests {
         assert_eq!(arterial_read(&K_PCASL, abv, aatt, M0, e_n, &earlier, 0.3, 0.25), two * 0.25);
         // outside the arterial window there is nothing to read
         assert_eq!(arterial_read(&K_PCASL, abv, aatt, M0, 0.4, &earlier, 0.3, 1.0), 0.0);
+    }
+
+    // ---- P7 Task 2: the parcel reference ----
+
+    use super::parcel_ref::{Case as PCase, Region as PRegion};
+
+    fn case(k: Kinetic, att: f64, t: f64) -> PCase {
+        PCase {
+            k, f: F, att, t1t: T1T, m0: M0, t, excitations: vec![], entry_lead: 0.0, pulses: vec![], epsilon: 0.0,
+            region: PRegion::Global, tau_ex: None,
+        }
+    }
+
+    /// The reference in its trivial limits: no excitations and no pulses is `delta_m`; without
+    /// exchange the intravascular part is all of it; P4's worked slab-confined factor for
+    /// `asl002` (0.0821045); and it has converged.
+    #[test]
+    fn the_parcel_reference_reproduces_the_closed_forms() {
+        for k in [K_PCASL, K_PASL] {
+            for t in [1.0, 1.4, 2.5, 3.6] {
+                let c = case(k, DT, t);
+                let (iv, total) = c.read(4);
+                let want = delta_m(&k, F, DT, T1T, M0, t);
+                assert!(rel_close(total, want, 1e-12), "{:?} t {t}: {total} vs {want}", k.label_type);
+                assert_eq!(iv, total);
+                let ex = PCase { tau_ex: Some(0.6), ..c.clone() }.read(4).0;
+                let want_iv = delta_m_iv(&k, F, DT, T1T, M0, t, 0.6);
+                assert!(rel_close(ex, want_iv, 1e-12), "{:?} t {t}: iv {ex} vs {want_iv}", k.label_type);
+            }
+        }
+        let k = Kinetic { tau: 1.8, ..K_PCASL };
+        let plain = case(k, 0.8, 3.6);
+        let supp = PCase { pulses: vec![2.05, 3.276], epsilon: 1.0, region: PRegion::Arrival, ..plain.clone() };
+        let ratio = supp.read(4).1 / plain.read(4).1;
+        assert!((ratio - 0.082_104_5).abs() < 1e-6, "{ratio}");
+        // two resolutions agree
+        let mut c = case(K_PASL, 0.6, 2.4);
+        c.excitations = vec![(1.0, 30.0), (1.3, 30.0), (1.6, 30.0), (1.9, 30.0)];
+        c.entry_lead = 0.25;
+        c.tau_ex = Some(0.4);
+        let (a, b) = (c.read(4), c.read(8));
+        assert!((a.0 - b.0).abs() < 1e-7 * a.0.abs() && (a.1 - b.1).abs() < 1e-7 * a.1.abs(), "{a:?} vs {b:?}");
+    }
+
+    /// Task 1's closed forms, with P4's sub-bolus factors, against the parcel reference: both
+    /// labeling types, with exchange, bolus-position `"slab"`, `"global"` and `"arrival"`, with and
+    /// without a slab-entry shift, arrival before, during and after the readouts.
+    #[test]
+    fn depleted_reads_match_the_parcel_reference() {
+        use crate::bolus::{entry_offset, subbolus_factors, Region};
+        let e: Vec<f64> = (0..8).map(|n| 1.0 + 0.3 * n as f64).collect();
+        let flips: Vec<f64> = (0..8).map(|n| 25.0 + 4.0 * n as f64).collect();
+        let pulses = [0.2, 0.9];
+        let mut checked = 0;
+        for k in [K_PCASL, K_PASL] {
+            for att in [0.3, 1.0, 1.6] {
+                for (region, pregion) in [(Region::Slab(0.3), PRegion::Slab(0.3)), (Region::Global, PRegion::Global),
+                                          (Region::Arrival, PRegion::Arrival)] {
+                    let subs = subbolus_factors(&pulses, 0.93, k.tau, entry_offset(k.label_type, region, att));
+                    for tau_ex in [None, Some(0.6)] {
+                        for lead in [0.0, 0.25] {
+                            let all = delta_m_read_all(&k, F, att, T1T, M0, &e, &flips, &subs, tau_ex, lead);
+                            for n in 1..=e.len() {
+                                let p = delta_m_read_parts(&k, F, att, T1T, M0, &e[..n], &flips[..n - 1], &subs, tau_ex, lead);
+                                let c = PCase {
+                                    excitations: e[..n - 1].iter().copied().zip(flips.iter().copied()).collect(),
+                                    entry_lead: lead, pulses: pulses.to_vec(), epsilon: 0.93, region: pregion, tau_ex,
+                                    ..case(k, att, e[n - 1])
+                                };
+                                let (iv, total) = c.read(4);
+                                let scale = total.abs().max(1e-9);
+                                assert!((p.total() - total).abs() <= 1e-6 * scale && (p.iv - iv).abs() <= 1e-6 * scale,
+                                    "{:?} att {att} {region:?} tau_ex {tau_ex:?} lead {lead} n {n}: {p:?} vs iv {iv} total {total}",
+                                    k.label_type);
+                                assert!((all[n - 1].total() - total).abs() <= 1e-6 * scale);
+                                checked += usize::from(total.abs() > 1e-6);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 300, "too few nonzero reads checked: {checked}");
+    }
+
+    /// The arterial read, with P4's parcel factor, against the parcel reference: fresh and
+    /// depleted from slab entry, under each region.
+    #[test]
+    fn arterial_reads_match_the_parcel_reference() {
+        use crate::bolus::{arterial_factor, entry_offset, Region};
+        let excitations: Vec<(f64, f64)> = (0..8).map(|n| (0.6 + 0.15 * n as f64, 30.0 + 5.0 * n as f64)).collect();
+        let pulses = [0.2, 0.5];
+        for k in [K_PCASL, K_PASL] {
+            let aatt = 0.4;
+            for (region, pregion) in [(Region::Slab(0.1), PRegion::Slab(0.1)), (Region::Global, PRegion::Global)] {
+                for lead in [0.0, 0.3] {
+                    for n in 0..excitations.len() {
+                        let t = excitations[n].0;
+                        let fac = arterial_factor(&pulses, 0.9, t - aatt, entry_offset(k.label_type, region, aatt));
+                        let got = arterial_read(&k, 0.02, aatt, M0, t, &excitations[..n], lead, fac);
+                        let c = PCase { excitations: excitations[..n].to_vec(), pulses: pulses.to_vec(), epsilon: 0.9,
+                                       region: pregion, ..case(k, DT, t) };
+                        let want = c.arterial(0.02, aatt, lead);
+                        assert!(rel_close(got, want, 1e-12), "{:?} {region:?} lead {lead} n {n}: {got} vs {want}", k.label_type);
+                    }
+                }
+            }
+        }
     }
 }
