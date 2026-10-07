@@ -1,0 +1,26 @@
+{
+ "ArterialSpinLabelingType": "PCASL",
+ "LabelingDuration": 1.8,
+ "PostLabelingDelay": 1.8,
+ "BackgroundSuppression": true,
+ "BackgroundSuppressionNumberPulses": 2,
+ "BackgroundSuppressionPulseTime": [
+  2.0,
+  3.2
+ ],
+ "M0Type": "Separate",
+ "RepetitionTimePreparation": 4.0,
+ "EchoTime": 0.022,
+ "MagneticFieldStrength": 3,
+ "AcquisitionVoxelSize": [
+  2.0,
+  2.0,
+  3.0
+ ],
+ "MRAcquisitionType": "3D",
+ "PulseSequenceType": "3D EPI",
+ "PhaseEncodingDirection": "j-",
+ "EffectiveEchoSpacing": 0.0005,
+ "NumberShots": 2,
+ "FlipAngle": 12
+}

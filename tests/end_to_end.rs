@@ -2097,3 +2097,31 @@ fn ge3d_fixture_writes_its_train() {
     assert!((hdr.header().pixdim[4] - 8.0).abs() < 1e-6, "{}", hdr.header().pixdim[4]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// P7 part C: the p7_multite3d fixture: three echoes per excitation of the 3D EPI train, written
+/// as `echo-N` series with their own M0s, each sidecar its echo's EchoTime, the readout block the
+/// three echo blocks.
+#[test]
+fn multite3d_fixture_writes_every_echo() {
+    let d = format!("{}/tests/fixtures/protocols/p7_multite3d/", env!("CARGO_MANIFEST_DIR"));
+    let sides: Vec<Value> = (1..=3)
+        .map(|e| serde_json::from_str(&std::fs::read_to_string(format!("{d}asl-echo-{e}.json")).unwrap()).unwrap())
+        .collect();
+    let ctx = std::fs::read_to_string(format!("{d}aslcontext.tsv")).unwrap();
+    let ov: Overlay = toml::from_str(&fixture_overlay("p7_multite3d")).unwrap();
+    let p = aslscan::protocol::parse_echoes(&sides, &ctx, Some(&ov), crop().params.as_ref()).unwrap();
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert_eq!(out.more_echoes.len(), 2);
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-p7m3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let perf = dir.join("sub-01/perf");
+    for (e, te) in [(1, 0.012), (2, 0.022), (3, 0.032)] {
+        let side: Value = serde_json::from_str(&std::fs::read_to_string(perf.join(format!("sub-01_echo-{e}_part-mag_asl.json")))
+            .unwrap()).unwrap();
+        assert_eq!(side["EchoTime"].as_f64(), Some(te), "echo {e}");
+        assert_eq!(side["AslscanSimulation"]["Readout"]["EchoBlockCentresMs"].as_array().unwrap().len(), 3);
+        assert!(perf.join(format!("sub-01_echo-{e}_m0scan.nii.gz")).exists());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

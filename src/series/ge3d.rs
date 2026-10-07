@@ -1412,4 +1412,72 @@ mod tests {
         let e = crate::protocol::resolve_ge3d(&tight, [12, 12, 8]).unwrap_err();
         assert!(e.contains("sub-train") && e.contains("row 0") && e.contains("row 1"), "{e}");
     }
+
+    // ---- Task 17: multi-TE 3D
+
+    /// `ge3d_protocol` read at several echo times, one sidecar per echo.
+    fn ge3d_echoes(tes: &[f64], extra: &str) -> Protocol {
+        let sides: Vec<Value> = tes.iter().map(|te| json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 0.5,
+            "BackgroundSuppression": true, "BackgroundSuppressionNumberPulses": 1, "BackgroundSuppressionPulseTime": [2.0],
+            "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "EchoTime": te, "MagneticFieldStrength": 3,
+            "AcquisitionVoxelSize": [2.0, 2.0, 0.75], "MRAcquisitionType": "3D", "PulseSequenceType": "3D EPI",
+            "PhaseEncodingDirection": "j-", "EffectiveEchoSpacing": 0.0005, "NumberShots": 4, "FlipAngle": 12
+        })).collect();
+        let ov: Overlay = toml::from_str(&format!(
+            "seed = 5\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n[signal]\nacq_contrast = \"ge\"\n\
+             [readout]\nexcitation_spacing = 40.0\nslab_entry_time = 0.5\nkz_segments = 2\n[kinetic]\nexchange_time = 0.4\n{extra}"))
+            .unwrap();
+        crate::protocol::parse_echoes(&sides, "volume_type\ncontrol\nlabel\n", Some(&ov), crop().params.as_ref()).unwrap()
+    }
+
+    /// Several echoes per excitation: noise off, each echo is the single-echo series at its echo time
+    /// bit for bit; noise on, echo 1 is still the single-echo series bit for bit and the echoes' noise
+    /// differs; the excitation spacing bounds the echo count (the last block must end before the
+    /// next excitation pulse); GRASE still refuses several echoes.
+    #[test]
+    fn several_echoes_per_excitation() {
+        let ph = crop();
+        let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
+        let run = |p: &Protocol| simulate_ge3d(p, &ph, T2Mode::Auto, &phase, RowOverride::None).unwrap();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let tes = [0.012, 0.024];
+        let multi = run(&ge3d_echoes(&tes, ""));
+        assert_eq!(multi.more_echoes.len(), 1);
+        for (e, te) in tes.iter().enumerate() {
+            let one = run(&ge3d_echoes(&[*te], ""));
+            let (m, ph_) = if e == 0 { (&multi.mag, &multi.phase) } else { (&multi.more_echoes[0].mag, &multi.more_echoes[0].phase) };
+            assert_eq!((bits(m), bits(ph_)), (bits(&one.mag), bits(&one.phase)), "echo {}", e + 1);
+        }
+        assert_ne!(bits(&multi.mag), bits(&multi.more_echoes[0].mag), "the echoes decay differently");
+        let with_noise = |tes: &[f64]| {
+            let mut p = ge3d_echoes(tes, "");
+            p.acq.noise_variance = 0.05;
+            run(&p)
+        };
+        let (mn, on) = (with_noise(&tes), with_noise(&tes[..1]));
+        assert_eq!((bits(&mn.mag), bits(&mn.phase)), (bits(&on.mag), bits(&on.phase)), "echo 1 under noise");
+        // echo 2's noise is its own: its residual against the noise-off echo 2 differs from echo 1's
+        let r = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y) as f64).collect::<Vec<f64>>();
+        let (r1, r2) = (r(&mn.mag, &multi.mag), r(&mn.more_echoes[0].mag, &multi.more_echoes[0].mag));
+        assert!(r1.iter().any(|x| *x != 0.0) && r1 != r2);
+        // the grid's blocks: 6 lines of 1 ms, half-width 3 ms, centred at EchoTime + 0.5 ms; with 40 ms
+        // between excitations and a 1 ms pulse the last echo's block must end by 39 ms: EchoTime <= 35.5 ms
+        let dims = [12, 12, 8];
+        crate::protocol::resolve_ge3d(&ge3d_echoes(&[0.012, 0.020, 0.028, 0.035], ""), dims).unwrap();
+        let e = crate::protocol::resolve_ge3d(&ge3d_echoes(&[0.012, 0.020, 0.028, 0.036], ""), dims).unwrap_err();
+        assert!(e.contains("next excitation pulse"), "{e}");
+        // GRASE refuses several echoes
+        let mut g = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+            "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "EchoTime": 0.012,
+            "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0], "MRAcquisitionType": "3D",
+            "PulseSequenceType": "3Dgrase", "PhaseEncodingDirection": "j-", "EffectiveEchoSpacing": 0.0005,
+            "NumberShots": 2, "FlipAngle": 150
+        });
+        let g2 = { let mut x = g.clone(); x["EchoTime"] = json!(0.03); x };
+        g["EchoTime"] = json!(0.012);
+        let e = crate::protocol::parse_echoes(&[g, g2], "volume_type\nlabel\n", None, None).unwrap_err();
+        assert!(e.contains("multi-echo spin-echo"), "{e}");
+    }
 }

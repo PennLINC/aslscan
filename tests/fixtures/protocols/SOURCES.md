@@ -63,3 +63,7 @@ Only the JSON sidecar and aslcontext.tsv are kept; no image data.
   (Q2TIPS, 0.7 s): cycles of six readouts 0.3 s apart from 0.8 s, each a sub-train of the 3D EPI train (8
   degrees, 40 ms between excitations), two shots per group, TR 4.0 s, the label entering the slab 0.3 s after
   labeling, a separate M0.
+- `p7_multite3d/`: written for aslscan (P7 plan, Task 17). `p7_ge3d` read at three echo times per excitation of
+  the 3D EPI train, 12, 22 and 32 ms (`asl-echo-{1,2,3}.json`, identical except `EchoTime`; pass them as repeated
+  `--asl-json`): the last echo's block (centred at 32.5 ms, 3 ms each side) ends before the next excitation's
+  pulse, which starts at 39 ms.

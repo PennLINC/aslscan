@@ -1,0 +1,24 @@
+# The P7 multi-TE 3D case (P7 plan, Task 17) on the crop: p7_ge3d (a 3D EPI train at 12 degrees, 40 ms
+# between excitations) read at three echo times per excitation, 12, 22 and 32 ms, one sidecar per echo.
+seed = 17
+
+[acquisition]
+oversample = 2
+signal_scale = 100.0
+
+[signal]
+acq_contrast = "ge"
+
+[readout]
+excitation_spacing = 40.0
+slab_entry_time = 0.5
+
+[kinetic]
+exchange_time = 0.4
+
+[physio]
+tissue_cardiac = 0.02
+label_cardiac = 0.03
+
+[m0]
+repetition_time = 6.0
