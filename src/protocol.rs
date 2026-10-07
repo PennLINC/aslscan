@@ -1331,6 +1331,8 @@ struct LlInputs<'a> {
     contrast: Contrast,
     ge: Option<&'a GeSpec>,
     is_3d: bool,
+    /// P7 part C: the 3D readout is the gradient-echo train, which Look-Locker can read.
+    epi3d: bool,
     hadamard: Option<&'a HadamardSpec>,
     compat: bool,
     suppression: Option<&'a SuppressionSpec>,
@@ -1359,7 +1361,8 @@ fn look_locker_spec(i: LlInputs) -> Result<Option<LookLockerSpec>, String> {
         return Ok(None);
     }
     for (what, on) in [
-        ("MRAcquisitionType 3D (Look-Locker is modeled for 2D EPI)", i.is_3d),
+        ("MRAcquisitionType 3D with a GRASE or spiral readout (3D Look-Locker reads a gradient-echo train: [readout] \
+          type = \"epi3d\", P7 part C)", i.is_3d && !i.epi3d),
         ("[compat] asldro = true", i.compat),
     ] {
         if on {
@@ -2747,6 +2750,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     )?;
     let look_locker = look_locker_spec(LlInputs {
         on: look_locker, overlay, rows: &rows, pld: &pld, flips: ll_flips, contrast, ge: ge.as_ref(), is_3d,
+        epi3d: readout_kind.is_some_and(|k| k.0 == ReadoutKind::Epi3d),
         hadamard: hadamard.as_ref(), compat: compat.is_some(), suppression: suppression.as_ref(),
         m0_type,
     })?;
@@ -2844,7 +2848,8 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
             return Err("overlay: acquisition.partial_fourier with [readout] type \"epi3d\": partial Fourier is not \
                         available on the 3D gradient-echo train".to_string());
         }
-        if ge.as_ref().is_some_and(|g| g.flip == Source::Default) {
+        let ll_array = look_locker.as_ref().is_some_and(|l| l.flip_array);
+        if !ll_array && ge.as_ref().is_some_and(|g| g.flip == Source::Default) {
             return Err("[readout] type \"epi3d\" requires FlipAngle (the excitation of every partition); without it \
                         the gradient-echo default of 90 degrees would saturate the train".to_string());
         }
@@ -3175,6 +3180,25 @@ pub fn resolve_ge3d(p: &Protocol, acq_dims: [usize; 3]) -> Result<Option<Ge3dRes
     }
     if let (M0Type::Separate, Some(tr)) = (p.m0_type, p.m0_repetition_time_s) {
         check_ge3d_timing(&train, &table, 0.0, tr * 1000.0).map_err(|e| format!("the separate M0: {e}"))?;
+    }
+    // P7 part C, 3D Look-Locker: each readout's sub-train must end before the next one's first
+    // excitation pulse
+    if let Some(ll) = &p.look_locker {
+        let half = table.block.t_ms.iter().fold(0.0f64, |m, t| m.max(t.abs())) + table.block.t_line_ms / 2.0;
+        let te_last = train.echo_times_ms[train.echo_times_ms.len() - 1];
+        let length = (table.n_exc as f64 - 1.0) * train.exc_spacing_ms + te_last + half;
+        for c in ll.cycles.iter().filter(|c| !c.m0scan) {
+            for w in c.rows.windows(2) {
+                let (a, b) = (p.rows[w[0]].t * 1000.0, p.rows[w[1]].t * 1000.0);
+                if a + length > b - train.excitation_time_ms / 2.0 + 1e-9 {
+                    return Err(format!(
+                        "row {}: its Look-Locker sub-train ({} excitations {} ms apart from {:.4} ms) reads until {:.4} ms, \
+                         after the next readout's first excitation pulse at {:.4} ms (row {}): the readouts must be at \
+                         least {:.4} ms apart", w[0], table.n_exc, train.exc_spacing_ms, a, a + length,
+                        b - train.excitation_time_ms / 2.0, w[1], length + train.excitation_time_ms / 2.0));
+                }
+            }
+        }
     }
     Ok(Some(Ge3dResolution {
         n_shots: table.n_shots, epi: table.block.epi, n_exc: table.n_exc, e_c: table.e_c, train, readout, t_line_ms,

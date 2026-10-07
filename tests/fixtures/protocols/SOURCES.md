@@ -59,3 +59,7 @@ Only the JSON sidecar and aslcontext.tsv are kept; no image data.
   segments, suppression, exchange, physiological noise, a separate M0) read by a 3D gradient-echo stack of EPI
   (`PulseSequenceType` "3D EPI", `FlipAngle` 12, the excitation), 40 ms between excitations, the label entering
   the slab 0.5 s after labeling.
+- `p7_ll3d/`: written for aslscan (P7 plan, Task 16) by `tools/make_p7_ll3d.py`. 3D Look-Locker PASL on the crop
+  (Q2TIPS, 0.7 s): cycles of six readouts 0.3 s apart from 0.8 s, each a sub-train of the 3D EPI train (8
+  degrees, 40 ms between excitations), two shots per group, TR 4.0 s, the label entering the slab 0.3 s after
+  labeling, a separate M0.

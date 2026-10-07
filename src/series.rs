@@ -180,6 +180,10 @@ pub struct Ge3dSeries {
     pub slab_entry: (crate::protocol::SlabEntryTime, &'static str),
     /// Per label, the mean slab-entry lead `ATT - d` over its perfused voxels (s).
     pub mean_lead_s: Vec<(String, f64)>,
+    /// Per raw volume, the label left of what arrived before its sub-train by the excitations of its
+    /// cycle before it (P7 part C, 3D Look-Locker; 1 without), and the readouts per cycle.
+    pub cumulative_depletion: Vec<f64>,
+    pub readouts_per_cycle: Option<usize>,
 }
 
 /// A Look-Locker series' records (P6 part B).

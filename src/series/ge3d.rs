@@ -70,6 +70,27 @@ pub(super) fn train_mz(t1_s: f64, cycles: &[LlCycle]) -> Vec<Vec<f64>> {
     tissue_mz_ll_sequence(1.0, t1_s, cycles)
 }
 
+/// The cycle raw volume `v` is read in (P7 addendum, part C, "3D Look-Locker"): its preparation's raw
+/// volumes, one per readout, each a sub-train of `n_exc` excitations from its row's excitation time
+/// (an m0scan row's from the start of its repetition) at that raw volume's flip. Returns every
+/// excitation of the cycle, their flips, and where `v`'s sub-train starts among them. Without
+/// Look-Locker the cycle is `v`'s own train.
+pub(super) fn cycle_of(sched: &Schedule, raw_flip: &[f64], n_exc: usize, spacing_s: f64, v: usize)
+    -> (Vec<f64>, Vec<f64>, usize)
+{
+    let prep = sched.raws[v].prep;
+    let r0 = sched.preps[prep].raw;
+    let m = sched.raws[r0..].iter().take_while(|r| r.prep == prep).count();
+    let (mut times, mut flips) = (Vec::with_capacity(m * n_exc), Vec::with_capacity(m * n_exc));
+    for r in r0..r0 + m {
+        let row = &sched.raw_rows[r];
+        let start = if row.kind == RowKind::M0scan { 0.0 } else { row.t };
+        times.extend(train_times(start, n_exc, spacing_s));
+        flips.extend(std::iter::repeat_n(raw_flip[r], n_exc));
+    }
+    (times, flips, (v - r0) * n_exc)
+}
+
 /// The separate M0 scan's train (P7 addendum, part C, "M0"): the same excitations without
 /// labeling or suppression, from the start of its repetition, at its steady state; `m_j(T1)` at
 /// unit `M0`.
@@ -219,7 +240,10 @@ pub(super) struct Ge3dBuild<'a> {
     /// Per phantom voxel: the slab-entry lead of its label and of its arterial label (s).
     pub lead: Vec<f64>,
     pub lead_a: Vec<f64>,
+    /// The separate M0's excitation (degrees), and each raw volume's (a Look-Locker FlipAngle array
+    /// gives each readout its own).
     pub flip_deg: f64,
+    pub raw_flip: Vec<f64>,
     pub spacing_s: f64,
     /// Motion (P5 part D, as on the 3D spin-echo path): each raw volume's pose, each shot's pose
     /// within its volume (the cumulative jumps of the events before it), each shot's gain (an
@@ -241,16 +265,21 @@ impl Ge3dBuild<'_> {
         self.groups.len() + (f * self.masks.len() + c) * self.k_nodes + k
     }
 
-    /// The excitation times of raw volume `v`'s trains (s from the start of labeling): every shot's
-    /// train starts at the row's excitation time (an m0scan row's at the start of its repetition).
-    pub fn excitations(&self, v: usize) -> Vec<f64> {
-        let row = &self.sched.raw_rows[v];
-        let start = if row.kind == RowKind::M0scan { 0.0 } else { row.t };
-        train_times(start, self.res.n_exc, self.spacing_s)
+    /// The cycle of raw volume `v` ([`cycle_of`]).
+    pub fn cycle(&self, v: usize) -> (Vec<f64>, Vec<f64>, usize) {
+        cycle_of(&self.sched, &self.raw_flip, self.res.n_exc, self.spacing_s, v)
     }
 
-    /// The reads of phantom voxel `i` in raw volume `v` at every excitation, per family (before
-    /// `sin(a)`, sign and factors): the depleted label from slab entry with every P4 part
+    /// The label left of what arrived before raw volume `v`'s sub-train, by the excitations of its
+    /// cycle before it: the product of their `cos(a)` (1 without Look-Locker).
+    pub fn cumulative_depletion(&self, v: usize) -> f64 {
+        let (_, flips, offset) = self.cycle(v);
+        flips[..offset].iter().map(|a| a.to_radians().cos()).product()
+    }
+
+    /// The reads of phantom voxel `i` in raw volume `v` at every excitation of its sub-train, per
+    /// family (before `sin(a)`, sign and factors): the label depleted from slab entry by every
+    /// excitation of its cycle before it (earlier sub-trains included), with every P4 part
     /// (sub-boli with their parcel factors, the exchange split), and the arterial read with its
     /// crushing survival and parcel factor.
     pub fn reads(&self, v: usize, i: usize) -> Vec<Vec<f64>> {
@@ -258,9 +287,8 @@ impl Ge3dBuild<'_> {
         let ph = self.ph;
         let row = &self.sched.raw_rows[v];
         let kin = p.kinetic(row);
-        let e = self.excitations(v);
-        let n = e.len();
-        let flips = vec![self.flip_deg; n];
+        let (e, flips, offset) = self.cycle(v);
+        let n = self.res.n_exc;
         let (f_ml, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
         let bolus = self.bolus_region.map(|region| {
             let s = p.suppression.as_ref().unwrap().for_row(self.sched.preps[self.sched.raws[v].prep].suppression);
@@ -270,21 +298,22 @@ impl Ge3dBuild<'_> {
             Some((region, pulses, eps)) => subbolus_factors(pulses, *eps, kin.tau, entry_offset(p.label_type, *region, att)),
             None => vec![(0.0, kin.tau, 1.0)],
         };
-        let parts = crate::kinetic::delta_m_read_all(&kin, f_ml, att, t1t, m0, &e, &flips, &subs, p.exchange_time, self.lead[i]);
+        let all = crate::kinetic::delta_m_read_all(&kin, f_ml, att, t1t, m0, &e, &flips, &subs, p.exchange_time, self.lead[i]);
+        let parts = &all[offset..offset + n];
         self.families.iter().map(|fam| match fam {
             Family::Blood => parts.iter().map(|q| q.iv).collect(),
             Family::Extravascular => parts.iter().map(|q| q.ev).collect(),
             Family::Arterial => {
                 let (Some(abv), Some(aatt)) = (&self.p4.abv, &self.p4.aatt) else { return vec![0.0; n] };
                 let crush = self.p4.crush.as_ref().map_or(1.0, |cr| cr[v][self.p4.label_of[i]]);
-                (0..n).map(|j| {
+                (offset..offset + n).map(|x| {
                     let g = match &bolus {
-                        Some((region, pulses, eps)) => arterial_factor(pulses, *eps, e[j] - aatt[i],
+                        Some((region, pulses, eps)) => arterial_factor(pulses, *eps, e[x] - aatt[i],
                                                                        entry_offset(p.label_type, *region, aatt[i])),
                         None => 1.0,
                     };
-                    let earlier: Vec<(f64, f64)> = e[..j].iter().map(|&t| (t, self.flip_deg)).collect();
-                    crate::kinetic::arterial_read(&kin, abv[i], aatt[i], m0, e[j], &earlier, self.lead_a[i], g * crush)
+                    let earlier: Vec<(f64, f64)> = e[..x].iter().copied().zip(flips[..x].iter().copied()).collect();
+                    crate::kinetic::arterial_read(&kin, abv[i], aatt[i], m0, e[x], &earlier, self.lead_a[i], g * crush)
                 }).collect()
             }
         }).collect()
@@ -360,9 +389,10 @@ pub(super) fn volume_inputs(b: &Ge3dBuild, g: usize) -> mrsim_acq::kspace3d::GeV
     });
     let ky_segments = b.res.readout.ky_segments;
     let nz = b.table.nz;
-    let sin_a = b.flip_deg.to_radians().sin();
+    let sin_a = b.raw_flip[g].to_radians().sin();
     let preps = b.sched.preps_of(g);
     let first_prep = b.sched.raws[g].prep;
+    let (_, _, offset) = b.cycle(g);
     let mut weights = vec![0.0; nz * ky_segments * ncomp];
     for p in 0..nz {
         for sy in 0..ky_segments {
@@ -376,7 +406,7 @@ pub(super) fn volume_inputs(b: &Ge3dBuild, g: usize) -> mrsim_acq::kspace3d::GeV
             let at = |c: usize| (p * ky_segments + sy) * ncomp + c;
             if tissue_on {
                 for (gi, mz) in b.group_mz.iter().enumerate() {
-                    weights[at(gi)] = sin_a * mz[prep][j] * tf;
+                    weights[at(gi)] = sin_a * mz[prep][offset + j] * tf;
                 }
             }
             if labeled {
@@ -424,7 +454,6 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
         return Err("the test-hook row overrides are not available on the 3D gradient-echo series".to_string());
     }
     for (what, on) in [
-        ("LookLocker: true (P7 plan, Task 16)", p.look_locker.is_some()),
         ("[hadamard] (P7 plan, Task 18)", p.hadamard.is_some()),
     ] {
         if on {
@@ -480,16 +509,20 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
     let sched = Schedule::new(p);
     let n = sched.raw_rows.len();
     let ge = p.ge.as_ref().expect("epi3d is gradient echo");
-    let flip_deg = ge.flip_deg;
+    // the separate M0's excitation: Look-Locker's [m0] flip_angle, else the series'
+    let flip_deg = p.look_locker.as_ref().and_then(|l| l.m0_flip_deg).map_or(ge.flip_deg, |f| f.0);
+    // each raw volume's: a Look-Locker FlipAngle array gives each readout (raw volume) its own
+    let raw_flip: Vec<f64> = (0..n).map(|v| p.look_locker.as_ref().map_or(ge.flip_deg, |l| l.flip_deg[v])).collect();
     let spacing_s = res.train.exc_spacing_ms / 1000.0;
     let sups: Vec<Option<crate::longitudinal::Suppression>> = sched.preps.iter().map(|pr| {
         let row = &sched.raw_rows[pr.raw];
         p.suppression.as_ref().map(|s| s.for_row(pr.suppression)).filter(|s| s.has_events() && row.kind != RowKind::M0scan)
     }).collect();
+    // each preparation's cycle: every sub-train of its raw volumes (one without Look-Locker)
     let cycles: Vec<LlCycle> = sched.preps.iter().zip(&sups).map(|(pr, s)| {
         let row = &sched.raw_rows[pr.raw];
-        let start = if row.kind == RowKind::M0scan { 0.0 } else { row.t };
-        train_cycle(row.tr, s.as_ref(), train_times(start, res.n_exc, spacing_s), flip_deg)
+        let (times, flips, _) = cycle_of(&sched, &raw_flip, res.n_exc, spacing_s, pr.raw);
+        LlCycle { tr: row.tr, s: s.as_ref(), t_read: times, flip_deg: flips }
     }).collect();
     let group_mz: Vec<Vec<Vec<f64>>> = groups.iter().map(|gr| train_mz(gr.t1_s, &cycles)).collect();
 
@@ -577,7 +610,7 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
 
     let mut b = Ge3dBuild {
         p, ph, res, table, sched, r_sim, masks, groups, group_images, group_mz, families, k_nodes: 0, nodes: Vec::new(),
-        prep_factors, label_scale, p4, bolus_region, lead, lead_a, flip_deg, spacing_s, poses, shot_pose, shot_gain,
+        prep_factors, label_scale, p4, bolus_region, lead, lead_a, flip_deg, raw_flip, spacing_s, poses, shot_pose, shot_gain,
         v2w: sim_grid.voxel_to_world, sim_dims: sim_grid.dims,
     };
 
@@ -827,6 +860,11 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
         achieved_error: achieved,
         memory_gib,
         slab_entry: g3.slab_entry,
+        cumulative_depletion: (0..n).map(|v| b.cumulative_depletion(v)).collect(),
+        readouts_per_cycle: p.look_locker.as_ref().map(|_| {
+            let prep = b.sched.raws[0].prep;
+            b.sched.raws.iter().take_while(|r| r.prep == prep).count()
+        }),
         mean_lead_s: ph.labels.iter().enumerate().map(|(li, (_, nm))| {
             let (s, c) = (0..ph.nvox()).filter(|&i| b.p4.label_of[i] == li && ph.perfusion[i] > 0.0)
                 .fold((0.0, 0usize), |(s, c), i| (s + b.lead[i], c + 1));
@@ -1231,5 +1269,148 @@ mod tests {
         assert_ne!(gt.delta_m, out_s.ground_truth.delta_m);
         assert_eq!((out_m.poses.len(), out_m.events.len(), out_m.motion_seed.is_some()), (2, moving.events.len(), true));
         assert_ne!(out_m.mag, out_s.mag);
+    }
+
+    // ---- Task 16: 3D Look-Locker
+
+    /// `ge3d_protocol`'s train read by Look-Locker: control then label cycles of `plds.len()`
+    /// readouts (sub-trains), `flips` the scalar or per-volume FlipAngle.
+    fn ll3d_protocol(plds: &[f64], flips: Value, extra: &str) -> Protocol {
+        let m = plds.len();
+        let pld: Vec<f64> = (0..2).flat_map(|_| plds.iter().copied()).collect();
+        let s: Value = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": pld,
+            "BackgroundSuppression": true, "BackgroundSuppressionNumberPulses": 1, "BackgroundSuppressionPulseTime": [2.0],
+            "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "EchoTime": 0.012, "MagneticFieldStrength": 3,
+            "AcquisitionVoxelSize": [2.0, 2.0, 0.75], "MRAcquisitionType": "3D", "PulseSequenceType": "3D EPI",
+            "PhaseEncodingDirection": "j-", "EffectiveEchoSpacing": 0.0005, "NumberShots": 4, "FlipAngle": flips,
+            "LookLocker": true
+        });
+        let ctx = format!("volume_type\n{}{}", "control\n".repeat(m), "label\n".repeat(m));
+        let ov: Overlay = toml::from_str(&format!(
+            "seed = 5\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n[signal]\nacq_contrast = \"ge\"\n\
+             [readout]\nexcitation_spacing = 40.0\nslab_entry_time = 0.5\nkz_segments = 2\n[kinetic]\nexchange_time = 0.4\n\
+             [look_locker]\nreadouts_per_cycle = {m}\n{extra}")).unwrap();
+        parse(&s, &ctx, Some(&ov), crop().params.as_ref()).unwrap()
+    }
+
+    /// 3D Look-Locker: the schedule (a group of four shots' cycles per cycle, every readout reading
+    /// each), and every raw volume's input at every partition's excitation against the brute-force
+    /// timeline (every sub-train of the cycle an event) and the parcel reference (depleted by every
+    /// earlier excitation of the cycle, earlier sub-trains included, from slab entry); the recorded
+    /// cumulative depletion.
+    #[test]
+    fn look_locker_sub_trains_see_the_reference_object() {
+        let ph = crop();
+        let plds = [0.5, 0.75, 1.0];
+        let p = ll3d_protocol(&plds, json!([12, 15, 18, 12, 15, 18]), "");
+        let pr = prepare_ge3d(&p, &ph, T2Mode::Class, RowOverride::None).unwrap();
+        let b = &pr.b;
+        // the schedule: per cycle four preparations (shots) and three raw volumes reading them
+        assert_eq!((b.sched.preps.len(), b.sched.raws.len()), (2 * 4, 6));
+        for (v, r) in b.sched.raws.iter().enumerate() {
+            assert_eq!((r.prep, r.n_preps, r.readout), ((v / 3) * 4, 4, v % 3));
+        }
+        assert!((b.sched.preps[4].start_s - 4.0 * 4.0).abs() < 1e-12 && (b.sched.preps[1].start_s - 4.0).abs() < 1e-12);
+        let spec = p.suppression.as_ref().unwrap();
+        let eps = spec.epsilon.0;
+        let spacing = 0.040;
+        let flips = [12.0, 15.0, 18.0];
+        // the brute-force tissue timeline: each preparation's cycle every sub-train
+        let sups: Vec<Option<Suppression>> = b.sched.preps.iter().map(|_| Some(Suppression::new(vec![2.0], eps, false))).collect();
+        let cyc_times = |r0: usize| -> (Vec<f64>, Vec<f64>) {
+            let mut t = Vec::new();
+            let mut f = Vec::new();
+            for n in 0..3 {
+                t.extend(train_times(b.sched.raw_rows[r0 + n].t, 4, spacing));
+                f.extend(std::iter::repeat_n(flips[n], 4));
+            }
+            (t, f)
+        };
+        let cycles: Vec<LlCycle> = b.sched.preps.iter().zip(&sups).map(|(pp, s)| {
+            let (t, f) = cyc_times(pp.raw);
+            LlCycle { tr: 4.0, s: s.as_ref(), t_read: t, flip_deg: f }
+        }).collect();
+        let ncomp = b.n_compartments();
+        let ky = b.res.readout.ky_segments;
+        let [snx, sny, _] = pr.sim_grid.dims;
+        for g in 0..6 {
+            let vol = volume_inputs(b, g);
+            let (r0, n) = ((g / 3) * 3, g % 3);
+            let row = &b.sched.raw_rows[g];
+            let kin = p.kinetic(row);
+            let (e_all, f_all) = cyc_times(r0);
+            let sign = if row.kind == RowKind::Label { -1.0 } else { 0.0 };
+            let sin_a = flips[n].to_radians().sin();
+            // the recorded cumulative depletion: every excitation of the earlier sub-trains
+            let want_dep: f64 = f_all[..4 * n].iter().map(|a: &f64| a.to_radians().cos()).product();
+            assert!((b.cumulative_depletion(g) - want_dep).abs() < 1e-15);
+            for pp in [0usize, 3, 4, 7] {
+                for sy in 0..ky {
+                    let line = b.table.line(pp, sy);
+                    let (j, prep) = (line.excitation, b.sched.raws[g].prep + line.shot);
+                    let x = 4 * n + j;
+                    let got: Vec<f64> = (0..snx * sny * 8).map(|v| {
+                        (0..ncomp).filter(|&c| !vol.images[c].is_empty())
+                            .map(|c| vol.weights[(pp * ky + sy) * ncomp + c] * vol.images[c][v] as f64).sum()
+                    }).collect();
+                    let per: Vec<f32> = (0..ph.nvox()).map(|i| {
+                        if ph.dseg[i] <= 0 {
+                            return 0.0;
+                        }
+                        let mut v = ph.m0[i] as f64 * brute(ph.t1[i] as f64, &cycles)[prep][x];
+                        if sign != 0.0 && ph.perfusion[i] > 0.0 {
+                            let c = Case {
+                                k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
+                                m0: ph.m0[i] as f64, t: e_all[x],
+                                excitations: e_all[..x].iter().copied().zip(f_all[..x].iter().copied()).collect(),
+                                entry_lead: ph.att[i] as f64 - 0.5, pulses: vec![2.0], epsilon: eps, region: PRegion::Global,
+                                tau_ex: Some(0.4), span: (0.0, kin.tau),
+                            };
+                            v += sign * c.read(4).1;
+                        }
+                        (sin_a * v) as f32
+                    }).collect();
+                    let want = b.r_sim.mean(&per);
+                    let peak = want.iter().fold(0.0f32, |m, x| m.max(x.abs())) as f64;
+                    let worst = got.iter().zip(&want).map(|(a, w)| (a - *w as f64).abs()).fold(0.0, f64::max);
+                    assert!(worst <= 3e-6 * peak, "volume {g} partition {pp} segment {sy}: {worst:e} of {peak:e}");
+                }
+            }
+        }
+    }
+
+    /// One readout per cycle at a scalar flip is the plain 3D EPI series: every volume's input the
+    /// same, bit for bit. A GRASE protocol still refuses Look-Locker, naming the 3D EPI readout;
+    /// overlapping sub-trains are refused, naming both rows.
+    #[test]
+    fn look_locker_reductions_and_refusals() {
+        let ph = crop();
+        let one = ll3d_protocol(&[0.5], json!(12), "");
+        let plain = ge3d_protocol("");
+        let (a, b) = (prepare_ge3d(&one, &ph, T2Mode::Class, RowOverride::None).unwrap(),
+                      prepare_ge3d(&plain, &ph, T2Mode::Class, RowOverride::None).unwrap());
+        for g in 0..2 {
+            let (va, vb) = (volume_inputs(&a.b, g), volume_inputs(&b.b, g));
+            assert_eq!(va.images, vb.images, "volume {g}");
+            assert_eq!(va.weights.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                       vb.weights.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "volume {g}");
+        }
+        // GRASE with Look-Locker
+        let mut g: Value = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": [0.5, 0.8],
+            "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "EchoTime": 0.012,
+            "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0], "MRAcquisitionType": "3D",
+            "PulseSequenceType": "3Dgrase", "PhaseEncodingDirection": "j-", "EffectiveEchoSpacing": 0.0005,
+            "NumberShots": 2, "FlipAngle": 150
+        });
+        g["LookLocker"] = json!(true);
+        let ov: Overlay = toml::from_str("[signal]\nacq_contrast = \"ge\"\n").unwrap();
+        let e = parse(&g, "volume_type\nlabel\nlabel\n", Some(&ov), None).unwrap_err();
+        assert!(e.contains("epi3d") || e.contains("GRASE"), "{e}");
+        // readouts 0.1 s apart cannot hold a 4-excitation sub-train of 40 ms spacing
+        let tight = ll3d_protocol(&[0.5, 0.6], json!(12), "");
+        let e = crate::protocol::resolve_ge3d(&tight, [12, 12, 8]).unwrap_err();
+        assert!(e.contains("sub-train") && e.contains("row 0") && e.contains("row 1"), "{e}");
     }
 }

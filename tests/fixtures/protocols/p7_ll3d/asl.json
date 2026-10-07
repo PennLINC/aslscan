@@ -1,0 +1,39 @@
+{
+ "Manufacturer": "aslscan-fixture",
+ "MagneticFieldStrength": 3,
+ "MRAcquisitionType": "3D",
+ "PulseSequenceType": "3D EPI",
+ "PhaseEncodingDirection": "j-",
+ "ArterialSpinLabelingType": "PASL",
+ "BolusCutOffFlag": true,
+ "BolusCutOffTechnique": "Q2TIPS",
+ "BolusCutOffDelayTime": 0.7,
+ "BackgroundSuppression": false,
+ "VascularCrushing": false,
+ "LookLocker": true,
+ "FlipAngle": 8,
+ "PostLabelingDelay": [
+  0.8,
+  1.1,
+  1.4,
+  1.7,
+  2.0,
+  2.3,
+  0.8,
+  1.1,
+  1.4,
+  1.7,
+  2.0,
+  2.3
+ ],
+ "M0Type": "Separate",
+ "RepetitionTimePreparation": 4.0,
+ "EchoTime": 0.012,
+ "EffectiveEchoSpacing": 0.0005,
+ "NumberShots": 2,
+ "AcquisitionVoxelSize": [
+  2.0,
+  2.0,
+  3.0
+ ]
+}

@@ -331,6 +331,20 @@ mod writer {
                     "the label's read between interpolation nodes is linear in the excitation index",
                 ],
             });
+            // P7 part C, 3D Look-Locker: each readout a sub-train of the cycle, segmented across the
+            // NumberShots cycles of a group; every excitation of the cycle depletes the label
+            if let Some(m) = g.readouts_per_cycle {
+                block["Readout"]["LookLocker"] = json!({
+                    "ReadoutsPerCycle": m,
+                    "Segmentation": "a group of NumberShots cycles, each reading one shot of every readout: readout n's \
+                                     volume is its sub-train's partitions over the group's cycles",
+                    "Depletion": "every excitation of a cycle (each readout's sub-train) depletes the label in the slab \
+                                  after it, so a readout reads what the earlier sub-trains left",
+                    "CumulativeDepletion": g.cumulative_depletion,
+                    "CumulativeDepletionMeaning": "per volume, the product of cos(a) over the excitations of its cycle \
+                                                   before its sub-train: what is left of label that arrived before them",
+                });
+            }
         }
         // P5 parts B and D: written only for a 3D readout
         if let (Some(r3), Some(rs)) = (&out.readout, &p.readout) {
