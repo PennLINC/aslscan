@@ -26,6 +26,10 @@
 # A case may name a required feature as its seventh field (kspace): a build without it skips the
 # case, and the run checks the executed and skipped counts per build. Under --self-test every
 # executed case must show a NIfTI difference, not just one of them.
+#
+# A case's sidecar field may list several sidecars separated by `+` (multi-TE, P6): each becomes
+# its own --asl-json, in order. The P6 cases (P7 plan, Task 0) run from the committed fixtures and
+# two variants of p6_ll that tools/regress_p6_inputs.py generates and checks.
 # Exits nonzero on any difference (or, under --self-test, on no difference) or failed run.
 set -euo pipefail
 A_REV=${1:?usage: tools/regress_identity.sh <aslscan-rev> <mrsim-acq-rev> [--self-test]}
@@ -43,6 +47,16 @@ mkdir -p "$HERE/work"
 exec 9>"$HERE/work/regress.lock"
 flock -n 9 || { echo "another regress_identity.sh run holds $HERE/work/regress.lock"; exit 1; }
 rm -rf "$OUT"; mkdir -p "$OUT/inputs"
+
+# --asl-json once per `+`-separated sidecar of a case's sidecar field, into the array JARGS
+json_args() {
+  local js j; JARGS=()
+  IFS='+' read -ra js <<< "$1"
+  for j in "${js[@]}"; do JARGS+=(--asl-json "$j"); done
+}
+json_args "a.json"; [ "${#JARGS[@]}" = 2 ] && [ "${JARGS[1]}" = a.json ] || { echo "json_args: one sidecar"; exit 1; }
+json_args "a.json+b.json+c.json"; [ "${#JARGS[@]}" = 6 ] && [ "${JARGS[5]}" = c.json ] && [ "${JARGS[2]}" = --asl-json ] \
+  || { echo "json_args: three sidecars"; exit 1; }
 
 common() { realpath "$(git -C "$1" rev-parse --path-format=absolute --git-common-dir)"; }
 # A worktree of repository $1 at $3, at path $2: created if absent; a reused one must be that
@@ -153,6 +167,10 @@ sed '/^\[m0\]/,$d' $P/p5_ge/overlay.toml > $A/p5-ge-incl.toml
 { cat $P/p5_grase/overlay.toml; printf '\n[motion.within_volume]\ndropout_rate = 1.0\nseverity = 0.3\njump_mm = [0.5, 0.0, 0.0]\njump_deg = [0.0, 0.0, 1.0]\n'; } > $A/p5-grase-seg.toml
 Z120=$HERE/work/phantom-3t-z120
 P001=$HERE/work/phantom-3t-asl001
+# P6 cases: the two generated p6_ll variants (one readout per cycle, the legacy dispatch; an
+# included m0scan between the cycles); the multi-TE fixtures pass one sidecar per echo
+python3 "$HERE/tools/regress_p6_inputs.py" "$P/p6_ll" "$A"
+mte() { echo "$P/$1/asl-echo-1.json+$P/$1/asl-echo-2.json+$P/$1/asl-echo-3.json"; }
 cases=(
   "pasl_cutoff|$P/pasl_cutoff/asl.json|$P/pasl_cutoff/aslcontext.tsv|$P/pasl_cutoff/overlay.toml|$FULL"
   "crop_pcasl|$P/crop_pcasl/asl.json|$P/crop_pcasl/aslcontext.tsv|$P/crop_pcasl/overlay.toml|$CROP"
@@ -179,9 +197,18 @@ cases=(
   "p5_grase_seg|$P/p5_grase/asl.json|$P/p5_grase/aslcontext.tsv|$A/p5-grase-seg.toml|$CROP"
   "asl005_p5|$P/asl005/asl.json|$P/asl005/aslcontext.tsv|$P/asl005_p5/overlay.toml|$Z120"
   "asl001_p5|$P/asl001/asl.json|$P/asl001/aslcontext.tsv|$P/asl001_p5/overlay.toml|$P001||kspace"
+  "p6_hadamard|$P/p6_hadamard/asl.json|$P/p6_hadamard/aslcontext.tsv|$P/p6_hadamard/overlay.toml|$CROP"
+  "p6_hadamard_3t|$P/p6_hadamard_3t/asl.json|$P/p6_hadamard_3t/aslcontext.tsv|$P/p6_hadamard_3t/overlay.toml|$Z97"
+  "p6_hadamard_grase|$P/p6_hadamard_grase/asl.json|$P/p6_hadamard_grase/aslcontext.tsv|$P/p6_hadamard_grase/overlay.toml|$Z120"
+  "p6_hadamard_multite|$(mte p6_hadamard_multite)|$P/p6_hadamard_multite/aslcontext.tsv|$P/p6_hadamard_multite/overlay.toml|$CROP"
+  "p6_multite|$(mte p6_multite)|$P/p6_multite/aslcontext.tsv|$P/p6_multite/overlay.toml|$CROP"
+  "p6_multite_se|$(mte p6_multite_se)|$P/p6_multite_se/aslcontext.tsv|$P/p6_multite_se/overlay.toml|$CROP"
+  "p6_ll|$P/p6_ll/asl.json|$P/p6_ll/aslcontext.tsv|$P/p6_ll/overlay.toml|$CROP"
+  "p6_ll_legacy|$A/p6-ll-legacy.json|$A/p6-ll-legacy.tsv|$A/p6-ll-legacy.toml|$CROP"
+  "p6_ll_m0|$A/p6-ll-m0.json|$A/p6-ll-m0.tsv|$A/p6-ll-m0.toml|$CROP"
 )
 # executed cases per build (the rest are skipped for a missing feature)
-declare -A expect=([cli-kspace-par]=25 [cli]=24)
+declare -A expect=([cli-kspace-par]=34 [cli]=33)
 
 fail=0; undetected=0
 for feats in cli,kspace,par cli; do
@@ -200,9 +227,10 @@ for feats in cli,kspace,par cli; do
       echo "$name: skipped (needs $need)"; skipped=$((skipped+1)); continue
     fi
     ran=$((ran+1))
+    json_args "$json"
     for side in old new; do
       bin=$OLD; [ $side = new ] && bin=$NEW
-      if ! $bin --asl-json $json --aslcontext $ctx --overlay $ov --phantom $ph $extra --out $OUT/$side-$name > $OUT/log-$side-$name.txt 2>&1; then
+      if ! $bin "${JARGS[@]}" --aslcontext $ctx --overlay $ov --phantom $ph $extra --out $OUT/$side-$name > $OUT/log-$side-$name.txt 2>&1; then
         echo "$name: $side run FAILED"; tail -2 $OUT/log-$side-$name.txt; fail=1; continue 2
       fi
     done
