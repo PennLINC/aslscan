@@ -77,13 +77,22 @@ pin "$HERE" "$BASE/aslscan" "$A_REV"
 pin "$LIVE_M" "$BASE/mrsim-acq" "$M_REV"
 
 # The new side builds from a snapshot of the live sources taken now, so an edit made while the
-# (long) comparison runs cannot change what is being compared. rsync --delete keeps unchanged
-# files' times, so the snapshot's own target directories stay incremental between runs.
+# (long) comparison runs cannot change what is being compared. Unchanged files keep their times, so
+# the snapshot's own target directories stay incremental between runs; but a changed file must be
+# NEWER than the last build, and rsync -a copies the source's time, which can be older than that
+# build (cargo then reuses stale code: P7, Task 15). So files are compared by content, and every file
+# rewritten gets the time of the copy.
 NEWROOT=$PARENT/p5-new
 [ "$SELF" = "--self-test" ] && NEWROOT=$PARENT/p5-selftest
 mkdir -p "$NEWROOT"
-rsync -a --delete --exclude target --exclude 'target-*' --exclude work --exclude .git "$HERE/" "$NEWROOT/aslscan/"
-rsync -a --delete --exclude target --exclude 'target-*' --exclude .git "$LIVE_M/" "$NEWROOT/mrsim-acq/"
+snapshot() {
+  local src=$1 dst=$2; shift 2
+  # -a without -t: times are not copied, so a file rewritten for a content change gets the time of
+  # the copy, and --checksum leaves files of equal content (and their times) alone
+  rsync -rlpgoD --checksum --delete "$@" "$src/" "$dst/"
+}
+snapshot "$HERE" "$NEWROOT/aslscan" --exclude target --exclude 'target-*' --exclude work --exclude .git
+snapshot "$LIVE_M" "$NEWROOT/mrsim-acq" --exclude target --exclude 'target-*' --exclude .git
 echo "new side: aslscan $(git -C "$HERE" rev-parse --short HEAD)$([ -z "$(git -C "$HERE" status --porcelain -- src Cargo.toml)" ] || echo +local), mrsim-acq $(git -C "$LIVE_M" rev-parse --short HEAD)$([ -z "$(git -C "$LIVE_M" status --porcelain -- src Cargo.toml)" ] || echo +local)"
 if [ "$SELF" = "--self-test" ]; then
   K=$NEWROOT/mrsim-acq/src/kspace.rs
