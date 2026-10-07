@@ -1917,3 +1917,35 @@ fn follow_up_review_fixes() {
     assert!(sc.look_locker.as_ref().unwrap().legacy_dispatch && !ar.look_locker.as_ref().unwrap().legacy_dispatch);
     assert_ne!(bits(&sc.mag), bits(&ar.mag));
 }
+
+/// P7 part A: a Look-Locker series with exchange and the arterial compartment writes the read by
+/// part, and its sidecar lists the parts in force in place of P6's refusals; P6's Look-Locker
+/// series keeps its sidecar block.
+#[test]
+fn look_locker_with_p4_parts_writes_the_parts() {
+    let parts = "[kinetic]\nexchange_time = 0.6\n[macrovascular]\n\
+                 arterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
+                 arterial_transit_time = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n";
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-p7a-{}", std::process::id()));
+    for (extra, on) in [(parts, true), ("", false)] {
+        let p = look_locker(&["control", "label"], 4, 35.0, 4.5, extra);
+        let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+        let side: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("sub-01/perf/sub-01_part-mag_asl.json")).unwrap()).unwrap();
+        let ll = &side["AslscanSimulation"]["LookLocker"];
+        let files: Vec<String> = std::fs::read_dir(dir.join("sub-01/perf/ground-truth")).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        for part in ["deltamReadIV", "deltamReadEV", "arterialRead"] {
+            assert_eq!(files.iter().any(|f| f.contains(&format!("desc-{part}_gt.nii.gz"))), on, "{part}: {files:?}");
+        }
+        assert_eq!(ll.get("Refused").is_some(), !on, "{ll}");
+        assert_eq!(ll.get("P4Parts").is_some(), on, "{ll}");
+        if on {
+            let listed: Vec<&str> = ll["P4Parts"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+            assert_eq!(listed, ["exchange (P4 part A)", "the arterial compartment (P4 part B)"]);
+            assert!(ll["FreshArterial"].as_str().unwrap().contains("QUASAR"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

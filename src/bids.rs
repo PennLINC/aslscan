@@ -69,7 +69,7 @@ mod writer {
     use crate::bolus::Region;
     use crate::protocol::{M0Type, Protocol, QuantitySource, SuppressionModel, COMPAT_PINNED};
     use crate::resample::GridOrigin;
-    use crate::series::SeriesOutput;
+    use crate::series::{LookLockerSeries, SeriesOutput};
 
     fn write_json(path: &Path, v: &Value) -> Result<(), String> {
         let text = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
@@ -855,6 +855,26 @@ mod writer {
                     "Resampling": mean,
                 }))?;
             }
+            // P7 part A: the read by part, each as desc-deltamRead_gt is (sin(a_n) times it)
+            for (part, d, what) in [
+                ("deltamReadIV", &l.read_iv, "the intravascular part of desc-deltamRead_gt: the label not yet \
+                  exchanged, depleted as the whole is (the blood compartment)"),
+                ("deltamReadEV", &l.read_ev, "the extravascular part of desc-deltamRead_gt: the exchanged label, \
+                  depleted as the whole is (the tissue compartment); IV + EV = desc-deltamRead_gt"),
+                ("arterialRead", &l.read_arterial, "the arterial compartment as each readout read it: sin(a_n) times \
+                  the arterial delta-M at the slice's excitation with its crushing survival and parcel suppression \
+                  factor, undepleted (fresh arterial blood)"),
+            ] {
+                if let Some(d) = d {
+                    write_4d(&PathBuf::from(format!("{gt_prefix}_desc-{part}_gt.nii.gz")), out.acq_grid.dims, out.n_volumes, d, &out.acq_grid)
+                        .map_err(|e| e.to_string())?;
+                    write_json(&PathBuf::from(format!("{gt_prefix}_desc-{part}_gt.json")), &json!({
+                        "Units": "arbitrary (same as M0map)",
+                        "Description": format!("{what}; per slice, static; zero for other rows"),
+                        "Resampling": mean,
+                    }))?;
+                }
+            }
             if !l.lines.is_empty() {
                 let mut tsv = String::from("cycle\treadout\tgroup\ttime\tflip_angle");
                 for (_, name) in &out.labels {
@@ -962,6 +982,30 @@ mod writer {
     /// `AslscanSimulation.LookLocker` (P6 part B, "Outputs").
     fn look_locker_block(p: &Protocol, out: &SeriesOutput) -> Option<Value> {
         let (l, ls) = (p.look_locker.as_ref()?, out.look_locker.as_ref()?);
+        let mut block = look_locker_block_p6(p, l, ls);
+        // P7 part A: with a P4 part in force, the parts replace P6's list of refusals; without
+        // one the block is P6's, byte for byte
+        if !ls.p4_parts.is_empty() {
+            let obj = block.as_object_mut().expect("an object");
+            obj.remove("Refused");
+            obj.insert("P4Parts".into(), json!(ls.p4_parts));
+            obj.insert("P4PartsModel".into(), json!(
+                "each part of the label is depleted as the whole is: exchange splits every arrival window's label \
+                 into the part not yet exchanged (T1'' residue) and the rest; bolus-position suppression cuts the \
+                 bolus into sub-boli, each with its parcel factor; crushing's VENC is per readout"));
+            obj.insert("FreshArterial".into(), json!(
+                "the arterial compartment holds the parcel passing through at each excitation, not depleted by earlier \
+                 readouts (QUASAR's assumption; it holds when blood crosses a slice much faster than the readout \
+                 spacing)"));
+            obj.insert("DepletionBeforeArrival".into(), json!(
+                "not modeled in 2D: label is depleted from its arrival in the voxel, not while it crosses other imaged \
+                 slices"));
+        }
+        Some(block)
+    }
+
+    /// P6's `AslscanSimulation.LookLocker`.
+    fn look_locker_block_p6(p: &Protocol, l: &crate::protocol::LookLockerSpec, ls: &LookLockerSeries) -> Value {
         let cycles: Vec<Value> = l.cycles.iter().map(|c| json!({
             "FirstRow": c.rows[0],
             "Readouts": c.rows.len(),
@@ -969,7 +1013,7 @@ mod writer {
             "ExcitationTimes": if c.m0scan { vec![0.0] } else { c.rows.iter().map(|&r| p.rows[r].t).collect::<Vec<f64>>() },
             "FlipAngles": c.rows.iter().map(|&r| l.flip_deg[r]).collect::<Vec<f64>>(),
         })).collect();
-        Some(json!({
+        json!({
             "Cycles": cycles,
             "ReadoutsPerCycle": l.readouts_per_cycle,
             "LegacyDispatch": ls.legacy_dispatch,
@@ -997,7 +1041,7 @@ mod writer {
                  read; desc-lookLocker_gt.tsv: one line per readout and excitation group with the mean tissue Mz before \
                  the pulse per phantom label"
             },
-        }))
+        })
     }
 
     /// `AslscanSimulation.Hadamard` (P6 part A, "Outputs").

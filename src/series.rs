@@ -168,6 +168,14 @@ pub struct LookLockerSeries {
     pub lines: Vec<LlLine>,
     /// One readout per cycle at one flip: P5's series itself.
     pub legacy_dispatch: bool,
+    /// P7 part A: the read's intravascular and extravascular parts (with exchange) and the
+    /// arterial read (with the arterial compartment), each `sin(a_n)` times its value as
+    /// `delta_m_read` is; `None` when the part is off.
+    pub read_iv: Option<Vec<f32>>,
+    pub read_ev: Option<Vec<f32>>,
+    pub read_arterial: Option<Vec<f32>>,
+    /// P7 part A: the P4 parts in force (empty: P6's Look-Locker series, its sidecar unchanged).
+    pub p4_parts: Vec<&'static str>,
 }
 
 /// One readout of one excitation group (P6 part B, `desc-lookLocker_gt.tsv`).

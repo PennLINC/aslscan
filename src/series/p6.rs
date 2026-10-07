@@ -8,7 +8,7 @@
 
 use super::*;
 use mrsim_acq::kspace::simulate_acquisition_echoes;
-use crate::kinetic::{delta_m_read, Kinetic};
+use crate::kinetic::{delta_m_read, delta_m_read_parts, Kinetic, ReadParts};
 use crate::longitudinal::{ll_legacy_dispatch, tissue_mz_ll_series, LlCycle};
 use crate::protocol::{check_excitation_timing, HadamardSpec};
 use crate::schedule::{Output, Schedule};
@@ -217,6 +217,11 @@ struct Built {
     /// P6 part B: the depleted-read truth and the per-readout table.
     gt_read: Option<Vec<f32>>,
     ll_lines: Vec<LlLine>,
+    /// P7 part A: the read's intravascular and extravascular parts (exchange) and the arterial
+    /// read (the arterial compartment), each times `sin(a_n)` as `gt_read` is.
+    gt_read_iv: Option<Vec<f32>>,
+    gt_read_ev: Option<Vec<f32>>,
+    gt_read_art: Option<Vec<f32>>,
 }
 
 /// The P1-P5 series body up to the acquisition, with `echo_time_s` in place of the protocol's
@@ -395,6 +400,28 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
 
     // ---- P4: per-voxel arterial parameters, crushing, physiological noise ----
     let p4 = p4_for_schedule(p, ph, bolus_region, sched)?;
+
+    // P7 part A: under Look-Locker with exchange or bolus-position suppression the read label is
+    // split and cut as P4 splits and cuts it, each part depleted by the later readouts. Without
+    // either, the read is P6's `delta_m_read` itself (the arterial compartment, crushing and the
+    // physiological factor do not change the tissue label's read).
+    let ll_parts_on = ll.is_some() && (p.exchange_time.is_some() || bolus_region.is_some());
+    // the pulses of raw volume v's preparation, under the bolus-position model
+    let bolus_of = |v: usize| {
+        bolus_region.map(|region| {
+            let s = p.suppression.as_ref().unwrap().for_row(first_prep(v).suppression);
+            (region, s.pulse_times, s.epsilon)
+        })
+    };
+    // the read of phantom voxel i: every sub-bolus with its parcel factor, the exchange split
+    let ll_parts = |v: usize, kin: &Kinetic, i: usize, e: &[f64], fl: &[f64]| -> ReadParts {
+        let att = ph.att[i] as f64;
+        let subs = match bolus_of(v) {
+            Some((region, pulses, eps)) => subbolus_factors(&pulses, eps, kin.tau, entry_offset(p.label_type, region, att)),
+            None => vec![(0.0, kin.tau, 1.0)],
+        };
+        delta_m_read_parts(kin, ph.perfusion[i] as f64, att, ph.t1[i] as f64, ph.m0[i] as f64, e, fl, &subs, p.exchange_time, 0.0)
+    };
 
     // ---- compat: simasl's one exp(-TE/T2) per phantom voxel, tissue and blood alike, with its
     // zero-T2 guard (`np.divide(.., where=t2 != 0)` leaves exp(0) = 1); the readout's own
@@ -641,6 +668,10 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
     let mut tissue_only: Option<Vec<Vec<f32>>> = leakage_on.then(|| vec![vec![0.0f32; nvox_sim * n]; ncomp]);
     let mut gt_static = vec![0.0f32; nvox_acq * n];
     let mut gt_read: Option<Vec<f32>> = ll.map(|_| vec![0.0f32; nvox_acq * n]);
+    let read_alloc = |on: bool| if ll.is_some() && on { Some(vec![0.0f32; nvox_acq * n]) } else { None };
+    let mut gt_read_iv = read_alloc(ll_parts_on && p.exchange_time.is_some());
+    let mut gt_read_ev = read_alloc(ll_parts_on && p.exchange_time.is_some());
+    let mut gt_read_art = read_alloc(macro_on);
     let mut gt_sim = if motion_on { vec![0.0f32; nvox_sim * n] } else { Vec::new() };
     let slab = snx * sny;
     // P4's extra ground truth, per row and frame on the acquisition grid (static) or, under
@@ -740,13 +771,66 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
             let fa = ll.map_or(90.0, |l| l.flip_deg[v]).to_radians().sin();
             for z in 0..nz {
                 let read = ll_read(v, slice_offsets[z]);
-                let sl = r_acq.mean_slice(z, |i| match &read {
-                    Some((e, fl)) if ph.dseg[i] > 0 => fa * delta_m_read(
-                        &kin, ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64, e, fl),
-                    _ => 0.0,
-                });
-                for (jj, x) in sl.iter().enumerate() {
-                    gr[(z * nx * ny + jj) * n + v] = *x;
+                if ll_parts_on {
+                    // P7 part A: the parts, each with its parcel factor, over this slice's slab
+                    let zs = r_acq.z_slab(z);
+                    let (zlo, zhi) = match (zs.first(), zs.last()) {
+                        (Some(a), Some(b)) => (a.0, b.0),
+                        _ => (0, 0),
+                    };
+                    let base = pslab * zlo;
+                    let parts: Vec<ReadParts> = (base..pslab * (zhi + 1))
+                        .map(|i| match &read {
+                            Some((e, fl)) if ph.dseg[i] > 0 => ll_parts(v, &kin, i, e, fl),
+                            _ => ReadParts::default(),
+                        })
+                        .collect();
+                    let put = |dst: &mut Vec<f32>, f: &dyn Fn(&ReadParts) -> f64| {
+                        let sl = r_acq.mean_slice(z, |i| fa * f(&parts[i - base]));
+                        for (jj, x) in sl.iter().enumerate() {
+                            dst[(z * nx * ny + jj) * n + v] = *x;
+                        }
+                    };
+                    put(gr, &|q| q.total());
+                    if let Some(g) = gt_read_iv.as_mut() {
+                        put(g, &|q| q.iv);
+                    }
+                    if let Some(g) = gt_read_ev.as_mut() {
+                        put(g, &|q| q.ev);
+                    }
+                } else {
+                    let sl = r_acq.mean_slice(z, |i| match &read {
+                        Some((e, fl)) if ph.dseg[i] > 0 => fa * delta_m_read(
+                            &kin, ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64, e, fl),
+                        _ => 0.0,
+                    });
+                    for (jj, x) in sl.iter().enumerate() {
+                        gr[(z * nx * ny + jj) * n + v] = *x;
+                    }
+                }
+                // P7 part A: the arterial read, fresh (2D), with its crushing survival and parcel
+                // factor, sin(a_n) as the image takes it
+                if let (Some(ga), Some(abv), Some(aatt)) = (gt_read_art.as_mut(), &p4.abv, &p4.aatt) {
+                    let t = row.t + slice_offsets[z];
+                    let bolus = bolus_of(v);
+                    let sl = r_acq.mean_slice(z, |i| {
+                        if ph.dseg[i] <= 0 {
+                            return 0.0;
+                        }
+                        let (va, a) = arterial_dm(&kin, abv[i], aatt[i], ph.m0[i] as f64, t);
+                        let Some(a) = a else { return 0.0 };
+                        let g = match &bolus {
+                            Some((region, pulses, eps)) => {
+                                arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, aatt[i]))
+                            }
+                            None => 1.0,
+                        };
+                        let c = p4.crush.as_ref().map_or(1.0, |cr| cr[v][p4.label_of[i]]);
+                        fa * g * c * va
+                    });
+                    for (jj, x) in sl.iter().enumerate() {
+                        ga[(z * nx * ny + jj) * n + v] = *x;
+                    }
                 }
             }
         }
@@ -871,13 +955,21 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                             None => delta_m(&kin, f_ml, att, t1t, m0, t),
                         }, p.exchange_time.map(|te| delta_m_iv(&kin, f_ml, att, t1t, m0, t, te))),
                     };
-                    let s = sign0 * scale;
-                    match iv {
+                    // P7 part A: under Look-Locker the images read the depleted parts, each with its
+                    // parcel factor; the P4 truths below keep their P4 meaning (at t, undepleted)
+                    let (s, dm_img, iv_img) = match (&read, ll_parts_on) {
+                        (Some((e, fl)), true) => {
+                            let pr = ll_parts(v, &kin, i, e, fl);
+                            (sign0, pr.total(), p.exchange_time.map(|_| pr.iv))
+                        }
+                        _ => (sign0 * scale, dm, iv),
+                    };
+                    match iv_img {
                         Some(iv) => {
                             bl[j] = blood_signal(v, s * iv);
-                            ev[j] = blood_signal(v, s * (dm - iv));
+                            ev[j] = blood_signal(v, s * (dm_img - iv));
                         }
-                        None => bl[j] = blood_signal(v, s * dm),
+                        None => bl[j] = blood_signal(v, s * dm_img),
                     }
                     if !giv.is_empty() {
                         // the unsuppressed intravascular part: kinetics and the split only
@@ -1085,7 +1177,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
     };
     let ge_propagated_some = ge_propagated.is_some();
     Ok(Built {
-        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines,
+        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art,
     })
 }
 
@@ -1116,7 +1208,7 @@ pub(super) fn simulate_p6(
         }
     }
     let Built {
-        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines,
+        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art,
     } = build(p, ph, mode, ov, tes[0], &sched)?;
     // P6 part C: every echo's readout block on explicit intervals, on the acquired grid
     if tes.len() > 1 || p.look_locker.is_some() {
@@ -1458,6 +1550,19 @@ pub(super) fn simulate_p6(
             delta_m_read: gt_read,
             lines: ll_lines,
             legacy_dispatch: ll_legacy_dispatch(l.cycles.iter().map(|c| c.rows.len()), l.flip_array),
+            read_iv: gt_read_iv,
+            read_ev: gt_read_ev,
+            read_arterial: gt_read_art,
+            p4_parts: [
+                ("exchange (P4 part A)", p.exchange_time.is_some()),
+                ("the arterial compartment (P4 part B)", p.macrovascular.is_some()),
+                ("crushing (P4 part C)", p.crushing.is_some()),
+                ("bolus-position suppression (P4 part D)",
+                 p.suppression.as_ref().is_some_and(|s| s.model != SuppressionModel::GlobalBolus)),
+            ]
+            .into_iter()
+            .filter_map(|(name, on)| on.then_some(name))
+            .collect(),
         }),
         ge_rule: ge_flip.map(|fa| match (p.compat.is_some(), fa == 90.0, ge_propagated_some, p.suppression.is_some()) {
             (true, ..) => "simasl's coherent steady state per volume (compat)",
@@ -2107,5 +2212,135 @@ mod tests {
                 assert!((line.tissue_mz[lab] - want).abs() <= 1e-9 * want.abs(), "label {l} readout {n}: {} vs {want}", line.tissue_mz[lab]);
             }
         }
+    }
+
+    // ---- P7 part A: the P4 parts under Look-Locker
+
+    /// A label cycle of six readouts (PCASL, 1 s labeling, readouts 0.3 s apart from PLD 0.6 s, 60
+    /// degrees) with exchange, the arterial compartment, crushing alternating per readout and a
+    /// bolus-position slab pulse after the labeling whose entry cut splits the bolus.
+    fn quasar_like(parts: &str) -> Protocol {
+        let m = 6;
+        let pld: Vec<f64> = (0..m).map(|n| 0.6 + 0.3 * n as f64).collect();
+        let mut s = sidecar(vec![1.0; m], pld, vec![4.5; m], "Absent", true);
+        s["LookLocker"] = json!(true);
+        s["BackgroundSuppression"] = json!(true);
+        s["BackgroundSuppressionNumberPulses"] = json!(1);
+        s["BackgroundSuppressionPulseTime"] = json!([1.2]);
+        s["VascularCrushing"] = json!(true);
+        s["VascularCrushingVENC"] = json!([0.0, 4.0, 0.0, 4.0, 0.0, 4.0]);
+        let ctx = format!("volume_type\n{}", "label\n".repeat(m));
+        parse_echoes(&[s], &ctx, Some(&overlay(parts, true)), None).unwrap()
+    }
+
+    const QUASAR_PARTS: &str = "[kinetic]\nexchange_time = 0.6\n\
+        [macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
+        arterial_transit_time = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n\
+        [vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n\
+        [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n";
+
+    /// Every Part A truth of the series against the parcel reference, voxel by voxel through the
+    /// series' own resampler: the read's intravascular and extravascular parts, their sum, and the
+    /// fresh arterial read with its per-readout survival; and the blood and arterial images
+    /// (noiseless, static) against the same references on the simulation grid.
+    #[test]
+    fn look_locker_reads_every_p4_part_as_the_parcel_reference() {
+        use crate::crushing::survival;
+        use crate::kinetic::parcel_ref::{Case, Region as PRegion};
+        let ph = crop();
+        let p = quasar_like(QUASAR_PARTS);
+        let sched = Schedule::new(&p);
+        let b = build(&p, &ph, T2Mode::Class, RowOverride::None, p.echo_times_s[0], &sched).unwrap();
+        let (iv_gt, ev_gt, art_gt, tot_gt) = (b.gt_read_iv.as_ref().unwrap(), b.gt_read_ev.as_ref().unwrap(),
+                                              b.gt_read_art.as_ref().unwrap(), b.gt_read.as_ref().unwrap());
+        let n = b.n;
+        let eps = p.suppression.as_ref().unwrap().for_row(0).epsilon;
+        let vel = [0.0, 10.0, 6.0, 3.0];
+        let abv = [0.0, 0.03, 0.015, 0.0];
+        let aatt = [0.0, 1.2, 1.8, 0.0];
+        let fl = p.look_locker.as_ref().unwrap().flip_deg.clone();
+        let [nx, ny, nz] = b.acq_grid.dims;
+        let r_sim = Resampler::with_offset(ph.grid.dims, crate::resample::axis_aligned_voxels(&ph.grid).unwrap(), b.sim_grid.dims,
+            [p.voxel_size_mm[0] / p.acq.oversample as f64, p.voxel_size_mm[1] / p.acq.oversample as f64, p.voxel_size_mm[2]],
+            crate::resample::corner_offset(&ph.grid, &b.acq_grid).unwrap());
+        let [snx, sny, _] = b.sim_grid.dims;
+        let k = b.k;
+        let mut checked = 0;
+        for v in 0..n {
+            let row = &p.rows[v];
+            let kin = p.kinetic(row);
+            let fa = fl[v].to_radians().sin();
+            let venc = [0.0, 4.0][v % 2];
+            for z in 0..nz {
+                let t = row.t + b.slice_offsets[z];
+                let excitations: Vec<(f64, f64)> = (0..v).map(|r| (p.rows[r].t + b.slice_offsets[z], fl[r])).collect();
+                let reference = |i: usize| -> (f64, f64, f64) {
+                    let l = ph.dseg[i];
+                    if l <= 0 {
+                        return (0.0, 0.0, 0.0);
+                    }
+                    let c = Case {
+                        k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64, t,
+                        excitations: excitations.clone(), entry_lead: 0.0, pulses: vec![1.2], epsilon: eps,
+                        region: PRegion::Slab(0.3), tau_ex: Some(0.6),
+                    };
+                    let (iv, total) = c.read(4);
+                    let l = l as usize;
+                    let art = c.arterial(abv[l], aatt[l], 0.0) * survival(vel[l], venc);
+                    (iv, total - iv, art)
+                };
+                // the truths, on the acquired grid
+                for (which, gt) in [(0, iv_gt), (1, ev_gt), (2, art_gt), (3, tot_gt)] {
+                    let want = b.r_acq.mean_slice(z, |i| {
+                        let (iv, ev, art) = reference(i);
+                        fa * [iv, ev, art, iv + ev][which]
+                    });
+                    let peak = want.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+                    for (jj, w) in want.iter().enumerate() {
+                        let got = gt[(z * nx * ny + jj) * n + v];
+                        assert!((got - w).abs() <= 1e-5 * peak, "readout {v} slice {z} part {which} voxel {jj}: {got} vs {w}");
+                        checked += usize::from(w.abs() > 0.01 * peak);
+                    }
+                }
+                // the images: a label row's blood compartments read -sin(a) iv, its arterial ones
+                // -sin(a) times the arterial read
+                for (first, which) in [(k, 0), (2 * k, 2)] {
+                    let want = r_sim.mean_slice(z, |i| { let r = reference(i); -fa * [r.0, r.1, r.2][which] });
+                    let peak = want.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+                    for (jj, w) in want.iter().enumerate() {
+                        let got: f32 = (first..first + k).map(|c| b.images[c][(z * snx * sny + jj) * n + v]).sum();
+                        assert!((got - w).abs() <= 1e-5 * peak, "image readout {v} slice {z} from {first} voxel {jj}: {got} vs {w}");
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "too few nonzero truth voxels: {checked}");
+        // the arterial truth is not vacuous: readouts 0 and 1 (1.6 and 1.9 s) are inside grey
+        // matter's arterial window [1.2, 2.2), and readout 1 is crushed (the slab pulse inverts
+        // the arterial parcel, so both are negative)
+        let sum = |gt: &[f32], v: usize| (0..nx * ny * nz).map(|j| gt[j * n + v] as f64).sum::<f64>().abs();
+        assert!(sum(art_gt, 0) > 0.0 && sum(art_gt, 1) > 0.0, "{} {}", sum(art_gt, 0), sum(art_gt, 1));
+        assert!(sum(art_gt, 1) < sum(art_gt, 0), "crushing: {} vs {}", sum(art_gt, 1), sum(art_gt, 0));
+    }
+
+    /// Without a Part A input the Look-Locker series writes no part truths, and a series with only
+    /// the arterial compartment reads the label as P6 does (`delta_m_read`).
+    #[test]
+    fn look_locker_part_truths_follow_their_parts() {
+        let ph = crop();
+        let mut s = sidecar(vec![1.0; 4], (0..4).map(|n| 0.6 + 0.3 * n as f64).collect(), vec![4.5; 4], "Absent", true);
+        s["LookLocker"] = json!(true);
+        let ctx = format!("volume_type\n{}", "label\n".repeat(4));
+        let p = parse_echoes(&[s.clone()], &ctx, Some(&overlay("", true)), None).unwrap();
+        let b = build(&p, &ph, T2Mode::Class, RowOverride::None, p.echo_times_s[0], &Schedule::new(&p)).unwrap();
+        assert!(b.gt_read.is_some() && b.gt_read_iv.is_none() && b.gt_read_ev.is_none() && b.gt_read_art.is_none());
+        let macro_only = "[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
+            arterial_transit_time = { grey_matter = 0.5, white_matter = 0.7, csf = 0.0 }\n";
+        let pm = parse_echoes(&[s], &ctx, Some(&overlay(macro_only, true)), None).unwrap();
+        let bm = build(&pm, &ph, T2Mode::Class, RowOverride::None, pm.echo_times_s[0], &Schedule::new(&pm)).unwrap();
+        assert!(bm.gt_read_art.is_some() && bm.gt_read_iv.is_none());
+        // the label read is P6's, bit for bit
+        assert_eq!(b.gt_read.as_ref().unwrap().iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                   bm.gt_read.as_ref().unwrap().iter().map(|x| x.to_bits()).collect::<Vec<_>>());
     }
 }

@@ -502,7 +502,7 @@ pub fn arterial_read(
 }
 
 #[cfg(test)]
-mod parcel_ref;
+pub(crate) mod parcel_ref;
 
 #[cfg(test)]
 mod tests {
