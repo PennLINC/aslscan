@@ -1325,8 +1325,9 @@ pub(super) fn simulate_p6(
     p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, ov: RowOverride, capture: Option<&mut Vec<Vec<f32>>>,
 ) -> Result<SeriesOutput, String> {
     let tes = p.echo_times_s.clone();
+    // P7 part C: the 3D gradient-echo train is its own series
     if p.ge3d().is_some() {
-        return Err("[readout] type \"epi3d\": the 3D gradient-echo series is not implemented yet (P7 plan, Task 15)".to_string());
+        return super::ge3d::simulate_ge3d(p, ph, mode, phase, ov);
     }
     let sched = Schedule::new(p);
     // P6 part C, compat: the echo-time decay is the signal stage's, so each echo has its own image
@@ -1691,6 +1692,7 @@ pub(super) fn simulate_p6(
             echo_time_s: tes[e + 1], mag, phase, m0: more_m0.get(e).cloned(),
         }).collect(),
         hadamard,
+        ge3d: None,
         look_locker: ll_on_raws(p, &sched).map(|l| LookLockerSeries {
             delta_m_read: gt_read,
             lines: ll_lines,

@@ -255,6 +255,83 @@ mod writer {
             block["Grid"]["Origin"] = json!(p.grid_origin.as_str());
         }
         p4_blocks(&mut block, p, out);
+        // P7 part C: the 3D gradient-echo train
+        if let (Some(g), Some(rs), Some(g3)) = (&out.ge3d, &p.readout, p.ge3d()) {
+            let r = &g.resolution;
+            let tr0 = p.rows.iter().find(|r| r.kind != crate::rows::RowKind::M0scan).or(p.rows.first()).map_or(0.0, |r| r.tr);
+            let spacing_s = r.train.exc_spacing_ms / 1000.0;
+            let centre = |t: f64| t + r.e_c as f64 * spacing_s;
+            block["Readout"] = json!({
+                "Type": "epi3d", "TypeSource": rs.kind.1.as_str(),
+                "Description": "a segmented 3D gradient-echo stack of EPI: per shot one small-flip excitation per \
+                                partition of its kz segment, each read by one EPI block per echo",
+                "NumberShots": r.n_shots, "KySegments": rs.ky_segments.0, "KzSegments": rs.kz_segments.0,
+                "ExcitationsPerShot": r.n_exc, "LinesPerBlock": r.epi,
+                "ExcitationSpacingMs": r.train.exc_spacing_ms,
+                "ExcitationTimeMs": { "Value": g3.excitation_time_ms.0, "Source": g3.excitation_time_ms.1.as_str() },
+                "EchoBlockCentresMs": r.train.echo_times_ms,
+                "EchoTimeConvention": "EchoTime is the k-space centre: each echo's block is centred at EchoTime - \
+                                       CentreLineTimeMs after its excitation",
+                "CentreLineTimeMs": r.t_kyc_ms,
+                "LineSpacingMs": r.t_line_ms, "LineSpacingSource": r.t_line_source,
+                "EffectiveEchoSpacing": r.t_line_ms / 1000.0 / rs.ky_segments.0 as f64,
+                "KzOrder": match rs.kz_order.0 { mrsim_acq::readout::KzOrder::Centric => "centric", _ => "linear" },
+                "CentreExcitation": r.e_c,
+                "FlipAngleInterpretation": "under \"epi3d\" FlipAngle is every partition's excitation (under GRASE it is \
+                                            the refocusing angle)",
+                "ExcitationTimeConvention": "PostLabelingDelay ends at the train's first excitation (BIDS's \"the \
+                                             excitation\" read as the first); CentreExcitation reads the kz centre",
+                "KzCentreExcitationTimes": p.rows.iter().map(|row| {
+                    if row.kind == crate::rows::RowKind::M0scan { centre(0.0) } else { centre(row.t) }
+                }).collect::<Vec<f64>>(),
+                "EffectivePostLabelingDelay": p.rows.iter().map(|row| match row.kind {
+                    crate::rows::RowKind::M0scan => 0.0,
+                    _ => centre(row.t) - row.tau,
+                }).collect::<Vec<f64>>(),
+                "ShotOrder": "s = ky_segment * KzSegments + kz_segment, one RepetitionTimePreparation apart",
+                "VolumeDuration": r.n_shots as f64 * tr0,
+                "Spoiling": "transverse magnetization fully spoiled between excitations: no stimulated or SSFP echoes",
+                "TissueModel": "every excitation an event on the tissue's timeline (cos(a) of Mz), the suppression \
+                                pulses before the train; tissue Mz before excitation j is M0(r) m_j(T1(r)), exact per \
+                                T1 group",
+                "TissueGroups": g.tissue_groups.iter().map(|(n, t1)| json!({ "Compartment": n, "T1": t1 })).collect::<Vec<_>>(),
+                "MaxT1Groups": { "Value": g3.max_t1_groups.0, "Source": g3.max_t1_groups.1.as_str() },
+                "SlabEntry": {
+                    "Value": match g.slab_entry.0 {
+                        crate::protocol::SlabEntryTime::Seconds(d) => json!(d),
+                        crate::protocol::SlabEntryTime::Arrival => json!("arrival"),
+                    },
+                    "Source": g.slab_entry.1,
+                    "Model": "a 3D excitation covers the slab: label is depleted by every excitation after its entry \
+                              into the slab (plug flow, one entry time), arterial label by those since its entry; \
+                              \"arrival\" depletes from arrival in the voxel",
+                    "MeanLeadPerLabel": g.mean_lead_s.iter().map(|(n, l)| json!({ "Label": n, "LeadSeconds": l })).collect::<Vec<_>>(),
+                },
+                "LabelInterpolation": {
+                    "Families": g.families,
+                    "Method": "per raw volume and family, the label's read at every excitation interpolated linearly \
+                               between node excitations, the nodes bisected until every voxel is within the tolerance \
+                               of the family's peak over the train",
+                    "Tolerance": { "Value": g3.node_tolerance.0, "Source": g3.node_tolerance.1.as_str() },
+                    "AchievedRelativeError": g.achieved_error,
+                    "NodeSlots": g.k_nodes,
+                    "NodesPerVolume": g.nodes,
+                },
+                "MemoryGiB": { "Estimate": g.memory_gib, "Limit": g3.max_memory_gib.0,
+                               "LimitSource": g3.max_memory_gib.1.as_str() },
+                "GroundTruth": "desc-deltam_gt (and its intravascular and arterial parts): the label at the kz-centre \
+                                excitation, depleted from slab entry, with its parcel factors, before sin(a), sign, \
+                                suppression or physiological factors; static",
+                "SeedSalt": format!("{:#x}", mrsim_acq::kspace3d::SEED_SALT_3D),
+                "Approximations": [
+                    "an ideal slab: exactly the field of view in z, uniform, no kz aliasing",
+                    "coil sensitivities uniform in z",
+                    "transverse magnetization fully spoiled between excitations",
+                    "one slab entry time for every parcel and voxel (plug flow)",
+                    "the label's read between interpolation nodes is linear in the excitation index",
+                ],
+            });
+        }
         // P5 parts B and D: written only for a 3D readout
         if let (Some(r3), Some(rs)) = (&out.readout, &p.readout) {
             let [_, ny, nz] = out.acq_grid.dims;
@@ -548,9 +625,11 @@ mod writer {
         let nifti_tr = p.rows.iter().find(|r| r.kind != crate::rows::RowKind::M0scan).or(p.rows.first()).map(|r| r.tr);
         // a segmented 3D volume takes NumberShots repetitions: the time step is the volume's (P5
         // part D); the sidecar's RepetitionTimePreparation stays the per-shot value given
-        let nifti_tr = match &out.readout {
-            Some(r3) => nifti_tr.map(|tr| r3.n_shots as f64 * tr),
-            None => nifti_tr,
+        let nifti_tr = match (&out.readout, &out.ge3d) {
+            (Some(r3), _) => nifti_tr.map(|tr| r3.n_shots as f64 * tr),
+            // P7 part C: a segmented 3D EPI volume likewise
+            (None, Some(g)) => nifti_tr.map(|tr| g.resolution.n_shots as f64 * tr),
+            (None, None) => nifti_tr,
         };
         // P6 part C: one series per echo (`echo-N`), each from its own input sidecar; with one echo the
         // names carry no echo entity and this runs once, as before
@@ -635,6 +714,18 @@ mod writer {
                 effective.push(("NumberShots", json!(r3.n_shots)));
                 effective.push(("FlipAngle", json!(rs.refocusing_flip_deg.0)));
             }
+            // P7 part C: the 3D EPI train's (its FlipAngle is the excitation, pushed above)
+            if let Some(g) = &out.ge3d {
+                let ny = out.acq_grid.dims[1];
+                let ees = g.resolution.t_line_ms / 1000.0 / g.resolution.readout.ky_segments as f64;
+                effective.push(("EffectiveEchoSpacing", json!(ees)));
+                effective.push(("TotalReadoutTime", json!(ees * (ny as f64 - 1.0))));
+                effective.push(("PhaseEncodingDirection", json!(p.phase_encoding_direction)));
+                if let Some(t) = overridden_sequence_type(p) {
+                    effective.push(("PulseSequenceType", json!(t)));
+                }
+                effective.push(("NumberShots", json!(g.resolution.n_shots)));
+            }
             if let Some(s) = &p.suppression {
                 // BIDS carries the first PLD's pulse times; an overlay override must be what is
                 // published, with the input kept under InputValuesReplaced.
@@ -711,6 +802,10 @@ mod writer {
                         p.look_locker.as_ref().and_then(|l| l.m0_flip_deg).map_or(90.0, |f| f.0), "ge",
                         "a gradient-echo readout at its own repetition time and excitation (overlay m0.flip_angle, or the \
                      series' scalar FlipAngle): one excitation, not a Look-Locker series; no suppression, no motion"),
+                    // P7 part C: the same 3D EPI train
+                    (Some(g), Some(rs)) if rs.ge3d.is_some() => (g.flip_deg.rem_euclid(360.0), "ge",
+                        "the series' 3D gradient-echo train at its own repetition time, excited from its start, at its \
+                         steady state: no labeling, no suppression, no motion"),
                     (Some(g), _) => (g.flip_deg.rem_euclid(360.0), "ge",
                                      "the series' gradient-echo readout at its own repetition time: no suppression, no motion"),
                     // P5 part B: the same echo train, its FlipAngle the refocusing angle
@@ -730,6 +825,17 @@ mod writer {
                         m0side.insert("PhaseEncodingDirection".to_string(), json!(p.phase_encoding_direction));
                     }
                     m0side.insert("NumberShots".to_string(), json!(r3.n_shots));
+                    if let Some(t) = overridden_sequence_type(p) {
+                        m0side.insert("PulseSequenceType".to_string(), json!(t));
+                    }
+                }
+                if let Some(g) = &out.ge3d {
+                    let ny = out.acq_grid.dims[1];
+                    let ees = g.resolution.t_line_ms / 1000.0 / g.resolution.readout.ky_segments as f64;
+                    m0side.insert("EffectiveEchoSpacing".to_string(), json!(ees));
+                    m0side.insert("TotalReadoutTime".to_string(), json!(ees * (ny as f64 - 1.0)));
+                    m0side.insert("PhaseEncodingDirection".to_string(), json!(p.phase_encoding_direction));
+                    m0side.insert("NumberShots".to_string(), json!(g.resolution.n_shots));
                     if let Some(t) = overridden_sequence_type(p) {
                         m0side.insert("PulseSequenceType".to_string(), json!(t));
                     }
@@ -931,7 +1037,7 @@ mod writer {
         if let Some(lines) = &out.physio {
             // 2D: per (volume, slice), unchanged; 3D: per (volume, shot), at each shot's excitation
             // (P5 part D), a branch of its own so the 2D file keeps its bytes
-            let mut tsv = if out.readout.is_some() {
+            let mut tsv = if out.readout.is_some() || out.ge3d.is_some() {
                 String::from(
                     "volume\tshot\ttime\tcardiac_phase\trespiratory_phase\tdrift\ttissue_factor\tlabel_window_start\t\
                      label_window_end\tlabel_mean_sin_cardiac\tlabel_mean_sin_respiratory\tlabel_mean_drift\tlabel_factor\n")

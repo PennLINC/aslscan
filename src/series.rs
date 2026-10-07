@@ -157,6 +157,29 @@ pub struct SeriesOutput {
     pub hadamard: Option<HadamardSeries>,
     /// P6 part B: the Look-Locker records.
     pub look_locker: Option<LookLockerSeries>,
+    /// P7 part C: the 3D gradient-echo train's records (`readout` is then `None`).
+    pub ge3d: Option<Ge3dSeries>,
+}
+
+/// A 3D gradient-echo series' records (P7 addendum, part C).
+#[derive(Debug, Clone)]
+pub struct Ge3dSeries {
+    pub resolution: crate::protocol::Ge3dResolution,
+    /// Per tissue group: its compartment's name and its T1 (s).
+    pub tissue_groups: Vec<(String, f64)>,
+    /// The label families, in compartment order.
+    pub families: Vec<&'static str>,
+    /// Node slots per family and mask, and per raw volume and family the node excitations.
+    pub k_nodes: usize,
+    pub nodes: Vec<Vec<Vec<usize>>>,
+    /// The interpolation's largest error over every voxel and excitation, relative to its family's
+    /// peak in the train.
+    pub achieved_error: f64,
+    /// The images estimated in memory at once (GiB).
+    pub memory_gib: f64,
+    pub slab_entry: (crate::protocol::SlabEntryTime, &'static str),
+    /// Per label, the mean slab-entry lead `ATT - d` over its perfused voxels (s).
+    pub mean_lead_s: Vec<(String, f64)>,
 }
 
 /// A Look-Locker series' records (P6 part B).
@@ -1370,6 +1393,7 @@ fn simulate_legacy(
         more_echoes: Vec::new(),
         hadamard: None,
         look_locker: None,
+        ge3d: None,
         ge_rule: ge_flip.map(|fa| match (p.compat.is_some(), fa == 90.0, ge_propagated.is_some(), p.suppression.is_some()) {
             (true, ..) => "simasl's coherent steady state per volume (compat)",
             (_, true, ..) => "90 degrees: the slab is saturated, each row independent (P3's timeline, sin(a) = 1)",

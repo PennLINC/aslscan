@@ -6,12 +6,10 @@
 //! grouping each tissue compartment by `T1` (tissue `Mz` is `M0(r) m_j(T1(r))`); the label's (Task
 //! 14) by depletion from slab entry and a piecewise-linear expansion over the train.
 
-// the series that calls these is P7 Task 15; until then they are exercised by their tests
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::*;
 use crate::longitudinal::{tissue_mz_ll, tissue_mz_ll_sequence, LlCycle, Suppression};
 use crate::protocol::SlabEntryTime;
+use crate::schedule::Schedule;
 
 /// One tissue group (P7 addendum, part C, "Tissue is separable"): the phantom voxels of compartment
 /// `compartment` (a label in class mode; every foreground voxel in voxel mode) whose `T1` is `t1_s`.
@@ -167,6 +165,589 @@ pub(super) fn check_memory(nvox_sim: usize, compartments: usize, in_flight: usiz
              [readout] node_tolerance, fewer worker threads, or a higher limit"));
     }
     Ok(gib)
+}
+
+
+// ---- P7 Task 15: the series ----
+
+/// The label families of a 3D gradient-echo series, each its own compartment family: the label
+/// not yet exchanged (all of it without exchange; the blood compartment, `T2_blood`), the
+/// exchanged label (the tissue compartment's `T2`), the arterial label (`T2_arterial`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Family {
+    Blood,
+    Extravascular,
+    Arterial,
+}
+
+impl Family {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Family::Blood => "blood (the label not yet exchanged; all of it without exchange)",
+            Family::Extravascular => "extravascular (the exchanged label)",
+            Family::Arterial => "arterial",
+        }
+    }
+}
+
+/// Everything a 3D gradient-echo series resolves before its acquisition (P7 Task 15): the
+/// per-volume builder [`volume_inputs`] reads it, from the worker that simulates the volume.
+pub(super) struct Ge3dBuild<'a> {
+    pub p: &'a Protocol,
+    pub ph: &'a Phantom,
+    pub res: crate::protocol::Ge3dResolution,
+    pub table: mrsim_acq::readout::Ge3dTable,
+    pub sched: Schedule,
+    pub r_sim: Resampler,
+    pub masks: Vec<Vec<bool>>,
+    pub groups: Vec<TissueGroup>,
+    /// Per tissue group, its `M0` on the simulation grid (static).
+    pub group_images: Vec<Vec<f32>>,
+    /// `m_j(T1)` per group, per preparation, per excitation (unit `M0`).
+    pub group_mz: Vec<Vec<Vec<f64>>>,
+    pub families: Vec<Family>,
+    /// Node slots per family and compartment mask.
+    pub k_nodes: usize,
+    /// Per raw volume, per family: the node excitations (empty: no label read).
+    pub nodes: Vec<Vec<Vec<usize>>>,
+    /// Per preparation: the tissue and label physiological factors.
+    pub prep_factors: Vec<(f64, f64)>,
+    /// Per raw volume: the label's sign times P3's global suppression factor.
+    pub label_scale: Vec<f64>,
+    pub p4: P4,
+    pub bolus_region: Option<Region>,
+    /// Per phantom voxel: the slab-entry lead of its label and of its arterial label (s).
+    pub lead: Vec<f64>,
+    pub lead_a: Vec<f64>,
+    pub flip_deg: f64,
+    pub spacing_s: f64,
+}
+
+impl Ge3dBuild<'_> {
+    pub fn n_compartments(&self) -> usize {
+        self.groups.len() + self.families.len() * self.masks.len() * self.k_nodes
+    }
+
+    /// The compartment of node slot `k` of family `f` (index into `families`) and mask `c`.
+    pub fn comp(&self, f: usize, c: usize, k: usize) -> usize {
+        self.groups.len() + (f * self.masks.len() + c) * self.k_nodes + k
+    }
+
+    /// The excitation times of raw volume `v`'s trains (s from the start of labeling): every shot's
+    /// train starts at the row's excitation time (an m0scan row's at the start of its repetition).
+    pub fn excitations(&self, v: usize) -> Vec<f64> {
+        let row = &self.sched.raw_rows[v];
+        let start = if row.kind == RowKind::M0scan { 0.0 } else { row.t };
+        train_times(start, self.res.n_exc, self.spacing_s)
+    }
+
+    /// The reads of phantom voxel `i` in raw volume `v` at every excitation, per family (before
+    /// `sin(a)`, sign and factors): the depleted label from slab entry with every P4 part
+    /// (sub-boli with their parcel factors, the exchange split), and the arterial read with its
+    /// crushing survival and parcel factor.
+    pub fn reads(&self, v: usize, i: usize) -> Vec<Vec<f64>> {
+        let p = self.p;
+        let ph = self.ph;
+        let row = &self.sched.raw_rows[v];
+        let kin = p.kinetic(row);
+        let e = self.excitations(v);
+        let n = e.len();
+        let flips = vec![self.flip_deg; n];
+        let (f_ml, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
+        let bolus = self.bolus_region.map(|region| {
+            let s = p.suppression.as_ref().unwrap().for_row(self.sched.preps[self.sched.raws[v].prep].suppression);
+            (region, s.pulse_times, s.epsilon)
+        });
+        let subs = match &bolus {
+            Some((region, pulses, eps)) => subbolus_factors(pulses, *eps, kin.tau, entry_offset(p.label_type, *region, att)),
+            None => vec![(0.0, kin.tau, 1.0)],
+        };
+        let parts = crate::kinetic::delta_m_read_all(&kin, f_ml, att, t1t, m0, &e, &flips, &subs, p.exchange_time, self.lead[i]);
+        self.families.iter().map(|fam| match fam {
+            Family::Blood => parts.iter().map(|q| q.iv).collect(),
+            Family::Extravascular => parts.iter().map(|q| q.ev).collect(),
+            Family::Arterial => {
+                let (Some(abv), Some(aatt)) = (&self.p4.abv, &self.p4.aatt) else { return vec![0.0; n] };
+                let crush = self.p4.crush.as_ref().map_or(1.0, |cr| cr[v][self.p4.label_of[i]]);
+                (0..n).map(|j| {
+                    let g = match &bolus {
+                        Some((region, pulses, eps)) => arterial_factor(pulses, *eps, e[j] - aatt[i],
+                                                                       entry_offset(p.label_type, *region, aatt[i])),
+                        None => 1.0,
+                    };
+                    let earlier: Vec<(f64, f64)> = e[..j].iter().map(|&t| (t, self.flip_deg)).collect();
+                    crate::kinetic::arterial_read(&kin, abv[i], aatt[i], m0, e[j], &earlier, self.lead_a[i], g * crush)
+                }).collect()
+            }
+        }).collect()
+    }
+
+    /// Whether raw volume `v` carries label.
+    pub fn labeled(&self, v: usize) -> bool {
+        self.label_scale[v] != 0.0
+    }
+}
+
+/// Raw volume `g`'s input to the acquisition (P7 addendum, part C): the tissue groups' `M0` and,
+/// per family and mask, the label's reads at its node excitations (masked, resampled), with the
+/// weights of every excitation: the tissue's `sin(a) m_j(T1) x` its physiological factor, the
+/// label's `sin(a) x` its sign and suppression factor `x` its physiological factor `x` the hat
+/// weight of the excitation on the node.
+pub(super) fn volume_inputs(b: &Ge3dBuild, g: usize) -> mrsim_acq::kspace3d::GeVolume {
+    let ph = b.ph;
+    let ncomp = b.n_compartments();
+    let nk = b.masks.len();
+    let mut images = vec![Vec::new(); ncomp];
+    let row = &b.sched.raw_rows[g];
+    let tissue_on = row.kind != RowKind::Deltam;
+    if tissue_on {
+        for (gi, im) in b.group_images.iter().enumerate() {
+            images[gi] = im.clone();
+        }
+    }
+    let labeled = b.labeled(g);
+    if labeled {
+        // per family and node, the reads at the node excitation over the phantom
+        let nvox = ph.nvox();
+        let mut node_vals: Vec<Vec<Vec<f32>>> = b.families.iter().enumerate()
+            .map(|(f, _)| vec![vec![0.0f32; nvox]; b.nodes[g][f].len()]).collect();
+        for i in (0..nvox).filter(|&i| ph.dseg[i] > 0) {
+            let r = b.reads(g, i);
+            for (f, fam) in r.iter().enumerate() {
+                for (k, &j) in b.nodes[g][f].iter().enumerate() {
+                    node_vals[f][k][i] = fam[j] as f32;
+                }
+            }
+        }
+        for (f, per_node) in node_vals.iter().enumerate() {
+            for (k, vals) in per_node.iter().enumerate() {
+                for (c, m) in b.masks.iter().enumerate() {
+                    let masked: Vec<f32> = vals.iter().zip(m).map(|(v, &on)| if on { *v } else { 0.0 }).collect();
+                    images[b.comp(f, c, k)] = b.r_sim.mean(&masked);
+                }
+            }
+        }
+    }
+    let ky_segments = b.res.readout.ky_segments;
+    let nz = b.table.nz;
+    let sin_a = b.flip_deg.to_radians().sin();
+    let preps = b.sched.preps_of(g);
+    let first_prep = b.sched.raws[g].prep;
+    let mut weights = vec![0.0; nz * ky_segments * ncomp];
+    for p in 0..nz {
+        for sy in 0..ky_segments {
+            let line = b.table.line(p, sy);
+            let (shot, j) = (line.shot, line.excitation);
+            let prep = first_prep + shot;
+            debug_assert_eq!(preps[shot].shot, shot);
+            let (tf, lf) = b.prep_factors[prep];
+            let at = |c: usize| (p * ky_segments + sy) * ncomp + c;
+            if tissue_on {
+                for (gi, mz) in b.group_mz.iter().enumerate() {
+                    weights[at(gi)] = sin_a * mz[prep][j] * tf;
+                }
+            }
+            if labeled {
+                for f in 0..b.families.len() {
+                    for (k, w) in hat(&b.nodes[g][f], j) {
+                        for c in 0..nk {
+                            weights[at(b.comp(f, c, k))] = sin_a * b.label_scale[g] * lf * w;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mrsim_acq::kspace3d::GeVolume { images, weights, shot_images: None }
+}
+
+/// What [`prepare_ge3d`] resolves for [`simulate_ge3d`]: the build and the series' grids and
+/// records.
+pub(super) struct Ge3dPrepared<'a> {
+    pub b: Ge3dBuild<'a>,
+    pub acq_grid: Grid,
+    pub sim_grid: Grid,
+    pub r_acq: Resampler,
+    pub relax: Relaxation,
+    pub mode_used: T2Mode,
+    pub acq: Acquisition,
+    pub fmap_sim: Vec<f32>,
+    pub physio_lines: Vec<PhysioLine>,
+    pub label_factors: Option<Vec<f64>>,
+    pub achieved: f64,
+    /// The phantom's foreground voxels.
+    pub fg: Vec<usize>,
+}
+
+/// Everything before the acquisition (P7 Task 15): the grids, the train, the tissue groups and
+/// their timeline, the P4 parts and the factors, the slab-entry leads and the interpolation nodes.
+pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, ov: RowOverride)
+    -> Result<Ge3dPrepared<'a>, String>
+{
+    let g3 = p.ge3d().expect("a 3D gradient-echo protocol");
+    if ov != RowOverride::None {
+        return Err("the test-hook row overrides are not available on the 3D gradient-echo series".to_string());
+    }
+    for (what, on) in [
+        ("[motion] (per-shot motion on the 3D gradient-echo train is deferred, P7 plan, Task 15)", p.motion.is_some()),
+        ("LookLocker: true (P7 plan, Task 16)", p.look_locker.is_some()),
+        ("[hadamard] (P7 plan, Task 18)", p.hadamard.is_some()),
+    ] {
+        if on {
+            return Err(format!("[readout] type \"epi3d\" with {what}: not available"));
+        }
+    }
+    if let (Some(pf), fs) = (ph.params.and_then(|q| q.field_strength), p.field_strength) {
+        if (pf - fs).abs() > 1e-9 {
+            return Err(format!("phantom MagneticFieldStrength {pf} disagrees with the protocol's {fs}"));
+        }
+    }
+
+    // ---- grids ----
+    let pv = axis_aligned_voxels(&ph.grid)?;
+    let acq_grid = acquisition_grid(&ph.grid, p.voxel_size_mm, p.acq.matrix, p.grid_origin)?;
+    let o = p.acq.oversample;
+    let sim_grid = hires_grid(&acq_grid, o);
+    let [nx, ny, nz] = acq_grid.dims;
+    let [snx, sny, _] = sim_grid.dims;
+    let res = crate::protocol::resolve_ge3d(p, acq_grid.dims)?.expect("an epi3d readout resolves");
+    let table = mrsim_acq::readout::ge3d_lines(&res.train, &res.readout, ny, nz)?;
+    let dv = p.voxel_size_mm;
+    let off = corner_offset(&ph.grid, &acq_grid)?;
+    let r_sim = Resampler::with_offset(ph.grid.dims, pv, sim_grid.dims, [dv[0] / o as f64, dv[1] / o as f64, dv[2]], off);
+    let r_acq = Resampler::with_offset(ph.grid.dims, pv, acq_grid.dims, dv, off);
+    let nvox_sim = snx * sny * nz;
+    let mut acq = p.acquisition(nx, ny)?;
+    acq.do_distortions = ph.fieldmap.is_some();
+    let fmap_sim: Vec<f32> = match &ph.fieldmap {
+        Some(f) => r_sim.mean(f),
+        None => vec![0.0; nvox_sim],
+    };
+
+    // ---- compartments: tissue groups, then each family's node slots per mask ----
+    let (relax, mode_used) = ph.relaxation_for(mode, false)?;
+    let masks: Vec<Vec<bool>> = match &relax {
+        Relaxation::Class { .. } => ph.labels.iter().map(|(l, _)| ph.dseg.iter().map(|d| d == l).collect()).collect(),
+        Relaxation::Voxel { .. } => vec![ph.dseg.iter().map(|d| *d > 0).collect()],
+    };
+    let groups = tissue_groups(ph, &masks, g3.max_t1_groups.0)?;
+    let group_images: Vec<Vec<f32>> = groups.iter()
+        .map(|gr| r_sim.mean(&ph.m0.iter().zip(&gr.mask).map(|(m, &on)| if on { *m } else { 0.0 }).collect::<Vec<f32>>()))
+        .collect();
+    let mut families = vec![Family::Blood];
+    if p.exchange_time.is_some() {
+        families.push(Family::Extravascular);
+    }
+    if p.macrovascular.is_some() {
+        families.push(Family::Arterial);
+    }
+
+    // ---- the schedule, its suppression, its trains and the tissue timeline ----
+    let sched = Schedule::new(p);
+    let n = sched.raw_rows.len();
+    let ge = p.ge.as_ref().expect("epi3d is gradient echo");
+    let flip_deg = ge.flip_deg;
+    let spacing_s = res.train.exc_spacing_ms / 1000.0;
+    let sups: Vec<Option<crate::longitudinal::Suppression>> = sched.preps.iter().map(|pr| {
+        let row = &sched.raw_rows[pr.raw];
+        p.suppression.as_ref().map(|s| s.for_row(pr.suppression)).filter(|s| s.has_events() && row.kind != RowKind::M0scan)
+    }).collect();
+    let cycles: Vec<LlCycle> = sched.preps.iter().zip(&sups).map(|(pr, s)| {
+        let row = &sched.raw_rows[pr.raw];
+        let start = if row.kind == RowKind::M0scan { 0.0 } else { row.t };
+        train_cycle(row.tr, s.as_ref(), train_times(start, res.n_exc, spacing_s), flip_deg)
+    }).collect();
+    let group_mz: Vec<Vec<Vec<f64>>> = groups.iter().map(|gr| train_mz(gr.t1_s, &cycles)).collect();
+
+    // ---- P4 parts, physiology per preparation, the label's scale per raw volume ----
+    let bolus_region = match p.suppression.as_ref().map(|s| s.model) {
+        Some(SuppressionModel::BolusPosition(r)) => Some(r),
+        _ => None,
+    };
+    let p4 = P4::new(p, ph, bolus_region)?;
+    let mut physio_lines: Vec<PhysioLine> = Vec::new();
+    let prep_factors: Vec<(f64, f64)> = sched.preps.iter().map(|pr| {
+        let row = &sched.raw_rows[pr.raw];
+        match &p4.physio {
+            None => (1.0, 1.0),
+            Some(phys) => {
+                let time = pr.start_s + row.t;
+                let tf = phys.tissue_factor(time);
+                let (lf, means) = match p.label_type {
+                    LabelType::Pasl => phys.label_factor_at(pr.start_s),
+                    _ => phys.label_factor_window(pr.start_s, pr.start_s + row.tau),
+                };
+                physio_lines.push(PhysioLine {
+                    volume: pr.raw, slice: pr.shot, time,
+                    cardiac_phase: phys.cardiac.phase(time), respiratory_phase: phys.respiratory.phase(time),
+                    drift: phys.drift.value(time), tissue_factor: tf, label_window: (pr.labeling_window[0], pr.labeling_window[1]),
+                    label_means: means, label_factor: lf,
+                });
+                (tf, lf)
+            }
+        }
+    }).collect();
+    let label_factors: Option<Vec<f64>> = match (&p.suppression, bolus_region) {
+        (Some(spec), None) => Some((0..n).map(|v| label_factor(&spec.for_row(sched.preps[sched.raws[v].prep].suppression))).collect()),
+        _ => None,
+    };
+    let label_scale: Vec<f64> = (0..n).map(|v| {
+        blood_sign(sched.raw_rows[v].kind, ov) * label_factors.as_ref().map_or(1.0, |f| f[v])
+    }).collect();
+
+    // ---- depletion from slab entry: each voxel's leads, refusing an entry after its arrival ----
+    let mut lead = vec![0.0; ph.nvox()];
+    let mut lead_a = vec![0.0; ph.nvox()];
+    for i in 0..ph.nvox() {
+        if ph.dseg[i] > 0 && ph.perfusion[i] > 0.0 {
+            lead[i] = entry_lead(g3.slab_entry.0, ph.att[i] as f64, i, "ATT")?;
+        }
+        if let (Some(abv), Some(aatt)) = (&p4.abv, &p4.aatt) {
+            if ph.dseg[i] > 0 && abv[i] > 0.0 {
+                lead_a[i] = entry_lead(g3.slab_entry.0, aatt[i], i, "aATT")?;
+            }
+        }
+    }
+
+    let mut b = Ge3dBuild {
+        p, ph, res, table, sched, r_sim, masks, groups, group_images, group_mz, families, k_nodes: 0, nodes: Vec::new(),
+        prep_factors, label_scale, p4, bolus_region, lead, lead_a, flip_deg, spacing_s,
+    };
+
+    // ---- the node selection, per raw volume and family; one count for the series ----
+    let fg: Vec<usize> = (0..ph.nvox()).filter(|&i| ph.dseg[i] > 0).collect();
+    let mut achieved = 0.0f64;
+    let mut nodes = Vec::with_capacity(n);
+    for v in 0..n {
+        if !b.labeled(v) {
+            nodes.push(vec![Vec::new(); b.families.len()]);
+            continue;
+        }
+        let per_voxel: Vec<Vec<Vec<f64>>> = fg.iter().map(|&i| b.reads(v, i)).collect();
+        let mut per_family = Vec::with_capacity(b.families.len());
+        for f in 0..b.families.len() {
+            let vals: Vec<Vec<f64>> = per_voxel.iter().map(|r| r[f].clone()).collect();
+            let nd = select_nodes(&vals, b.res.e_c, g3.node_tolerance.0);
+            let peak = vals.iter().flatten().fold(0.0f64, |m, x| m.max(x.abs()));
+            if peak > 0.0 {
+                for vv in &vals {
+                    for (a, c) in vv.iter().zip(interpolate(vv, &nd)) {
+                        achieved = achieved.max((a - c).abs() / peak);
+                    }
+                }
+            }
+            per_family.push(nd);
+        }
+        nodes.push(per_family);
+    }
+    b.k_nodes = nodes.iter().flatten().map(|nd| nd.len()).max().unwrap_or(0);
+    b.nodes = nodes;
+    Ok(Ge3dPrepared {
+        b, acq_grid, sim_grid, r_acq, relax, mode_used, acq, fmap_sim, physio_lines, label_factors, achieved, fg,
+    })
+}
+
+/// The 3D gradient-echo series (P7 addendum, part C): the train's tissue from its timeline per T1
+/// group, the label depleted from slab entry on interpolation nodes, one acquisition call with
+/// volumes built on demand, the separate M0 as the same train at its own repetition time.
+pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, ov: RowOverride)
+    -> Result<SeriesOutput, String>
+{
+    let g3 = p.ge3d().expect("a 3D gradient-echo protocol");
+    let Ge3dPrepared { b, acq_grid, sim_grid, r_acq, relax, mode_used, acq, fmap_sim, physio_lines, label_factors, achieved, fg } =
+        prepare_ge3d(p, ph, mode, ov)?;
+    let n = b.sched.raw_rows.len();
+    let [_, _, nz] = acq_grid.dims;
+    let nvox_sim = sim_grid.dims.iter().product::<usize>();
+    let nvox_acq = acq_grid.dims.iter().product::<usize>();
+    let flip_deg = b.flip_deg;
+    let spacing_s = b.spacing_s;
+    let ncomp = b.n_compartments();
+    #[cfg(feature = "par")]
+    let in_flight = std::thread::available_parallelism().map_or(1, |x| x.get()).min(n.max(1));
+    #[cfg(not(feature = "par"))]
+    let in_flight = 1;
+    let what = format!("{} tissue group(s), {} label famil(ies) x {} mask(s) x {} node(s)", b.groups.len(), b.families.len(),
+                       b.masks.len(), b.k_nodes);
+    let memory_gib = check_memory(nvox_sim, ncomp, in_flight, g3.max_memory_gib.0, &what)?;
+
+    // ---- relaxation per compartment ----
+    let t2_blood_ms = p.t2_blood_ms();
+    let t2_arterial_ms = p.macrovascular.as_ref().map(|m| (m.t2_arterial.0 * 1000.0) as f32);
+    let (acq_t2_ms, acq_t2p_ms): (Option<Vec<f32>>, Option<Vec<f32>>) = match &relax {
+        Relaxation::Voxel { t2_ms, t2p_ms } => (Some(b.r_sim.rate_mean(t2_ms, &ph.m0)), Some(b.r_sim.rate_mean(t2p_ms, &ph.m0))),
+        Relaxation::Class { .. } => (None, None),
+    };
+    let tissue_t2 = |c: usize| -> T2Volume {
+        match (&relax, &acq_t2_ms) {
+            (Relaxation::Class { t2_ms, .. }, _) => T2Volume::Uniform(t2_ms[c]),
+            (_, Some(m)) => T2Volume::Map(m),
+            _ => unreachable!("voxel mode has its maps"),
+        }
+    };
+    let tissue_t2p = |c: usize| -> T2Volume {
+        match (&relax, &acq_t2p_ms) {
+            (Relaxation::Class { t2p_ms, .. }, _) => T2Volume::Uniform(t2p_ms[c]),
+            (_, Some(m)) => T2Volume::Map(m),
+            _ => unreachable!("voxel mode has its maps"),
+        }
+    };
+    let mut t2_vols: Vec<T2Volume> = b.groups.iter().map(|gr| tissue_t2(gr.compartment)).collect();
+    let mut ti_vols: Vec<T2Volume> = b.groups.iter().map(|gr| tissue_t2p(gr.compartment)).collect();
+    for fam in &b.families {
+        for c in 0..b.masks.len() {
+            for _ in 0..b.k_nodes {
+                t2_vols.push(match fam {
+                    Family::Blood => T2Volume::Uniform(t2_blood_ms),
+                    Family::Extravascular => tissue_t2(c),
+                    Family::Arterial => T2Volume::Uniform(t2_arterial_ms.expect("the arterial family has its T2")),
+                });
+                // the label inherits its compartment's T2' (P6)
+                ti_vols.push(tissue_t2p(c));
+            }
+        }
+    }
+
+    // ---- the acquisition: every echo, volumes on demand ----
+    let echoes = mrsim_acq::kspace3d::simulate_acquisition_3d_ge(
+        sim_grid.dims, acq_grid.dims, n, &t2_vols, &fmap_sim, Some(&ti_vols), &acq, &b.res.train, &b.res.readout,
+        &|g| volume_inputs(&b, g), phase, p.seed,
+    );
+
+    // ---- the separate M0: the same train without labeling or suppression at its own TR ----
+    let m0_seed = (p.m0_type == M0Type::Separate).then_some(p.seed ^ M0_SEED_SALT);
+    let m0_echoes: Option<Vec<(Vec<f32>, Vec<f32>)>> = match (m0_seed, p.m0_repetition_time_s) {
+        (Some(seed), Some(tr)) => {
+            let mz: Vec<Vec<f64>> = b.groups.iter().map(|gr| m0_train_mz(gr.t1_s, tr, b.res.n_exc, spacing_s, flip_deg)).collect();
+            let sin_a = flip_deg.to_radians().sin();
+            let ky_segments = b.res.readout.ky_segments;
+            let m0_volume = |_g: usize| {
+                let mut images = vec![Vec::new(); ncomp];
+                for (gi, im) in b.group_images.iter().enumerate() {
+                    images[gi] = im.clone();
+                }
+                let mut weights = vec![0.0; nz * ky_segments * ncomp];
+                for pp in 0..nz {
+                    for sy in 0..ky_segments {
+                        let j = b.table.line(pp, sy).excitation;
+                        for (gi, m) in mz.iter().enumerate() {
+                            weights[(pp * ky_segments + sy) * ncomp + gi] = sin_a * m[j];
+                        }
+                    }
+                }
+                mrsim_acq::kspace3d::GeVolume { images, weights, shot_images: None }
+            };
+            Some(mrsim_acq::kspace3d::simulate_acquisition_3d_ge(
+                sim_grid.dims, acq_grid.dims, 1, &t2_vols, &fmap_sim, Some(&ti_vols), &acq, &b.res.train, &b.res.readout,
+                &m0_volume, phase, seed,
+            ))
+        }
+        (Some(_), None) => return Err("M0Type Separate without an M0 repetition time".to_string()),
+        _ => None,
+    };
+
+    // ---- ground truth: the label at the kz-centre excitation, static ----
+    let e_c = b.res.e_c;
+    let mut delta_m = vec![0.0f32; nvox_acq * n];
+    let mut gt_iv = p.exchange_time.map(|_| vec![0.0f32; nvox_acq * n]);
+    let mut gt_art = p.macrovascular.as_ref().map(|_| vec![0.0f32; nvox_acq * n]);
+    for v in 0..n {
+        if !matches!(sched_kind(&b, v), RowKind::Label | RowKind::Deltam) {
+            continue;
+        }
+        let mut per: Vec<Vec<f32>> = vec![vec![0.0f32; ph.nvox()]; b.families.len()];
+        for &i in &fg {
+            for (f, r) in b.reads(v, i).iter().enumerate() {
+                per[f][i] = r[e_c] as f32;
+            }
+        }
+        let fam = |x: Family| b.families.iter().position(|y| *y == x);
+        let total: Vec<f32> = (0..ph.nvox()).map(|i| {
+            per[0][i] + fam(Family::Extravascular).map_or(0.0, |f| per[f][i])
+        }).collect();
+        let put = |dst: &mut Vec<f32>, src: &[f32]| {
+            for (vox, x) in r_acq.mean(src).iter().enumerate() {
+                dst[vox * n + v] = *x;
+            }
+        };
+        put(&mut delta_m, &total);
+        if let Some(g) = gt_iv.as_mut() {
+            put(g, &per[0]);
+        }
+        if let (Some(g), Some(f)) = (gt_art.as_mut(), fam(Family::Arterial)) {
+            put(g, &per[f]);
+        }
+    }
+    let perfused: Vec<bool> = ph.perfusion.iter().map(|f| *f > 0.0).collect();
+    let ground_truth = GroundTruth {
+        delta_m,
+        delta_m_static: None,
+        perfusion: r_acq.mean(&ph.perfusion),
+        att: r_acq.masked_mean(&ph.att, &perfused),
+        t1: r_acq.mean(&ph.t1),
+        t2: r_acq.mean(&ph.t2),
+        m0: r_acq.mean(&ph.m0),
+        dseg: r_acq.majority(&ph.dseg),
+        acq_t2_ms: acq_t2_ms.clone(),
+        acq_t2p_ms: acq_t2p_ms.clone(),
+        acq_t1_ms: None,
+        delta_m_iv: gt_iv,
+        delta_m_suppressed: None,
+        delta_m_arterial: gt_art,
+        abv: b.p4.abv.as_ref().map(|a| r_acq.mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>())),
+        aatt: match (&b.p4.abv, &b.p4.aatt) {
+            (Some(bv), Some(a)) => {
+                let has: Vec<bool> = bv.iter().map(|x| *x > 0.0).collect();
+                Some(r_acq.masked_mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>(), &has))
+            }
+            _ => None,
+        },
+    };
+
+    let ge3d = Ge3dSeries {
+        resolution: b.res.clone(),
+        tissue_groups: b.groups.iter().map(|gr| {
+            let name = match &relax {
+                Relaxation::Class { .. } => ph.labels[gr.compartment].1.clone(),
+                Relaxation::Voxel { .. } => "tissue".to_string(),
+            };
+            (name, gr.t1_s)
+        }).collect(),
+        families: b.families.iter().map(|f| f.as_str()).collect(),
+        k_nodes: b.k_nodes,
+        nodes: b.nodes.clone(),
+        achieved_error: achieved,
+        memory_gib,
+        slab_entry: g3.slab_entry,
+        mean_lead_s: ph.labels.iter().enumerate().map(|(li, (_, nm))| {
+            let (s, c) = (0..ph.nvox()).filter(|&i| b.p4.label_of[i] == li && ph.perfusion[i] > 0.0)
+                .fold((0.0, 0usize), |(s, c), i| (s + b.lead[i], c + 1));
+            (nm.clone(), if c > 0 { s / c as f64 } else { 0.0 })
+        }).collect(),
+    };
+    let mut echoes = echoes.into_iter();
+    let (mag, phase_out) = echoes.next().expect("one echo at least");
+    let mut m0_iter = m0_echoes.map(|v| v.into_iter());
+    let m0 = m0_iter.as_mut().and_then(|it| it.next());
+    let tes = &p.echo_times_s;
+    let more_echoes: Vec<EchoSeries> = echoes.enumerate().map(|(e, (mag, phase))| EchoSeries {
+        echo_time_s: tes[e + 1], mag, phase, m0: m0_iter.as_mut().and_then(|it| it.next()),
+    }).collect();
+    Ok(SeriesOutput {
+        acq_grid, sim_grid, n_volumes: n, mag, phase: phase_out, m0, mode: mode_used, labels: ph.labels.clone(),
+        n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(), seeds: (p.seed, m0_seed), acquisition: acq,
+        ground_truth, label_factors, poses: vec![Pose::IDENTITY; n], motion_seed: None, events: Vec::new(),
+        dropped: Vec::new(), compat: None, crush_survival: b.p4.crush.clone(),
+        physio: b.p4.physio.as_ref().map(|_| physio_lines), ge_rule: Some(
+            "every excitation of the train an event on the tissue's timeline (spoiled): the first preparation at its \
+             steady state, each later one from the end of the one before"),
+        readout: None, echo_amplitudes: None, spiral_segmentation: None, more_echoes, hadamard: None, look_locker: None,
+        ge3d: Some(ge3d),
+    })
+}
+
+fn sched_kind(b: &Ge3dBuild, v: usize) -> RowKind {
+    b.sched.raw_rows[v].kind
 }
 
 #[cfg(test)]
@@ -361,5 +942,124 @@ mod tests {
         assert!((check_memory(1 << 20, 64, 8, 4.0, "test").unwrap() - 2.0).abs() < 1e-12);
         let err = check_memory(1 << 20, 64, 8, 1.5, "18 tissue groups, K = 6").unwrap_err();
         assert!(err.contains("2.00 GiB") && err.contains("max_memory_gib") && err.contains("K = 6"), "{err}");
+    }
+
+    // ---- Task 15
+
+    use crate::kinetic::parcel_ref::{Case, Region as PRegion};
+    use crate::protocol::{parse, Overlay};
+    use serde_json::{json, Value};
+
+    fn crop() -> Phantom {
+        crate::phantom::load(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/phantom-crop"))).unwrap()
+    }
+
+    /// A 3D EPI PCASL protocol on the crop: 0.75 mm partitions (8 of them), two kz and two ky
+    /// segments (four shots, four excitations each, 40 ms apart, 12 degrees), PLD 0.5 s so the
+    /// label arrives during the train, one suppression pulse before it, exchange, the label
+    /// entering the slab 0.5 s after labeling.
+    fn ge3d_protocol(extra: &str) -> Protocol {
+        let s: Value = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 0.5,
+            "BackgroundSuppression": true, "BackgroundSuppressionNumberPulses": 1, "BackgroundSuppressionPulseTime": [2.0],
+            "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "EchoTime": 0.012, "MagneticFieldStrength": 3,
+            "AcquisitionVoxelSize": [2.0, 2.0, 0.75], "MRAcquisitionType": "3D", "PulseSequenceType": "3D EPI",
+            "PhaseEncodingDirection": "j-", "EffectiveEchoSpacing": 0.0005, "NumberShots": 4, "FlipAngle": 12
+        });
+        let ov: Overlay = toml::from_str(&format!(
+            "seed = 5\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n[signal]\nacq_contrast = \"ge\"\n\
+             [readout]\nexcitation_spacing = 40.0\nslab_entry_time = 0.5\nkz_segments = 2\n[kinetic]\nexchange_time = 0.4\n{extra}"))
+            .unwrap();
+        parse(&s, "volume_type\ncontrol\nlabel\n", Some(&ov), crop().params.as_ref()).unwrap()
+    }
+
+    /// Every raw volume's input, at every partition's excitation, against independent references:
+    /// the weighted sum of its images is sin(a) times the tissue `M0 m_j` (the brute-force event
+    /// run) plus the label's sign times its read (the parcel reference, depleted from slab entry,
+    /// exchange split, suppression by its pulse), resampled. The same reference without the
+    /// slab-entry lead misses it: the depletion before arrival is in the images.
+    #[test]
+    fn each_excitation_sees_the_reference_object() {
+        let ph = crop();
+        let p = ge3d_protocol("");
+        let pr = prepare_ge3d(&p, &ph, T2Mode::Class, RowOverride::None).unwrap();
+        let b = &pr.b;
+        assert_eq!((b.table.nz, b.res.n_exc, b.res.n_shots), (8, 4, 4));
+        assert!(b.k_nodes >= 2);
+        let spec = p.suppression.as_ref().unwrap();
+        let eps = spec.epsilon.0;
+        let sin_a = 12f64.to_radians().sin();
+        let spacing = 0.040;
+        // the brute-force tissue timeline over every preparation
+        let sups: Vec<Option<Suppression>> = b.sched.preps.iter().map(|_| Some(Suppression::new(vec![2.0], eps, false))).collect();
+        let cycles: Vec<LlCycle> = b.sched.preps.iter().zip(&sups).map(|(pp, s)| {
+            let row = &b.sched.raw_rows[pp.raw];
+            train_cycle(row.tr, s.as_ref(), train_times(row.t, 4, spacing), 12.0)
+        }).collect();
+        let ncomp = b.n_compartments();
+        let ky = b.res.readout.ky_segments;
+        let [snx, sny, _] = pr.sim_grid.dims;
+        for g in 0..2 {
+            let vol = volume_inputs(b, g);
+            let row = &b.sched.raw_rows[g];
+            let kin = p.kinetic(row);
+            let e = train_times(row.t, 4, spacing);
+            let sign = if row.kind == RowKind::Label { -1.0 } else { 0.0 };
+            for pp in 0..8 {
+                for sy in 0..ky {
+                    let line = b.table.line(pp, sy);
+                    let (j, prep) = (line.excitation, b.sched.raws[g].prep + line.shot);
+                    let got: Vec<f64> = (0..snx * sny * 8).map(|x| {
+                        (0..ncomp).filter(|&c| !vol.images[c].is_empty())
+                            .map(|c| vol.weights[(pp * ky + sy) * ncomp + c] * vol.images[c][x] as f64).sum()
+                    }).collect();
+                    let reference = |lead_on: bool| -> Vec<f32> {
+                        let per: Vec<f32> = (0..ph.nvox()).map(|i| {
+                            if ph.dseg[i] <= 0 {
+                                return 0.0;
+                            }
+                            let m = brute(ph.t1[i] as f64, &cycles)[prep][j];
+                            let mut v = ph.m0[i] as f64 * m;
+                            if sign != 0.0 && ph.perfusion[i] > 0.0 {
+                                let c = Case {
+                                    k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
+                                    m0: ph.m0[i] as f64, t: e[j], excitations: e[..j].iter().map(|&t| (t, 12.0)).collect(),
+                                    entry_lead: if lead_on { ph.att[i] as f64 - 0.5 } else { 0.0 }, pulses: vec![2.0],
+                                    epsilon: eps, region: PRegion::Global, tau_ex: Some(0.4), span: (0.0, kin.tau),
+                                };
+                                v += sign * c.read(4).1;
+                            }
+                            (sin_a * v) as f32
+                        }).collect();
+                        pr.b.r_sim.mean(&per)
+                    };
+                    let want = reference(true);
+                    let tissue_peak = want.iter().fold(0.0f32, |m, x| m.max(x.abs())) as f64;
+                    let worst = got.iter().zip(&want).map(|(a, w)| (a - *w as f64).abs()).fold(0.0, f64::max);
+                    // the label is about a hundredth of the tissue: the tolerance covers the
+                    // interpolation (1e-4 of the label's peak) and f32
+                    assert!(worst <= 3e-6 * tissue_peak, "volume {g} partition {pp} segment {sy}: {worst:e} of {tissue_peak:e}");
+                    if g == 1 && j == 3 {
+                        let no_lead = reference(false);
+                        let miss = got.iter().zip(&no_lead).map(|(a, w)| (a - *w as f64).abs()).fold(0.0, f64::max);
+                        assert!(miss > 10.0 * worst.max(1e-9 * tissue_peak), "the slab-entry depletion is not in the images: {miss:e} vs {worst:e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The series refuses what it does not model yet, and runs a protocol end to end.
+    #[test]
+    fn the_series_runs_and_refuses_what_it_does_not_model() {
+        let ph = crop();
+        let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
+        let out = simulate_ge3d(&ge3d_protocol(""), &ph, T2Mode::Auto, &phase, RowOverride::None).unwrap();
+        assert_eq!(out.n_volumes, 2);
+        assert!(out.ge3d.is_some() && out.readout.is_none());
+        assert!(out.mag.iter().all(|x| x.is_finite()) && out.mag.iter().any(|x| *x > 0.0));
+        let motion = ge3d_protocol("[motion]\nmode = \"random\"\ntrans_mm = [1.0, 1.0, 0.0]\nrot_deg = [0.0, 0.0, 1.0]\n");
+        assert!(simulate_ge3d(&motion, &ph, T2Mode::Auto, &phase, RowOverride::None).unwrap_err().contains("[motion]"));
+        assert!(simulate_ge3d(&ge3d_protocol(""), &ph, T2Mode::Auto, &phase, RowOverride::BloodIntoTissue0).is_err());
     }
 }

@@ -55,3 +55,7 @@ Only the JSON sidecar and aslcontext.tsv are kept; no image data.
   each encoded preparation read by four Look-Locker readouts: seven sub-boli of 0.25 s, PLD_n = 0.5, 0.8, 1.1,
   1.4 s, 35 degrees, TR 4.5 s, two encoding cycles after an included M0, exchange on; the context lists the 56
   decoded volumes readout-major.
+- `p7_ge3d/`: written for aslscan (P7 plan, Task 15). `p5_grase`'s protocol (PCASL on the crop, two shots in two ky
+  segments, suppression, exchange, physiological noise, a separate M0) read by a 3D gradient-echo stack of EPI
+  (`PulseSequenceType` "3D EPI", `FlipAngle` 12, the excitation), 40 ms between excitations, the label entering
+  the slab 0.5 s after labeling.

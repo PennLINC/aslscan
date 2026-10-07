@@ -2065,3 +2065,35 @@ fn look_locker_hadamard_reads_every_echo() {
     assert_eq!(tsv.lines().count(), 1 + 24);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// P7 part C: the p7_ge3d fixture end to end. The sidecar's standard keys are the 3D EPI train's
+/// (FlipAngle the excitation, the effective spacing, the shots), its readout block records the
+/// train, the slab entry and the interpolation; the separate M0 is the same train (its FlipAngle the
+/// excitation); the physiology table is per shot; the NIfTI time step is the volume's.
+#[test]
+fn ge3d_fixture_writes_its_train() {
+    let (s, ctx) = fixture("p7_ge3d");
+    let p = parse_named("p7_ge3d", &s, &ctx, &fixture_overlay("p7_ge3d"));
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-p7ge3d-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let perf = dir.join("sub-01/perf");
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    assert_eq!((side["FlipAngle"].as_f64(), side["NumberShots"].as_u64()), (Some(12.0), Some(2)));
+    assert_eq!(side["EffectiveEchoSpacing"].as_f64(), Some(0.0005));
+    let ro = &side["AslscanSimulation"]["Readout"];
+    assert_eq!(ro["Type"], json!("epi3d"));
+    assert_eq!(ro["SlabEntry"]["Value"], json!(0.5));
+    assert!(ro["LabelInterpolation"]["AchievedRelativeError"].as_f64().unwrap() <= 1e-4);
+    assert!(ro["FlipAngleInterpretation"].as_str().unwrap().contains("excitation"));
+    let m0: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("sub-01_m0scan.json")).unwrap()).unwrap();
+    assert_eq!(m0["FlipAngle"].as_f64(), Some(12.0));
+    let physio = std::fs::read_to_string(perf.join("ground-truth/sub-01_desc-physio_gt.tsv")).unwrap();
+    assert!(physio.starts_with("volume\tshot\t"), "{physio}");
+    assert_eq!(physio.lines().count(), 1 + 4 * 2, "a line per volume and shot");
+    // the NIfTI time step is the volume's: two shots of 4 s
+    let hdr = nifti::ReaderOptions::new().read_file(perf.join("sub-01_part-mag_asl.nii.gz")).unwrap();
+    assert!((hdr.header().pixdim[4] - 8.0).abs() < 1e-6, "{}", hdr.header().pixdim[4]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

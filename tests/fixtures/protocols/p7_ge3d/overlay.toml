@@ -1,0 +1,25 @@
+# The P7 3D gradient-echo acceptance case (P7 plan, Task 15) on the crop: p5_grase's protocol (PCASL,
+# two shots in two ky segments, suppression, exchange, physiological noise, a separate M0) read by a
+# 3D EPI train at 12 degrees, 40 ms between excitations, label entering the slab 0.5 s after labeling.
+seed = 17
+
+[acquisition]
+oversample = 2
+signal_scale = 100.0
+
+[signal]
+acq_contrast = "ge"
+
+[readout]
+excitation_spacing = 40.0
+slab_entry_time = 0.5
+
+[kinetic]
+exchange_time = 0.4
+
+[physio]
+tissue_cardiac = 0.02
+label_cardiac = 0.03
+
+[m0]
+repetition_time = 6.0
