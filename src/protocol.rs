@@ -607,9 +607,22 @@ pub struct HadamardSpec {
     /// Each sub-bolus's span `[a_j, b_j]` within the labeling `[0, tau_tot]` (s).
     pub spans: Vec<(f64, f64)>,
     pub tau_tot: f64,
-    /// The delay from the end of the labeling to the excitation (s): the last sub-bolus's PLD.
+    /// The delay from the end of the labeling to the excitation (s): the last sub-bolus's PLD
+    /// (under Look-Locker, the first readout's).
     pub pld: f64,
     pub cycles: Vec<HadamardCycle>,
+    /// P7 part B: the Look-Locker readouts after each encoded preparation (1 without Look-Locker)
+    /// and each readout's delay from the end of the labeling, `PLD_n` (`[pld]` without).
+    pub readouts: usize,
+    pub plds: Vec<f64>,
+}
+
+impl HadamardSpec {
+    /// The input row of decoded volume (sub-bolus `j`, readout `n`) within a cycle's rows: the
+    /// rows are readout-major, `H - 1` sub-boli per readout.
+    pub fn row(&self, cy: &HadamardCycle, j: usize, n: usize) -> usize {
+        cy.rows[n * (self.order - 1) + j]
+    }
 }
 
 /// One Look-Locker cycle (P6 addendum, part B): its rows (the readouts in order, or one m0scan row).
@@ -1093,11 +1106,22 @@ fn same_json(a: &Value, b: &Value) -> bool {
 /// cycles); the sub-boli's durations are the same in every cycle, every row's PostLabelingDelay is
 /// its sub-bolus's effective delay `PLD + sum_{k>j} tau_k`, and the repetition time, the
 /// suppression pulse set and the crushing VENC are each one per cycle.
+///
+/// Under Look-Locker (P7 addendum, part B; `ll` is `Some((M, flips))`): each encoded preparation
+/// is read `M` times, and the rows list the decoded volumes readout-major, `(H - 1) M` per cycle;
+/// row `(j, n)`'s delay is `PLD_n + sum_{k>j} tau_k`, `PLD_n` strictly increasing; `FlipAngle` and
+/// `VascularCrushingVENC` agree across the sub-boli of a readout (one VENC per readout index, not
+/// per cycle); the cycle's pulse set is one and its pulses precede the first readout.
+#[allow(clippy::too_many_arguments)]
 fn hadamard_spec(
     ho: Option<&HadamardOverlay>, label_type: LabelType, rows: &[Row], pld: &[f64], suppression: Option<&SuppressionSpec>,
-    crushing: Option<&CrushSpec>, compat: bool,
+    crushing: Option<&CrushSpec>, compat: bool, ll: Option<(usize, Option<&[f64]>)>,
 ) -> Result<Option<HadamardSpec>, String> {
     let Some(ho) = ho else { return Ok(None) };
+    let (m, flips) = ll.unwrap_or((1, None));
+    if m == 0 {
+        return Err("overlay: look_locker.readouts_per_cycle must be at least 1".to_string());
+    }
     let order = ho.order.ok_or("overlay: [hadamard] needs order (4, 8, 16 or 32)")?;
     if !crate::hadamard::ORDERS.contains(&order) {
         return Err(format!("overlay: hadamard.order {order}: the Sylvester orders 4, 8, 16 and 32 are supported"));
@@ -1115,6 +1139,8 @@ fn hadamard_spec(
              cycle and m0scan rows between cycles", rows[i].kind.as_str(), order - 1));
     }
     let n_sub = order - 1;
+    // the decoded rows of one cycle: H - 1 per readout
+    let per = n_sub * m;
     let mut cycles = Vec::new();
     let mut i = 0;
     while i < rows.len() {
@@ -1123,26 +1149,35 @@ fn hadamard_spec(
             continue;
         }
         let run = rows[i..].iter().take_while(|r| r.kind == RowKind::Deltam).count();
-        if run % n_sub != 0 {
+        if run % per != 0 {
+            let what = if m > 1 {
+                format!("{n_sub} sub-boli at each of {m} readouts (look_locker.readouts_per_cycle), {per} rows")
+            } else {
+                format!("{n_sub} sub-boli")
+            };
             return Err(format!(
-                "aslcontext.tsv rows {i}..{} are {run} deltam rows, not a whole number of order-{order} cycles of {n_sub} \
-                 sub-boli; m0scan rows go only between cycles", i + run - 1));
+                "aslcontext.tsv rows {i}..{} are {run} deltam rows, not a whole number of order-{order} cycles of {what}; \
+                 m0scan rows go only between cycles", i + run - 1));
         }
-        for c in 0..run / n_sub {
-            cycles.push(HadamardCycle { rows: (i + c * n_sub..i + (c + 1) * n_sub).collect() });
+        for c in 0..run / per {
+            cycles.push(HadamardCycle { rows: (i + c * per..i + (c + 1) * per).collect() });
         }
         i += run;
     }
     if cycles.is_empty() {
         return Err("[hadamard] with no deltam rows: nothing is encoded".to_string());
     }
-    let tau: Vec<f64> = cycles[0].rows.iter().map(|&r| rows[r].tau).collect();
+    // the sub-boli from the first readout's rows (the only readout without Look-Locker)
+    let tau: Vec<f64> = cycles[0].rows[..n_sub].iter().map(|&r| rows[r].tau).collect();
+    // "sub-bolus j", and the readout under Look-Locker
+    let at = |j: usize, n: usize| if m > 1 { format!("sub-bolus {}, readout {}", j + 1, n + 1) } else { format!("sub-bolus {}", j + 1) };
     for (c, cy) in cycles.iter().enumerate() {
-        for (j, &r) in cy.rows.iter().enumerate() {
+        for (k, &r) in cy.rows.iter().enumerate() {
+            let (j, n) = (k % n_sub, k / n_sub);
             if (rows[r].tau - tau[j]).abs() > 1e-9 {
                 return Err(format!(
-                    "LabelingDuration of row {r} (cycle {}, sub-bolus {}) is {} s, but {} s in cycle 1: the sub-boli \
-                     are the same in every cycle", c + 1, j + 1, rows[r].tau, tau[j]));
+                    "LabelingDuration of row {r} (cycle {}, {}) is {} s, but {} s in cycle 1: the sub-boli \
+                     are the same in every cycle", c + 1, at(j, n), rows[r].tau, tau[j]));
             }
         }
     }
@@ -1153,15 +1188,23 @@ fn hadamard_spec(
         spans.push((a, a + t));
         a += t;
     }
-    let pld_n = pld[cycles[0].rows[n_sub - 1]];
+    // each readout's delay, from its last sub-bolus's row in cycle 1
+    let plds: Vec<f64> = (0..m).map(|n| pld[cycles[0].rows[n * n_sub + n_sub - 1]]).collect();
+    if let Some(n) = (1..m).find(|&n| plds[n] <= plds[n - 1]) {
+        return Err(format!(
+            "[hadamard] with LookLocker: true: readout {}'s delay PLD_{} = {} s does not follow readout {}'s {} s (the \
+             last sub-bolus's PostLabelingDelay of each readout must strictly increase)", n + 1, n + 1, plds[n], n, plds[n - 1]));
+    }
+    let pld_n = plds[0];
     for (c, cy) in cycles.iter().enumerate() {
-        for (j, &r) in cy.rows.iter().enumerate() {
-            let want = pld_n + tau[j + 1..].iter().sum::<f64>();
+        for (k, &r) in cy.rows.iter().enumerate() {
+            let (j, n) = (k % n_sub, k / n_sub);
+            let want = plds[n] + tau[j + 1..].iter().sum::<f64>();
             if (pld[r] - want).abs() > 1e-6 {
                 return Err(format!(
-                    "PostLabelingDelay of row {r} (cycle {}, sub-bolus {}) is {} s; with [hadamard] each row's delay is \
-                     its sub-bolus's effective delay PLD + the later sub-boli's durations = {want} s (PLD {pld_n} s, the \
-                     last sub-bolus's)", c + 1, j + 1, pld[r]));
+                    "PostLabelingDelay of row {r} (cycle {}, {}) is {} s; with [hadamard] each row's delay is \
+                     its sub-bolus's effective delay PLD + the later sub-boli's durations = {want} s (PLD {} s, the \
+                     last sub-bolus's)", c + 1, at(j, n), pld[r], plds[n]));
             }
         }
         let tr0 = rows[cy.rows[0]].tr;
@@ -1193,9 +1236,34 @@ fn hadamard_spec(
             }
         }
         if let Some(cr) = crushing {
-            let v0 = cr.venc[cy.rows[0]];
-            if cy.rows.iter().any(|&r| cr.venc[r] != v0) {
-                return Err(format!("VascularCrushingVENC varies within cycle {}: one VENC per cycle", c + 1));
+            if m == 1 {
+                let v0 = cr.venc[cy.rows[0]];
+                if cy.rows.iter().any(|&r| cr.venc[r] != v0) {
+                    return Err(format!("VascularCrushingVENC varies within cycle {}: one VENC per cycle", c + 1));
+                }
+            } else {
+                // P7 part A: under Look-Locker one VENC per readout index (each readout its own
+                // bipolar gradients), the same for every sub-bolus of it
+                for (k, &r) in cy.rows.iter().enumerate() {
+                    let (j, n) = (k % n_sub, k / n_sub);
+                    let v0 = cr.venc[cy.rows[n * n_sub]];
+                    if cr.venc[r] != v0 {
+                        return Err(format!(
+                            "VascularCrushingVENC of row {r} (cycle {}, {}) is {}, but {v0} for sub-bolus 1 of the same \
+                             readout: a readout's decoded volumes share its VENC", c + 1, at(j, n), cr.venc[r]));
+                    }
+                }
+            }
+        }
+        if let Some(f) = flips.filter(|_| m > 1) {
+            for (k, &r) in cy.rows.iter().enumerate() {
+                let (j, n) = (k % n_sub, k / n_sub);
+                let f0 = f[cy.rows[n * n_sub]];
+                if f[r] != f0 {
+                    return Err(format!(
+                        "FlipAngle of row {r} (cycle {}, {}) is {} degrees, but {f0} for sub-bolus 1 of the same readout: \
+                         a readout's decoded volumes share its excitation", c + 1, at(j, n), f[r]));
+                }
             }
         }
     }
@@ -1203,7 +1271,7 @@ fn hadamard_spec(
         Some(b) => (b, Source::Overlay),
         None => (true, Source::Default),
     };
-    Ok(Some(HadamardSpec { order, report_leakage, tau, spans, tau_tot, pld: pld_n, cycles }))
+    Ok(Some(HadamardSpec { order, report_leakage, tau, spans, tau_tot, pld: pld_n, cycles, readouts: m, plds }))
 }
 
 /// What [`look_locker_spec`] reads.
@@ -1216,7 +1284,7 @@ struct LlInputs<'a> {
     contrast: Contrast,
     ge: Option<&'a GeSpec>,
     is_3d: bool,
-    hadamard: bool,
+    hadamard: Option<&'a HadamardSpec>,
     compat: bool,
     suppression: Option<&'a SuppressionSpec>,
     m0_type: M0Type,
@@ -1245,7 +1313,6 @@ fn look_locker_spec(i: LlInputs) -> Result<Option<LookLockerSpec>, String> {
     }
     for (what, on) in [
         ("MRAcquisitionType 3D (Look-Locker is modeled for 2D EPI)", i.is_3d),
-        ("[hadamard]", i.hadamard),
         ("[compat] asldro = true", i.compat),
     ] {
         if on {
@@ -1274,7 +1341,24 @@ fn look_locker_spec(i: LlInputs) -> Result<Option<LookLockerSpec>, String> {
         return Err(format!("FlipAngle {fa} for row {r}: a Look-Locker excitation is in (0, 90] degrees"));
     }
     let mut cycles = Vec::new();
-    let mut v = 0;
+    // P7 part B: under [hadamard] the context lists decoded volumes, so the cycles are not runs of
+    // the arrays: each encoding cycle is represented by sub-bolus 1 of each readout (its row's
+    // time is the readout's, tau_tot + PLD_n), each m0scan row by its own cycle;
+    // hadamard_spec checked the readout structure
+    if let Some(h) = i.hadamard {
+        let mut v = 0;
+        while v < n {
+            if i.rows[v].kind == RowKind::M0scan {
+                cycles.push(LookLockerCycle { rows: vec![v], m0scan: true });
+                v += 1;
+            } else {
+                let cy = h.cycles.iter().find(|c| c.rows[0] == v).expect("hadamard_spec covers every deltam row");
+                cycles.push(LookLockerCycle { rows: (0..h.readouts).map(|nn| h.row(cy, 0, nn)).collect(), m0scan: false });
+                v += cy.rows.len();
+            }
+        }
+    }
+    let mut v = if i.hadamard.is_some() { n } else { 0 };
     while v < n {
         if i.rows[v].kind == RowKind::M0scan {
             cycles.push(LookLockerCycle { rows: vec![v], m0scan: true });
@@ -2572,13 +2656,23 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
         None
     };
 
+    // P7 part B: under Look-Locker the encoded preparations are read readouts_per_cycle times
+    let hadamard_ll = match (look_locker, overlay.and_then(|o| o.hadamard.as_ref())) {
+        (true, Some(_)) => match overlay.and_then(|o| o.look_locker.as_ref()).and_then(|l| l.readouts_per_cycle) {
+            Some(m) => Some((m, ll_flips.as_deref())),
+            None => return Err("[hadamard] with LookLocker: true needs [look_locker] readouts_per_cycle: the readouts \
+                                after each encoded preparation (the context lists the decoded volumes, so the cycles \
+                                cannot be read off the delays)".to_string()),
+        },
+        _ => None,
+    };
     let hadamard = hadamard_spec(
         overlay.and_then(|o| o.hadamard.as_ref()), label_type, &rows, &pld, suppression.as_ref(), crushing.as_ref(),
-        compat.is_some(),
+        compat.is_some(), hadamard_ll,
     )?;
     let look_locker = look_locker_spec(LlInputs {
         on: look_locker, overlay, rows: &rows, pld: &pld, flips: ll_flips, contrast, ge: ge.as_ref(), is_3d,
-        hadamard: hadamard.is_some(), compat: compat.is_some(), suppression: suppression.as_ref(),
+        hadamard: hadamard.as_ref(), compat: compat.is_some(), suppression: suppression.as_ref(),
         m0_type,
     })?;
 
@@ -4705,6 +4799,128 @@ mod tests {
         plain["VascularCrushingVENC"] = json!([0.0, 4.0, 0.0, 4.0]);
         let p = ok(&plain, &format!("{MACRO}{VEL}")).unwrap();
         assert!(Schedule::new(&p).raws.iter().all(|r| r.venc.is_none()));
+    }
+
+    /// A Look-Locker Hadamard-4 PCASL protocol: `cycles` encoding cycles of three 0.3 s sub-boli
+    /// read at `PLD_n` = 1.0, 1.3, 1.6 s, the context the decoded volumes readout-major; an m0scan
+    /// row before with `m0`.
+    fn ll_hadamard(cycles: usize, m0: bool) -> (Value, String) {
+        let (h, plds, tau) = (4, [1.0, 1.3, 1.6], 0.3);
+        let (mut ld, mut pld, mut ctx) = (Vec::new(), Vec::new(), String::from("volume_type\n"));
+        if m0 {
+            ld.push(0.0);
+            pld.push(0.0);
+            ctx.push_str("m0scan\n");
+        }
+        for _ in 0..cycles {
+            for p_n in plds {
+                for j in 0..h - 1 {
+                    ld.push(tau);
+                    pld.push(p_n + tau * (h - 2 - j) as f64);
+                    ctx.push_str("deltam\n");
+                }
+            }
+        }
+        let s = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": ld, "PostLabelingDelay": pld,
+            "BackgroundSuppression": false, "M0Type": if m0 { "Included" } else { "Absent" }, "RepetitionTimePreparation": 5.0,
+            "LookLocker": true, "EchoTime": 0.012, "FlipAngle": 35, "MagneticFieldStrength": 3,
+            "AcquisitionVoxelSize": [3.5, 3.5, 5], "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05, 0.10],
+            "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.016
+        });
+        (s, ctx)
+    }
+
+    const LLH: &str = "[hadamard]\norder = 4\n[look_locker]\nreadouts_per_cycle = 3\n";
+
+    /// P7 part B: the Look-Locker Hadamard context, its refusals, and its schedule.
+    #[test]
+    fn look_locker_hadamard_protocols() {
+        use crate::schedule::{Output, Schedule};
+        let ok = |s: &Value, ctx: &str, ov: &str| parse(s, ctx, Some(&overlay(&format!("{GE}{ov}"))), None);
+        let (s, ctx) = ll_hadamard(2, true);
+        let p = ok(&s, &ctx, LLH).unwrap();
+        let h = p.hadamard.as_ref().unwrap();
+        assert_eq!((h.readouts, h.plds.clone(), h.pld, h.cycles.len()), (3, vec![1.0, 1.3, 1.6], 1.0, 2));
+        assert_eq!(h.cycles[0].rows, (1..10).collect::<Vec<_>>());
+        assert_eq!(h.row(&h.cycles[1], 2, 1), 10 + 3 + 2);
+        // the delays decrease within a readout's block, so the run rule would have split every row;
+        // the Look-Locker cycles come from the encoding: sub-bolus 1 of each readout
+        let ll = p.look_locker.as_ref().unwrap();
+        assert_eq!(ll.cycles.iter().map(|c| (c.rows.clone(), c.m0scan)).collect::<Vec<_>>(),
+                   vec![(vec![0], true), (vec![1, 4, 7], false), (vec![10, 13, 16], false)]);
+        assert!(ll.cycles[1].rows.iter().map(|&r| p.rows[r].t).collect::<Vec<_>>()
+            .iter().zip([1.9, 2.2, 2.5]).all(|(a, b)| (a - b).abs() < 1e-12));
+
+        // the schedule: per encoding row one preparation and three raw volumes, outputs readout-major
+        let sch = Schedule::new(&p);
+        assert_eq!((sch.preps.len(), sch.raws.len(), sch.outputs.len()), (1 + 2 * 4, 1 + 2 * 4 * 3, 1 + 2 * 9));
+        for e in 0..4 {
+            for n in 0..3 {
+                let r = &sch.raws[1 + e * 3 + n];
+                assert_eq!((r.prep, r.readout, r.encoding_row, r.cycle), (1 + e, n, Some(e), Some(0)));
+                assert!((sch.raw_rows[1 + e * 3 + n].t - (0.9 + [1.0, 1.3, 1.6][n])).abs() < 1e-12);
+            }
+            assert_eq!(sch.preps[1 + e].raw, 1 + e * 3);
+        }
+        assert_eq!(sch.outputs[1..10].to_vec(), (0..3).flat_map(|n| (0..3).map(move |j| Output::Decoded { cycle: 0, subbolus: j, readout: n }))
+            .collect::<Vec<_>>());
+        assert_eq!(sch.cycles[1].raws, 13..25);
+        assert!((sch.preps[1 + 4].start_s - (5.0 + 4.0 * 5.0)).abs() < 1e-12, "{}", sch.preps[5].start_s);
+
+        // refusals
+        let err = |s: &Value, ctx: &str, ov: &str| ok(s, ctx, ov).unwrap_err();
+        let (s1, ctx1) = ll_hadamard(1, false);
+        assert!(err(&s1, &ctx1, "[hadamard]\norder = 4\n").contains("readouts_per_cycle"));
+        assert!(err(&s1, &ctx1, "[hadamard]\norder = 4\n[look_locker]\nreadouts_per_cycle = 2\n").contains("9 deltam rows"));
+        let lab = ctx1.replacen("deltam", "label", 1);
+        assert!(err(&s1, &lab, LLH).contains("is label"));
+        let mut d = s1.clone();
+        d["PostLabelingDelay"][4] = json!(1.55);
+        let e = err(&d, &ctx1, LLH);
+        assert!(e.contains("sub-bolus 2, readout 2"), "{e}");
+        // readout 2 earlier than readout 1
+        let mut dec = s1.clone();
+        for j in 0..3 {
+            dec["PostLabelingDelay"][3 + j] = json!(0.9 + 0.3 * (2 - j) as f64);
+        }
+        assert!(err(&dec, &ctx1, LLH).contains("strictly increase"));
+        let mut fl = s1.clone();
+        fl["FlipAngle"] = json!([35, 35, 35, 30, 35, 35, 25, 25, 25]);
+        let e = err(&fl, &ctx1, LLH);
+        assert!(e.contains("FlipAngle") && e.contains("sub-bolus 2, readout 2"), "{e}");
+        let mut flok = s1.clone();
+        flok["FlipAngle"] = json!([35, 35, 35, 30, 30, 30, 25, 25, 25]);
+        ok(&flok, &ctx1, LLH).unwrap();
+        // crushing: one VENC per readout, the same for its sub-boli
+        let crush = format!("{LLH}{MACRO}{VEL}");
+        let mut cr = s1.clone();
+        cr["VascularCrushing"] = json!(true);
+        cr["VascularCrushingVENC"] = json!([0, 0, 0, 4, 4, 4, 0, 0, 0]);
+        let pc = ok(&cr, &ctx1, &crush).unwrap();
+        let sc = Schedule::new(&pc);
+        assert_eq!(sc.raws[..3].iter().map(|r| r.venc_with(&sc.preps)).collect::<Vec<_>>(), vec![Some(0.0), Some(4.0), Some(0.0)]);
+        let mut crb = cr.clone();
+        crb["VascularCrushingVENC"] = json!([0, 0, 0, 4, 0, 4, 0, 0, 0]);
+        assert!(err(&crb, &ctx1, &crush).contains("VascularCrushingVENC of row 4"));
+        // without Look-Locker P6's rule stands: three P6 cycles (their own effective delays), a VENC
+        // that varies within one is refused, one per cycle is accepted
+        let mut plain = cr.clone();
+        plain.as_object_mut().unwrap().remove("LookLocker");
+        plain["PostLabelingDelay"] = json!([1.6, 1.3, 1.0, 1.6, 1.3, 1.0, 1.6, 1.3, 1.0]);
+        let ov_plain = overlay(&format!("{GE}[hadamard]\norder = 4\n{MACRO}{VEL}"));
+        parse(&plain, &ctx1, Some(&ov_plain), None).unwrap();
+        plain["VascularCrushingVENC"] = json!([0, 4, 0, 0, 4, 0, 0, 4, 0]);
+        let e = parse(&plain, &ctx1, Some(&ov_plain), None).unwrap_err();
+        assert!(e.contains("one VENC per cycle"), "{e}");
+        // suppression: one set per cycle, its pulses before the first readout (1.9 s)
+        let mut bs = s1.clone();
+        bs["BackgroundSuppression"] = json!(true);
+        bs["BackgroundSuppressionNumberPulses"] = json!(1);
+        bs["BackgroundSuppressionPulseTime"] = json!([1.5]);
+        ok(&bs, &ctx1, LLH).unwrap();
+        bs["BackgroundSuppressionPulseTime"] = json!([2.0]);
+        assert!(err(&bs, &ctx1, LLH).contains("at or after the readout"));
     }
 
     #[test]

@@ -1072,7 +1072,10 @@ mod writer {
             "Cycles": h.cycles.iter().map(|c| c.rows.clone()).collect::<Vec<_>>(),
             "Outputs": sched.outputs.iter().map(|o| match *o {
                 crate::schedule::Output::Raw(r) => json!({ "RawVolume": r }),
-                crate::schedule::Output::Decoded { cycle, subbolus } => json!({ "Cycle": cycle + 1, "SubBolus": subbolus + 1 }),
+                crate::schedule::Output::Decoded { cycle, subbolus, readout } if h.readouts > 1 => {
+                    json!({ "Cycle": cycle + 1, "SubBolus": subbolus + 1, "Readout": readout + 1 })
+                }
+                crate::schedule::Output::Decoded { cycle, subbolus, .. } => json!({ "Cycle": cycle + 1, "SubBolus": subbolus + 1 }),
             }).collect::<Vec<_>>(),
             "RawVolumes": sched.raws.iter().map(|r| json!({
                 "Cycle": r.cycle.map(|c| c + 1), "EncodingRow": r.encoding_row,

@@ -88,7 +88,7 @@ fn decode_series(sched: &Schedule, order: usize, mag: &[f32], phase: &[f32], n_r
                     op[x * n_out + k] = phase[x * n_raw + r];
                 }
             }
-            Output::Decoded { cycle, subbolus } => {
+            Output::Decoded { cycle, subbolus, .. } => {
                 for (x, &(re, im)) in decoded[cycle][subbolus].iter().enumerate() {
                     om[x * n_out + k] = re.hypot(im) as f32;
                     op[x * n_out + k] = im.atan2(re) as f32;
@@ -115,7 +115,7 @@ fn decoded_truth(
     let mut sup = bolus_region.map(|_| vec![0.0f32; slab * nz * n_out]);
     let mut art = p4.abv.as_ref().map(|_| vec![0.0f32; slab * nz * n_out]);
     for (k, o) in sched.outputs.iter().enumerate() {
-        let Output::Decoded { cycle, subbolus } = *o else { continue };
+        let Output::Decoded { cycle, subbolus, .. } = *o else { continue };
         let r0 = sched.cycles[cycle].raws.start;
         let row = &sched.raw_rows[r0];
         let kin = p.kinetic(row);
@@ -1187,6 +1187,9 @@ pub(super) fn simulate_p6(
 ) -> Result<SeriesOutput, String> {
     let tes = p.echo_times_s.clone();
     let sched = Schedule::new(p);
+    if p.hadamard.as_ref().is_some_and(|h| h.readouts > 1) {
+        return Err("[hadamard] with Look-Locker readouts: the series is not implemented yet (P7 plan, Task 8)".to_string());
+    }
     // P6 part C, compat: the echo-time decay is the signal stage's, so each echo has its own image
     // set, bounded before any is built: the grids and the compartment count resolved alone
     if p.compat.is_some() && tes.len() > 1 {

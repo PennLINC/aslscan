@@ -69,8 +69,9 @@ impl RawVolume {
 pub enum Output {
     /// A raw volume, written as acquired.
     Raw(usize),
-    /// Sub-bolus `subbolus` of Hadamard cycle `cycle`, decoded.
-    Decoded { cycle: usize, subbolus: usize },
+    /// Sub-bolus `subbolus` of Hadamard cycle `cycle`, decoded; at Look-Locker readout `readout`
+    /// (P7 part B; 0 without Look-Locker).
+    Decoded { cycle: usize, subbolus: usize, readout: usize },
 }
 
 /// A Hadamard or Look-Locker cycle: a run of raw volumes that belong together.
@@ -142,13 +143,29 @@ impl Schedule {
     /// per raw volume. The outputs follow the input rows: an `m0scan` row is its raw volume, a
     /// `deltam` row its cycle's decoded sub-bolus. Pulse sets and VENC are the cycle's (the
     /// protocol checked they are one per cycle), taken from its first row.
+    ///
+    /// Under Look-Locker (P7 addendum, part B) each encoding row's preparations are read `M` times:
+    /// `M` raw volumes share them (readout `n` at `t = tau_tot + PLD_n`, each with its own VENC),
+    /// so a cycle is `H M` raw volumes, encoding-row-major; its decoded outputs are readout-major,
+    /// as the rows are.
     pub fn hadamard(p: &Protocol, h: &crate::protocol::HadamardSpec) -> Schedule {
         let shots = p.readout.as_ref().map_or(1, |r| r.number_shots.0);
         let mut sched = Schedule { raw_rows: Vec::new(), preps: Vec::new(), raws: Vec::new(), outputs: Vec::new(), cycles: Vec::new() };
         let mut clock = 0.0;
-        let mut push_raw = |sched: &mut Schedule, row: Row, source_row: usize, labeled: bool, cycle: Option<usize>, enc: Option<usize>| {
+        let m = h.readouts;
+        // one encoding row's preparations and its raw volumes: `readouts` rows read after the same
+        // preparations (one row without Look-Locker), each with its source row's VENC under
+        // Look-Locker
+        let mut push_raw = |sched: &mut Schedule, readouts: &[(Row, usize)], source_row: usize, labeled: bool,
+                            cycle: Option<usize>, enc: Option<usize>| {
             let r = sched.raws.len();
-            sched.raws.push(RawVolume { prep: sched.preps.len(), n_preps: shots, readout: 0, cycle, encoding_row: enc, venc: None });
+            let prep = sched.preps.len();
+            for (n, (row, vrow)) in readouts.iter().enumerate() {
+                let venc = if m > 1 { p.crushing.as_ref().map(|c| c.venc[*vrow]) } else { None };
+                sched.raws.push(RawVolume { prep, n_preps: shots, readout: n, cycle, encoding_row: enc, venc });
+                sched.raw_rows.push(row.clone());
+            }
+            let row = &readouts[0].0;
             for s in 0..shots {
                 let start = clock + s as f64 * row.tr;
                 sched.preps.push(Preparation {
@@ -161,7 +178,6 @@ impl Schedule {
                 });
             }
             clock += shots as f64 * row.tr;
-            sched.raw_rows.push(row);
             r
         };
         let mut v = 0;
@@ -170,18 +186,22 @@ impl Schedule {
                 let cy = &h.cycles[c];
                 let tr = p.rows[v].tr;
                 let first = sched.raws.len();
+                let readouts: Vec<(Row, usize)> = (0..m)
+                    .map(|n| (Row { kind: RowKind::Label, t: h.tau_tot + h.plds[n], tau: h.tau_tot, tr }, h.row(cy, 0, n)))
+                    .collect();
                 for e in 0..h.order {
-                    let row = Row { kind: RowKind::Label, t: h.tau_tot + h.pld, tau: h.tau_tot, tr };
-                    push_raw(&mut sched, row, v, true, Some(c), Some(e));
+                    push_raw(&mut sched, &readouts, v, true, Some(c), Some(e));
                 }
-                sched.cycles.push(Cycle { raws: first..first + h.order, rows: cy.rows.clone() });
-                for j in 0..cy.rows.len() {
-                    sched.outputs.push(Output::Decoded { cycle: c, subbolus: j });
+                sched.cycles.push(Cycle { raws: first..first + h.order * m, rows: cy.rows.clone() });
+                for n in 0..m {
+                    for j in 0..h.order - 1 {
+                        sched.outputs.push(Output::Decoded { cycle: c, subbolus: j, readout: n });
+                    }
                 }
                 v += cy.rows.len();
             } else {
                 // an m0scan row (the protocol allows nothing else outside a cycle)
-                let r = push_raw(&mut sched, p.rows[v].clone(), v, false, None, None);
+                let r = push_raw(&mut sched, &[(p.rows[v].clone(), v)], v, false, None, None);
                 sched.outputs.push(Output::Raw(r));
                 v += 1;
             }
@@ -280,8 +300,8 @@ mod tests {
             assert_eq!(s.cycles.iter().map(|c| c.raws.clone()).collect::<Vec<_>>(), vec![1..9, 9..17]);
             assert_eq!(s.cycles[1].rows, (8..15).collect::<Vec<_>>());
             assert_eq!(s.outputs[0], Output::Raw(0));
-            assert_eq!(s.outputs[1], Output::Decoded { cycle: 0, subbolus: 0 });
-            assert_eq!(s.outputs[14], Output::Decoded { cycle: 1, subbolus: 6 });
+            assert_eq!(s.outputs[1], Output::Decoded { cycle: 0, subbolus: 0, readout: 0 });
+            assert_eq!(s.outputs[14], Output::Decoded { cycle: 1, subbolus: 6, readout: 0 });
             assert_eq!((s.raws[0].cycle, s.raws[0].encoding_row, s.raw_rows[0].kind), (None, None, RowKind::M0scan));
             let mut clock = 0.0;
             for (r, raw) in s.raws.iter().enumerate() {
