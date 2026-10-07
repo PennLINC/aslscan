@@ -16,8 +16,8 @@ use std::path::Path;
 use mrsim_acq::kspace::{Acquisition, EchoFormation, KspaceWindow, PartialFourierMode};
 use mrsim_acq::motion::{load_motion_tsv, MotionMode};
 use mrsim_acq::readout::{
-    centre_echo, check_grase_timing, check_spiral_timing, esp_from_echo_time, grase_block, grase_lines, spiral_esp_from_echo_time,
-    spiral_lines, EchoTrain, KzOrder, Readout3d,
+    centre_echo, check_ge3d_timing, check_grase_timing, check_spiral_timing, esp_from_echo_time, ge3d_lines, grase_block,
+    grase_lines, spiral_esp_from_echo_time, spiral_lines, EchoTrain, ExcitationTrain, Ge3dReadout, KzOrder, Readout3d,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -140,6 +140,15 @@ pub struct Overlay {
     pub multi_te: Option<MultiTeOverlay>,
     pub hadamard: Option<HadamardOverlay>,
     pub look_locker: Option<LookLockerOverlay>,
+    pub images: Option<ImagesOverlay>,
+}
+
+/// `[images]` (P7 addendum, part C): the bound on the compartment images in memory at once.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImagesOverlay {
+    /// GiB; default 4. `[multi_te] max_image_memory_gib` is its older name (compat multi-TE).
+    pub max_memory_gib: Option<f64>,
 }
 
 /// `[look_locker]` (P6 addendum, part B): read only with `LookLocker: true`.
@@ -204,6 +213,17 @@ pub struct ReadoutOverlay {
     /// How much denser than the Nyquist spacing a spiral's turns are (at least 1; default
     /// [`DEFAULT_RADIAL_OVERSAMPLING`]).
     pub radial_oversampling: Option<f64>,
+    /// `"epi3d"` (P7 part C): the excitation spacing within a train (ms), required.
+    pub excitation_spacing: Option<f64>,
+    /// `"epi3d"`: the excitation pulse reserved about each excitation (ms, default 2).
+    pub excitation_time: Option<f64>,
+    /// `"epi3d"`: seconds from labeling to the label's entry into the slab, or `"arrival"` (P7
+    /// part C, depletion from slab entry); otherwise bolus-position's.
+    pub slab_entry_time: Option<SlabEntry>,
+    /// `"epi3d"`: the tissue compartments' distinct-T1 groups allowed (default 16).
+    pub max_t1_groups: Option<usize>,
+    /// `"epi3d"`: the blood interpolation's tolerance, relative to its peak (default 1e-4).
+    pub node_tolerance: Option<f64>,
 }
 
 /// `[macrovascular]` (P4, part B): per-label values keyed by `dseg.json` names.
@@ -487,6 +507,8 @@ pub struct IrSpec {
 pub enum ReadoutKind {
     Grase,
     Spiral,
+    /// The 3D gradient-echo stack-of-EPI train (P7 addendum, part C).
+    Epi3d,
 }
 
 impl ReadoutKind {
@@ -494,6 +516,7 @@ impl ReadoutKind {
         match self {
             ReadoutKind::Grase => "grase",
             ReadoutKind::Spiral => "spiral",
+            ReadoutKind::Epi3d => "epi3d",
         }
     }
 }
@@ -523,6 +546,30 @@ pub struct ReadoutSpec {
     pub interleaves: Option<(usize, Source)>,
     pub spiral_readout_ms: Option<(f64, Source)>,
     pub radial_oversampling: Option<(f64, Source)>,
+    /// P7 part C, `"epi3d"` only: the excitation spacing and pulse (ms), the slab entry (from
+    /// `[readout]` or bolus-position's), the tissue groups allowed and the interpolation tolerance.
+    pub ge3d: Option<Ge3dSpec>,
+}
+
+/// Where the label enters the slab (P7 addendum, part C): `d` seconds after its labeling, or at its
+/// arrival in the voxel (no depletion before it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SlabEntryTime {
+    Seconds(f64),
+    Arrival,
+}
+
+/// The `"epi3d"` readout's own inputs (P7 addendum, part C, "Inputs").
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ge3dSpec {
+    pub excitation_spacing_ms: f64,
+    pub excitation_time_ms: (f64, Source),
+    /// The slab entry and where it came from (`[readout]` or `[background_suppression]`).
+    pub slab_entry: (SlabEntryTime, &'static str),
+    pub max_t1_groups: (usize, Source),
+    pub node_tolerance: (f64, Source),
+    /// The bound on the images in memory at once (GiB): `[images] max_memory_gib`, default 4.
+    pub max_memory_gib: (f64, Source),
 }
 
 /// The readout completed with the acquisition grid (P5 plan, Task 7): the echo train, the line
@@ -1718,10 +1765,14 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
             ReadoutKind::Grase
         } else if lower.contains("spiral") {
             ReadoutKind::Spiral
+        } else if lower.contains("epi") {
+            // P7 part C: the gradient-echo stack-of-EPI train ("epi3d", "3D EPI")
+            ReadoutKind::Epi3d
         } else {
             return Err(format!(
-                "3D readout {name:?} (PulseSequenceType, or [readout] type): the 3D readouts are GRASE (\"grase\") \
-                 and the stack of spirals (\"spiral\"); [readout] type selects one"));
+                "3D readout {name:?} (PulseSequenceType, or [readout] type): the 3D readouts are GRASE (\"grase\"), \
+                 the stack of spirals (\"spiral\") and the gradient-echo stack of EPI (\"epi3d\"); [readout] type \
+                 selects one"));
         };
         Some((kind, src))
     } else {
@@ -1733,8 +1784,8 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     let ped = match readout_kind.map(|k| k.0) {
         None => string(sidecar, "PhaseEncodingDirection")?,
         // GRASE: required (it sets the traversal and the distortion direction), overlay first
-        Some(ReadoutKind::Grase) => ro_ped.or(side_ped).ok_or(
-            "a GRASE readout needs a phase-encode direction (it sets the traversal and the distortion direction): \
+        Some(ReadoutKind::Grase | ReadoutKind::Epi3d) => ro_ped.or(side_ped).ok_or(
+            "a GRASE or 3D EPI readout needs a phase-encode direction (it sets the traversal and the distortion direction): \
              the sidecar has no PhaseEncodingDirection; give [readout] phase_encoding_direction = \"j\" or \"j-\""
                 .to_string())?,
         Some(ReadoutKind::Spiral) => {
@@ -1759,9 +1810,11 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
         }
     };
     let echo_times_s = if multi_echo {
-        if is_3d {
-            return Err("multi-TE (one --asl-json per echo) with MRAcquisitionType 3D: multi-echo 3D trains are \
-                        deferred (P6 addendum)".to_string());
+        // P7 part C: a 3D gradient-echo train reads several echoes per excitation
+        if is_3d && readout_kind.is_none_or(|k| k.0 != ReadoutKind::Epi3d) {
+            return Err("multi-TE (one --asl-json per echo) with a 3D GRASE or spiral readout: multi-echo spin-echo \
+                        trains are deferred (P7 addendum); the 3D gradient-echo train (\"epi3d\") reads several echoes"
+                .to_string());
         }
         echo_times_of(sidecars)?
     } else {
@@ -1779,7 +1832,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     // BIDS"), optional; spirals have no phase-encode readout, so it is refused there.
     let total_readout_time_s = match readout_kind.map(|k| k.0) {
         None => require_finite_positive(num(sidecar, "TotalReadoutTime")?, "asl.json: TotalReadoutTime")?,
-        Some(ReadoutKind::Grase) => match opt_num(sidecar, "TotalReadoutTime")? {
+        Some(ReadoutKind::Grase | ReadoutKind::Epi3d) => match opt_num(sidecar, "TotalReadoutTime")? {
             Some(v) => require_finite_positive(v, "asl.json: TotalReadoutTime")?,
             None => 0.0,
         },
@@ -1903,18 +1956,28 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     // The 3D readouts are spin-echo trains (P5 part B): a 3D gradient-echo readout and 3D inversion
     // recovery are deferred, and the sidecar's FlipAngle is the refocusing angle there (read below),
     // not an excitation the spin-echo rule would hold to 90.
-    if is_3d {
+    let epi3d = readout_kind.is_some_and(|k| k.0 == ReadoutKind::Epi3d);
+    if epi3d {
+        // P7 part C: the 3D EPI train is a gradient-echo readout
+        if contrast != Contrast::GradientEcho {
+            return Err(format!(
+                "[readout] type \"epi3d\" (a 3D gradient-echo train) needs [signal] acq_contrast = \"ge\", not {:?}; \
+                 the 3D spin-echo readouts are \"grase\" and \"spiral\"", contrast.as_str()));
+        }
+    } else if is_3d {
         match contrast {
             Contrast::SpinEcho => {}
             Contrast::GradientEcho => return Err(
-                "acq_contrast \"ge\" with MRAcquisitionType \"3D\": 3D gradient-echo readouts (segmented 3D EPI, \
-                 3D GRE) are deferred; the 3D readouts are spin-echo trains".to_string()),
+                "acq_contrast \"ge\" with MRAcquisitionType \"3D\" and a GRASE or spiral readout: the 3D gradient-echo \
+                 readout is [readout] type = \"epi3d\" (P7)".to_string()),
             Contrast::InversionRecovery => return Err(
                 "acq_contrast \"ir\" with MRAcquisitionType \"3D\": inversion recovery composed with an echo train \
                  is deferred".to_string()),
         }
     }
-    let side_fa_excitation = if is_3d { None } else { side_fa };
+    // under GRASE and spiral the sidecar's FlipAngle is the refocusing angle; under "epi3d" the
+    // excitation (P7 part C)
+    let side_fa_excitation = if is_3d && !epi3d { None } else { side_fa };
     let (ir, ge) = match contrast {
         Contrast::SpinEcho => {
             for (what, fa) in [("asl.json: FlipAngle", side_fa_excitation), ("overlay: signal.excitation_flip_angle", so.and_then(|s| s.excitation_flip_angle))] {
@@ -2006,11 +2069,22 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
             let spiral_only = [("interleaves", r.interleaves.is_some()),
                                ("spiral_readout_time", r.spiral_readout_time.is_some()), ("dwell_time", r.dwell_time.is_some()),
                                ("radial_oversampling", r.radial_oversampling.is_some())];
-            let (wrong, other) = match kind {
-                ReadoutKind::Grase => (&spiral_only[..], "spiral"),
-                ReadoutKind::Spiral => (&grase_only[..], "GRASE"),
+            // P7 part C: the spin-echo train's keys and the 3D EPI train's
+            let echo_train_only = [("echo_spacing", r.echo_spacing.is_some()), ("refocusing_time", r.refocusing_time.is_some()),
+                                   ("refocusing_flip_angle", r.refocusing_flip_angle.is_some())];
+            let epi3d_only = [("excitation_spacing", r.excitation_spacing.is_some()),
+                              ("excitation_time", r.excitation_time.is_some()),
+                              ("slab_entry_time", r.slab_entry_time.is_some()), ("max_t1_groups", r.max_t1_groups.is_some()),
+                              ("node_tolerance", r.node_tolerance.is_some())];
+            let wrong: Vec<(&str, bool, &str)> = match kind {
+                ReadoutKind::Grase => spiral_only.iter().map(|&(k, on)| (k, on, "spiral"))
+                    .chain(epi3d_only.iter().map(|&(k, on)| (k, on, "3D EPI"))).collect(),
+                ReadoutKind::Spiral => grase_only.iter().map(|&(k, on)| (k, on, "GRASE"))
+                    .chain(epi3d_only.iter().map(|&(k, on)| (k, on, "3D EPI"))).collect(),
+                ReadoutKind::Epi3d => spiral_only.iter().map(|&(k, on)| (k, on, "spiral"))
+                    .chain(echo_train_only.iter().map(|&(k, on)| (k, on, "spin-echo train"))).collect(),
             };
-            if let Some((key, _)) = wrong.iter().find(|(_, on)| *on) {
+            if let Some((key, _, other)) = wrong.iter().find(|(_, on, _)| *on) {
                 return Err(format!("overlay: readout.{key} is a {other} key; the readout is {}", kind.as_str()));
             }
             if let Some(v) = opt_num(sidecar, "ParallelReductionFactorOutOfPlane")? {
@@ -2044,7 +2118,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
             // the dwell time is the overlay's, else the sidecar's DwellTime
             let side_dwell = pos(opt_num(sidecar, "DwellTime")?, "asl.json: DwellTime")?;
             let (interleaves, spiral_readout_ms, dwell_time_s) = match kind {
-                ReadoutKind::Grase => (None, None, side_dwell.map(|d| (d, Source::Sidecar))),
+                ReadoutKind::Grase | ReadoutKind::Epi3d => (None, None, side_dwell.map(|d| (d, Source::Sidecar))),
                 ReadoutKind::Spiral => {
                     let il = match r.interleaves {
                         Some(0) => return Err("overlay: readout.interleaves must be at least 1".to_string()),
@@ -2067,7 +2141,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
             // the spiral's radial margin over Nyquist (P5 part C, amended): at exactly Nyquist some
             // image directions are not recoverable
             let radial_oversampling = match (kind, r.radial_oversampling) {
-                (ReadoutKind::Grase, _) => None,
+                (ReadoutKind::Grase | ReadoutKind::Epi3d, _) => None,
                 (ReadoutKind::Spiral, Some(v)) if v.is_finite() && v >= 1.0 => Some((v, Source::Overlay)),
                 (ReadoutKind::Spiral, Some(v)) => {
                     return Err(format!("overlay: readout.radial_oversampling {v} must be at least 1"))
@@ -2098,7 +2172,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
                 None => return Err(format!(
                     "NumberShots {} does not divide into {} kz segments", number_shots.0, kz_segments.0)),
             };
-            if kind == ReadoutKind::Grase && ky_segments.0 * kz_segments.0 != number_shots.0 {
+            if kind != ReadoutKind::Spiral && ky_segments.0 * kz_segments.0 != number_shots.0 {
                 return Err(format!(
                     "[readout] ky_segments {} x kz_segments {} = {} shots, but NumberShots is {}",
                     ky_segments.0, kz_segments.0, ky_segments.0 * kz_segments.0, number_shots.0));
@@ -2118,7 +2192,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
                 (None, Some(v)) => (v, Source::Sidecar),
                 (None, None) => (180.0, Source::Default),
             };
-            if !(refocusing_flip_deg.0 > 0.0 && refocusing_flip_deg.0 <= 180.0) {
+            if kind != ReadoutKind::Epi3d && !(refocusing_flip_deg.0 > 0.0 && refocusing_flip_deg.0 <= 180.0) {
                 return Err(format!(
                     "refocusing flip angle {} (the sidecar's FlipAngle is read as the refocusing angle of a 3D echo \
                      train; [readout] refocusing_flip_angle overrides it) must be in (0, 180]", refocusing_flip_deg.0));
@@ -2144,6 +2218,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
                 interleaves,
                 spiral_readout_ms,
                 radial_oversampling,
+                ge3d: None,
             })
         }
     };
@@ -2698,11 +2773,96 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
                             asldro = true every echo shares one image set".to_string())
             }
             (false, None) => None,
+            (true, Some(_)) if overlay.and_then(|o| o.images.as_ref()).and_then(|i| i.max_memory_gib).is_some() => {
+                return Err("overlay: [images] max_memory_gib and [multi_te] max_image_memory_gib are the same bound \
+                            (the second its older name): give one".to_string())
+            }
             (true, Some(v)) => Some((require_finite_positive(v, "overlay multi_te.max_image_memory_gib")?, Source::Overlay)),
-            (true, None) => Some((4.0, Source::Default)),
+            // P7: [images] max_memory_gib is the newer name of the same bound
+            (true, None) => match overlay.and_then(|o| o.images.as_ref()).and_then(|i| i.max_memory_gib) {
+                Some(v) => Some((require_finite_positive(v, "overlay images.max_memory_gib")?, Source::Overlay)),
+                None => Some((4.0, Source::Default)),
+            },
         };
         Some(MultiTeSpec { sidecars: sidecars.to_vec(), refocusing_time_ms, max_image_memory_gib })
     };
+
+    // P7 part C: the 3D EPI train's own inputs; its slab entry from [readout] or bolus-position's
+    let images_gib = overlay.and_then(|o| o.images.as_ref()).and_then(|i| i.max_memory_gib)
+        .map(|v| require_finite_positive(v, "overlay images.max_memory_gib")).transpose()?;
+    let mut readout = readout;
+    if let Some(r) = readout.as_mut().filter(|r| r.kind.0 == ReadoutKind::Epi3d) {
+        let empty = ReadoutOverlay::default();
+        let ro = overlay.and_then(|o| o.readout.as_ref()).unwrap_or(&empty);
+        let excitation_spacing_ms = match ro.excitation_spacing {
+            Some(v) => require_finite_positive(v, "overlay readout.excitation_spacing")?,
+            None => return Err("[readout] type \"epi3d\" needs excitation_spacing (ms between the train's excitations; \
+                                no default: it sets every excitation's longitudinal state)".to_string()),
+        };
+        let excitation_time_ms = match ro.excitation_time {
+            Some(v) => (require_finite_positive(v, "overlay readout.excitation_time")?, Source::Overlay),
+            None => (2.0, Source::Default),
+        };
+        let from_bolus = match suppression.as_ref().map(|s| s.model) {
+            Some(SuppressionModel::BolusPosition(Region::Slab(d))) => Some(SlabEntryTime::Seconds(d)),
+            Some(SuppressionModel::BolusPosition(Region::Arrival)) => Some(SlabEntryTime::Arrival),
+            _ => None,
+        };
+        let from_readout = match &ro.slab_entry_time {
+            None => None,
+            Some(SlabEntry::Seconds(d)) => Some(SlabEntryTime::Seconds(require_finite_nonneg(*d, "overlay readout.slab_entry_time")?)),
+            Some(SlabEntry::Word(w)) if w == "arrival" => Some(SlabEntryTime::Arrival),
+            Some(SlabEntry::Word(w)) => return Err(format!(
+                "overlay: readout.slab_entry_time {w:?}: expected seconds or \"arrival\"")),
+        };
+        let slab_entry = match (from_readout, from_bolus) {
+            (Some(_), Some(_)) => return Err(
+                "overlay: readout.slab_entry_time and background_suppression.slab_entry_time both give the slab \
+                 entry: one source (P4's rule)".to_string()),
+            (Some(e), None) => (e, "overlay readout.slab_entry_time"),
+            (None, Some(e)) => (e, "overlay background_suppression.slab_entry_time"),
+            (None, None) => return Err(
+                "[readout] type \"epi3d\" needs the label's slab entry: a 3D excitation covers the slab and depletes \
+                 the label in its arteries (P7 part C); give [readout] slab_entry_time (seconds after labeling, or \
+                 \"arrival\" for no depletion before the voxel)".to_string()),
+        };
+        let max_t1_groups = match ro.max_t1_groups {
+            Some(0) => return Err("overlay: readout.max_t1_groups must be at least 1".to_string()),
+            Some(v) => (v, Source::Overlay),
+            None => (16, Source::Default),
+        };
+        let node_tolerance = match ro.node_tolerance {
+            Some(v) if v.is_finite() && v > 0.0 && v < 1.0 => (v, Source::Overlay),
+            Some(v) => return Err(format!("overlay: readout.node_tolerance {v} must be in (0, 1)")),
+            None => (1e-4, Source::Default),
+        };
+        if compat.is_some() {
+            return Err("[readout] type \"epi3d\" under [compat] asldro = true: simasl has no 3D gradient-echo train"
+                .to_string());
+        }
+        if acq.partial_fourier != 1.0 {
+            return Err("overlay: acquisition.partial_fourier with [readout] type \"epi3d\": partial Fourier is not \
+                        available on the 3D gradient-echo train".to_string());
+        }
+        if ge.as_ref().is_some_and(|g| g.flip == Source::Default) {
+            return Err("[readout] type \"epi3d\" requires FlipAngle (the excitation of every partition); without it \
+                        the gradient-echo default of 90 degrees would saturate the train".to_string());
+        }
+        if let Some(g) = ge.as_ref().filter(|g| !(g.flip_deg > 0.0 && g.flip_deg <= 90.0)) {
+            return Err(format!(
+                "FlipAngle {} with [readout] type \"epi3d\": the train's excitations are in (0, 90] degrees (under \
+                 \"epi3d\" FlipAngle is the excitation, not a GRASE refocusing angle)", g.flip_deg));
+        }
+        let max_memory_gib = match images_gib {
+            Some(v) => (v, Source::Overlay),
+            None => (4.0, Source::Default),
+        };
+        r.ge3d = Some(Ge3dSpec { excitation_spacing_ms, excitation_time_ms, slab_entry, max_t1_groups, node_tolerance,
+                                 max_memory_gib });
+    } else if images_gib.is_some() && !(multi_te.is_some() && compat.is_some()) {
+        return Err("overlay: [images] max_memory_gib bounds the images of a 3D gradient-echo series ([readout] type \
+                    \"epi3d\") or of compat's multi-TE echoes; this protocol has neither".to_string());
+    }
 
     Ok(Protocol {
         echo_times_s, multi_te, hadamard, look_locker,
@@ -2769,7 +2929,12 @@ impl Protocol {
     /// echo). Decided once, here: false sends the series down today's code unchanged (the legacy
     /// dispatch). Each P6 part adds its condition as it is parsed.
     pub fn p6_active(&self) -> bool {
-        self.echo_times_s.len() > 1 || self.hadamard.is_some() || self.look_locker.is_some()
+        self.echo_times_s.len() > 1 || self.hadamard.is_some() || self.look_locker.is_some() || self.ge3d().is_some()
+    }
+
+    /// The 3D gradient-echo train's inputs, when the readout is one (P7 part C).
+    pub fn ge3d(&self) -> Option<&Ge3dSpec> {
+        self.readout.as_ref().and_then(|r| r.ge3d.as_ref())
     }
 
     /// The kinetic constants for `row`.
@@ -2937,6 +3102,86 @@ pub fn check_excitation_timing(p: &Protocol, acq_dims: [usize; 3]) -> Result<(),
 /// echo spacing from `EchoTime` read as the k-space-centre time, and every timing check on the
 /// actual RF and sampling intervals, for every row and for the separate M0. `None` for 2D.
 /// `series` calls it after computing the grid and the CLI before writing anything.
+/// The 3D gradient-echo train completed with the acquisition grid (P7 addendum, part C).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ge3dResolution {
+    pub train: ExcitationTrain,
+    pub readout: Ge3dReadout,
+    pub n_shots: usize,
+    /// Lines per EPI block and excitations per shot.
+    pub epi: usize,
+    pub n_exc: usize,
+    /// The excitation (0-based, within its shot) that reads the kz centre.
+    pub e_c: usize,
+    pub t_line_ms: f64,
+    pub t_line_source: &'static str,
+    /// The centre line's time from its echo (ms): BIDS's EchoTime is the k-space centre, so each
+    /// echo's block is centred at `EchoTime - t_kyc`.
+    pub t_kyc_ms: f64,
+}
+
+/// The `"epi3d"` readout with the grid (P7 addendum, part C): the line spacing (the overlay's, else
+/// BIDS's effective spacing times the ky segments, the two agreeing within 1% when both are given),
+/// the echoes' blocks centred so the k-space centre line is read at each `EchoTime`, and the timing
+/// of every row's train (from its excitation at `row.t`, an m0scan row's at the start of its
+/// repetition) and of the separate M0's. `None` unless the readout is one.
+pub fn resolve_ge3d(p: &Protocol, acq_dims: [usize; 3]) -> Result<Option<Ge3dResolution>, String> {
+    let (Some(r), Some(g)) = (&p.readout, p.ge3d()) else { return Ok(None) };
+    let [_, ny, nz] = acq_dims;
+    let ky_segments = r.ky_segments.0;
+    let ees = r.effective_echo_spacing_s;
+    let trt_ees = r.total_readout_time_s.filter(|_| ny > 1).map(|t| t / (ny as f64 - 1.0));
+    if let (Some(a), Some(b)) = (ees, trt_ees) {
+        if (a - b).abs() > 0.01 * a {
+            return Err(format!(
+                "EffectiveEchoSpacing {a} s and TotalReadoutTime {} s disagree: BIDS defines TotalReadoutTime = \
+                 EffectiveEchoSpacing (ny - 1) = {} s on {ny} lines", r.total_readout_time_s.unwrap(), a * (ny as f64 - 1.0)));
+        }
+    }
+    let effective = ees.or(trt_ees);
+    let (t_line_ms, t_line_source) = match (r.line_spacing_ms, effective) {
+        (Some(v), eff) => {
+            if let Some(e) = eff {
+                let want = e * 1000.0 * ky_segments as f64;
+                if (v - want).abs() > 0.01 * want {
+                    return Err(format!(
+                        "[readout] line_spacing {v} ms disagrees with the sidecar's effective spacing {e} s x {ky_segments} \
+                         ky segments = {want} ms"));
+                }
+            }
+            (v, "overlay readout.line_spacing")
+        }
+        (None, Some(e)) => (e * 1000.0 * ky_segments as f64, "effective echo spacing x ky segments"),
+        (None, None) => return Err(
+            "a 3D EPI readout needs its line spacing: the sidecar has no EffectiveEchoSpacing or TotalReadoutTime; give \
+             [readout] line_spacing (ms)".to_string()),
+    };
+    let block = grase_block(ny, ky_segments, t_line_ms, p.reverse_phase)?;
+    let t_kyc_ms = block.t_ms[ny / 2];
+    let train = ExcitationTrain {
+        kz_segments: r.kz_segments.0,
+        kz_order: r.kz_order.0,
+        exc_spacing_ms: g.excitation_spacing_ms,
+        echo_times_ms: p.echo_times_s.iter().map(|te| te * 1000.0 - t_kyc_ms).collect(),
+        excitation_time_ms: g.excitation_time_ms.0,
+    };
+    let readout = Ge3dReadout { ky_segments, t_line_ms, reverse_phase: p.reverse_phase };
+    let table = ge3d_lines(&train, &readout, ny, nz).map_err(|e| {
+        if nz < 2 { format!("{e}: use MRAcquisitionType 2D") } else { e }
+    })?;
+    for (i, row) in p.rows.iter().enumerate() {
+        let exc = if row.kind == RowKind::M0scan { 0.0 } else { row.t };
+        check_ge3d_timing(&train, &table, exc * 1000.0, row.tr * 1000.0).map_err(|e| format!("row {i}: {e}"))?;
+    }
+    if let (M0Type::Separate, Some(tr)) = (p.m0_type, p.m0_repetition_time_s) {
+        check_ge3d_timing(&train, &table, 0.0, tr * 1000.0).map_err(|e| format!("the separate M0: {e}"))?;
+    }
+    Ok(Some(Ge3dResolution {
+        n_shots: table.n_shots, epi: table.block.epi, n_exc: table.n_exc, e_c: table.e_c, train, readout, t_line_ms,
+        t_line_source, t_kyc_ms,
+    }))
+}
+
 pub fn resolve_readout(p: &Protocol, acq_dims: [usize; 3]) -> Result<Option<ReadoutResolution>, String> {
     let Some(r) = &p.readout else { return Ok(None) };
     let [nx, ny, nz] = acq_dims;
@@ -2948,6 +3193,9 @@ pub fn resolve_readout(p: &Protocol, acq_dims: [usize; 3]) -> Result<Option<Read
     }
     if r.kind.0 == ReadoutKind::Spiral {
         return resolve_spiral(p, r, acq_dims).map(Some);
+    }
+    if r.kind.0 == ReadoutKind::Epi3d {
+        return Err("a 3D gradient-echo train ([readout] type \"epi3d\") is resolved by resolve_ge3d".to_string());
     }
     let (ky_segments, kz_segments) = (r.ky_segments.0, r.kz_segments.0);
     if ny % ky_segments != 0 {
@@ -4187,6 +4435,93 @@ mod tests {
         })
     }
 
+    // ---- P7 part C: the 3D gradient-echo train ("epi3d")
+
+    fn epi3d() -> Value {
+        let mut s = grase();
+        s["PulseSequenceType"] = json!("3D EPI");
+        s["FlipAngle"] = json!(12);
+        s
+    }
+
+    const EPI3D: &str = "[signal]\nacq_contrast = \"ge\"\n[readout]\nexcitation_spacing = 50.0\nslab_entry_time = 0.5\n";
+
+    /// The `"epi3d"` inputs: activation, defaults, the slab entry's two sources, every refusal, the
+    /// memory key, multi-TE, and the resolution with the grid.
+    #[test]
+    fn epi3d_protocols() {
+        let ok = |s: &Value, ov: &str| parse(s, CTX, Some(&overlay(ov)), None);
+        let err = |s: &Value, ov: &str| ok(s, ov).unwrap_err();
+        let p = ok(&epi3d(), EPI3D).unwrap();
+        let r = p.readout.as_ref().unwrap();
+        let g = p.ge3d().unwrap();
+        assert_eq!((r.kind, r.ky_segments.0, r.kz_segments.0), ((ReadoutKind::Epi3d, Source::Sidecar), 2, 1));
+        assert_eq!((g.excitation_spacing_ms, g.excitation_time_ms, g.max_t1_groups, g.node_tolerance, g.max_memory_gib),
+                   (50.0, (2.0, Source::Default), (16, Source::Default), (1e-4, Source::Default), (4.0, Source::Default)));
+        assert_eq!(g.slab_entry, (SlabEntryTime::Seconds(0.5), "overlay readout.slab_entry_time"));
+        // FlipAngle is the excitation under "epi3d"
+        assert_eq!(p.ge.as_ref().unwrap().flip_deg, 12.0);
+        assert!(p.p6_active());
+        // the overlay's type over a GRASE sidecar
+        let po = ok(&grase(), &format!("{EPI3D}type = \"epi3d\"\n")).unwrap_err();
+        assert!(po.contains("(0, 90]") && po.contains("refocusing"), "{po}");
+        let mut g12 = grase();
+        g12["FlipAngle"] = json!(12);
+        let pt = ok(&g12, &format!("{EPI3D}type = \"epi3d\"\n")).unwrap();
+        assert_eq!(pt.readout.unwrap().kind, (ReadoutKind::Epi3d, Source::Overlay));
+        // the slab entry from bolus-position, its "arrival"; both sources refused; neither refused
+        let mut bs = epi3d();
+        bs["BackgroundSuppression"] = json!(true);
+        bs["BackgroundSuppressionNumberPulses"] = json!(1);
+        bs["BackgroundSuppressionPulseTime"] = json!([2.0]);
+        let bp = "[signal]\nacq_contrast = \"ge\"\n[readout]\nexcitation_spacing = 50.0\n\
+                  [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = \"arrival\"\n";
+        assert_eq!(ok(&bs, bp).unwrap().ge3d().unwrap().slab_entry,
+                   (SlabEntryTime::Arrival, "overlay background_suppression.slab_entry_time"));
+        let both = bp.replace("excitation_spacing = 50.0\n", "excitation_spacing = 50.0\nslab_entry_time = 0.3\n");
+        assert!(err(&bs, &both).contains("one source"), "{}", err(&bs, &both));
+        let none = "[signal]\nacq_contrast = \"ge\"\n[readout]\nexcitation_spacing = 50.0\n";
+        assert!(err(&epi3d(), none).contains("slab entry"));
+        // refusals
+        assert!(err(&epi3d(), "[readout]\nexcitation_spacing = 50.0\nslab_entry_time = 0.5\n").contains("acq_contrast"));
+        assert!(err(&grase(), "[signal]\nacq_contrast = \"ge\"\n").contains("epi3d"));
+        assert!(err(&epi3d(), "[signal]\nacq_contrast = \"ge\"\n[readout]\nslab_entry_time = 0.5\n").contains("excitation_spacing"));
+        assert!(err(&epi3d(), &format!("{EPI3D}echo_spacing = 10.0\n")).contains("spin-echo train key"));
+        assert!(err(&epi3d(), &format!("{EPI3D}interleaves = 4\n")).contains("spiral key"));
+        assert!(err(&grase(), "[readout]\nexcitation_spacing = 50.0\n").contains("3D EPI key"));
+        let mut nofa = epi3d();
+        nofa.as_object_mut().unwrap().remove("FlipAngle");
+        assert!(err(&nofa, EPI3D).contains("FlipAngle"));
+        assert!(err(&epi3d(), &format!("{EPI3D}node_tolerance = 2.0\n")).contains("(0, 1)"));
+        assert!(err(&epi3d(), &format!("{EPI3D}max_t1_groups = 0\n")).contains("at least 1"));
+        assert!(err(&epi3d(), &EPI3D.replace("0.5", "\"sometimes\"")).contains("arrival"));
+        assert!(err(&epi3d(), &format!("{EPI3D}[acquisition]\npartial_fourier = 0.75\n")).contains("partial Fourier"));
+        // the memory key: [images] with "epi3d"; refused with neither epi3d nor compat multi-TE
+        assert_eq!(ok(&epi3d(), &format!("{EPI3D}[images]\nmax_memory_gib = 2.0\n")).unwrap().ge3d().unwrap().max_memory_gib,
+                   (2.0, Source::Overlay));
+        assert!(err(&grase(), "[images]\nmax_memory_gib = 2.0\n").contains("[images]"));
+        // multi-TE: several echoes per excitation; GRASE still refuses it
+        let two: Vec<Value> = [0.012, 0.030].iter().map(|te| { let mut x = epi3d(); x["EchoTime"] = json!(te); x }).collect();
+        let pm = parse_echoes(&two, CTX, Some(&overlay(EPI3D)), None).unwrap();
+        assert_eq!(pm.echo_times_s, vec![0.012, 0.030]);
+        let twog: Vec<Value> = [0.012, 0.030].iter().map(|te| { let mut x = grase(); x["EchoTime"] = json!(te); x }).collect();
+        assert!(parse_echoes(&twog, CTX, None, None).unwrap_err().contains("multi-echo spin-echo"));
+
+        // resolution with the grid: 32 x 32 x 8, two ky segments; EffectiveEchoSpacing 0.3 ms gives
+        // lines 0.6 ms apart; the echo is centred so the centre line is read at EchoTime
+        let res = resolve_ge3d(&p, [32, 32, 8]).unwrap().unwrap();
+        assert!((res.t_line_ms - 0.6).abs() < 1e-12 && res.n_exc == 8 && res.n_shots == 2 && res.epi == 16);
+        assert!((res.train.echo_times_ms[0] + res.t_kyc_ms - 12.0).abs() < 1e-12);
+        assert!(resolve_readout(&p, [32, 32, 8]).unwrap_err().contains("resolve_ge3d"));
+        assert!(resolve_ge3d(&p, [32, 32, 1]).unwrap_err().contains("2D"));
+        // a spacing the echo block does not fit in, named with its row
+        let tight = ok(&epi3d(), &EPI3D.replace("50.0", "12.0")).unwrap();
+        let e = resolve_ge3d(&tight, [32, 32, 8]).unwrap_err();
+        assert!(e.contains("row 0") && e.contains("next excitation pulse"), "{e}");
+        // a GRASE protocol has no 3D EPI resolution
+        assert!(resolve_ge3d(&ok(&grase(), "").unwrap(), [32, 32, 8]).unwrap().is_none());
+    }
+
     #[test]
     fn three_d_inputs_activation_and_refusals() {
         let ok = |s: &Value, ov: &str| parse(s, CTX, Some(&overlay(ov)), None);
@@ -4393,6 +4728,11 @@ mod tests {
         assert_eq!(cp.multi_te.unwrap().max_image_memory_gib, Some((4.0, Source::Default)));
         let cp = parse_echoes(&c, CTX, Some(&overlay("[compat]\nasldro = true\n[multi_te]\nmax_image_memory_gib = 1.5\n")), None).unwrap();
         assert_eq!(cp.multi_te.unwrap().max_image_memory_gib, Some((1.5, Source::Overlay)));
+        // P7: [images] max_memory_gib is the same bound under its newer name; both are refused
+        let cp = parse_echoes(&c, CTX, Some(&overlay("[compat]\nasldro = true\n[images]\nmax_memory_gib = 2.5\n")), None).unwrap();
+        assert_eq!(cp.multi_te.unwrap().max_image_memory_gib, Some((2.5, Source::Overlay)));
+        let both = "[compat]\nasldro = true\n[multi_te]\nmax_image_memory_gib = 1.5\n[images]\nmax_memory_gib = 2.5\n";
+        assert!(parse_echoes(&c, CTX, Some(&overlay(both)), None).unwrap_err().contains("give one"));
         // compat still refuses a separate M0
         assert!(parse_echoes(&two, CTX, Some(&overlay("[compat]\nasldro = true\n[m0]\nrepetition_time = 8.0\n")), None).is_err());
     }

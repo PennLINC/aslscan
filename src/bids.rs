@@ -139,9 +139,15 @@ mod writer {
     fn overridden_sequence_type(p: &Protocol) -> Option<&'static str> {
         let rs = p.readout.as_ref()?;
         let input = p.input_sidecar.get("PulseSequenceType").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
-        (rs.kind.1 == crate::protocol::Source::Overlay && !input.contains(rs.kind.0.as_str())).then_some(match rs.kind.0 {
+        // P7 part C: the 3D EPI train is named by "epi" in the input (as its detection reads it)
+        let described = match rs.kind.0 {
+            crate::protocol::ReadoutKind::Epi3d => input.contains("epi"),
+            k => input.contains(k.as_str()),
+        };
+        (rs.kind.1 == crate::protocol::Source::Overlay && !described).then_some(match rs.kind.0 {
             crate::protocol::ReadoutKind::Grase => "GRASE",
             crate::protocol::ReadoutKind::Spiral => "spiral",
+            crate::protocol::ReadoutKind::Epi3d => "3D EPI",
         })
     }
 

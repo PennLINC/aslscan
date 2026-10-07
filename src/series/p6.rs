@@ -1325,6 +1325,9 @@ pub(super) fn simulate_p6(
     p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseModel, ov: RowOverride, capture: Option<&mut Vec<Vec<f32>>>,
 ) -> Result<SeriesOutput, String> {
     let tes = p.echo_times_s.clone();
+    if p.ge3d().is_some() {
+        return Err("[readout] type \"epi3d\": the 3D gradient-echo series is not implemented yet (P7 plan, Task 15)".to_string());
+    }
     let sched = Schedule::new(p);
     // P6 part C, compat: the echo-time decay is the signal stage's, so each echo has its own image
     // set, bounded before any is built: the grids and the compartment count resolved alone
