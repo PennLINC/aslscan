@@ -11,6 +11,7 @@
 
 use super::*;
 use crate::longitudinal::{tissue_mz_ll, tissue_mz_ll_sequence, LlCycle, Suppression};
+use crate::protocol::SlabEntryTime;
 
 /// One tissue group (P7 addendum, part C, "Tissue is separable"): the phantom voxels of compartment
 /// `compartment` (a label in class mode; every foreground voxel in voxel mode) whose `T1` is `t1_s`.
@@ -76,6 +77,96 @@ pub(super) fn train_mz(t1_s: f64, cycles: &[LlCycle]) -> Vec<Vec<f64>> {
 /// unit `M0`.
 pub(super) fn m0_train_mz(t1_s: f64, m0_tr_s: f64, n_exc: usize, spacing_s: f64, flip_deg: f64) -> Vec<f64> {
     tissue_mz_ll(1.0, t1_s, &train_cycle(m0_tr_s, None, train_times(0.0, n_exc, spacing_s), flip_deg))
+}
+
+// ---- P7 Task 14: depletion from slab entry, the blood interpolation ----
+
+/// How long before its arrival a voxel's label entered the slab (P7 addendum, part C, "Depletion
+/// from slab entry"): `arrival - d`, zero for `"arrival"`. A slab entry after the arrival is
+/// refused, naming the voxel (`what` names the arrival: "ATT" or "aATT").
+pub(super) fn entry_lead(entry: SlabEntryTime, arrival_s: f64, voxel: usize, what: &str) -> Result<f64, String> {
+    match entry {
+        SlabEntryTime::Arrival => Ok(0.0),
+        SlabEntryTime::Seconds(d) if d <= arrival_s => Ok(arrival_s - d),
+        SlabEntryTime::Seconds(d) => Err(format!(
+            "slab_entry_time {d} s is after phantom voxel {voxel}'s {what} {arrival_s} s: its label would enter the slab \
+             after reaching the voxel")),
+    }
+}
+
+/// The node selection of the blood interpolation (P7 addendum, part C, "Blood is not separable"):
+/// `values[r][j]` is a family's read at voxel `r` and excitation `j` of one train. Nodes start at
+/// the first, the last and `centre`, and the interval with the worst error is bisected until every
+/// voxel's piecewise-linear interpolant is within `tol` of the largest value over the whole train
+/// (computed exactly, at every excitation). Nodes at every excitation are exact, so it terminates. A
+/// train with no label read needs no nodes.
+pub(super) fn select_nodes(values: &[Vec<f64>], centre: usize, tol: f64) -> Vec<usize> {
+    let n = values.first().map_or(0, |v| v.len());
+    let peak = values.iter().flatten().fold(0.0f64, |m, x| m.max(x.abs()));
+    if n == 0 || peak == 0.0 {
+        return Vec::new();
+    }
+    let mut nodes = vec![0, centre.min(n - 1), n - 1];
+    nodes.sort_unstable();
+    nodes.dedup();
+    let bound = tol * peak;
+    loop {
+        // the worst interval between consecutive nodes
+        let mut worst = (0.0f64, 0usize);
+        for (k, w) in nodes.windows(2).enumerate() {
+            let (a, b) = (w[0], w[1]);
+            for v in values {
+                for j in a + 1..b {
+                    let x = (j - a) as f64 / (b - a) as f64;
+                    let err = (v[j] - ((1.0 - x) * v[a] + x * v[b])).abs();
+                    if err > worst.0 {
+                        worst = (err, k);
+                    }
+                }
+            }
+        }
+        if worst.0 <= bound {
+            return nodes;
+        }
+        let (a, b) = (nodes[worst.1], nodes[worst.1 + 1]);
+        nodes.insert(worst.1 + 1, (a + b) / 2);
+    }
+}
+
+/// The hat weights of excitation `j` on `nodes` (sorted): `(node index, weight)`, two neighbours
+/// (or one at a node), summing to one inside the span; nothing outside it.
+pub(super) fn hat(nodes: &[usize], j: usize) -> Vec<(usize, f64)> {
+    match nodes.binary_search(&j) {
+        Ok(k) => vec![(k, 1.0)],
+        Err(0) => Vec::new(),
+        Err(k) if k == nodes.len() => Vec::new(),
+        Err(k) => {
+            let (a, b) = (nodes[k - 1], nodes[k]);
+            let x = (j - a) as f64 / (b - a) as f64;
+            vec![(k - 1, 1.0 - x), (k, x)]
+        }
+    }
+}
+
+/// The interpolant of `values` (one voxel) at every excitation on `nodes`.
+pub(super) fn interpolate(values: &[f64], nodes: &[usize]) -> Vec<f64> {
+    (0..values.len()).map(|j| hat(nodes, j).iter().map(|&(k, w)| w * values[nodes[k]]).sum()).collect()
+}
+
+/// The images one volume holds while it is simulated (P7 addendum, part C, "Memory"), in bytes:
+/// `compartments` images of `nvox_sim` `f32` voxels, times the volumes in flight (the worker
+/// threads). Over `limit_gib` it is refused, naming the estimate and the remedies.
+pub(super) fn check_memory(nvox_sim: usize, compartments: usize, in_flight: usize, limit_gib: f64, what: &str) -> Result<f64, String> {
+    let bytes = 4.0 * nvox_sim as f64 * compartments as f64 * in_flight as f64;
+    let gib = bytes / (1u64 << 30) as f64;
+    if gib > limit_gib {
+        return Err(format!(
+            "the 3D gradient-echo series would hold {gib:.2} GiB of images at once ({compartments} compartment images of \
+             {nvox_sim} voxels x {in_flight} volumes in flight; {what}), over the limit of {limit_gib} GiB ([images] \
+             max_memory_gib): more kz segments (shorter trains need fewer interpolation nodes), a looser \
+             [readout] node_tolerance, fewer worker threads, or a higher limit"));
+    }
+    Ok(gib)
 }
 
 #[cfg(test)]
@@ -197,5 +288,78 @@ mod tests {
         }
         let e = tissue_groups(&ph, &masks, 16).unwrap_err();
         assert!(e.contains("max_t1_groups = 16") && e.contains("distinct"), "{e}");
+    }
+
+    // ---- Task 14
+
+    use crate::kinetic::{delta_m_read_all, Kinetic, LabelType};
+
+    const K: Kinetic = Kinetic { label_type: LabelType::Pcasl, tau: 1.8, alpha: 0.85, lambda: 0.9, t1b: 1.65 };
+
+    /// One train's blood reads (the whole label, with exchange's split summed) at 32 excitations 40
+    /// ms apart from 2.0 s, for voxels whose ATT puts their arrival before, inside and after it.
+    fn train_reads(atts: &[f64], lead_from: f64) -> (Vec<f64>, Vec<Vec<f64>>) {
+        let e = train_times(2.0, 32, 0.04);
+        let flips = vec![10.0; e.len()];
+        let vals = atts.iter().map(|&att| {
+            let lead = entry_lead(SlabEntryTime::Seconds(lead_from), att, 0, "ATT").unwrap();
+            delta_m_read_all(&K, 60.0, att, 1.33, 74.6, &e, &flips, &[(0.0, K.tau, 1.0)], Some(0.6), lead)
+                .iter().map(|p| p.total()).collect()
+        }).collect();
+        (e, vals)
+    }
+
+    /// The interpolation meets its tolerance at every voxel and excitation; an arrival inside the
+    /// train needs more than the three starting nodes; nodes at every excitation are exact; a
+    /// centre before the arrival (centric order) still meets the tolerance, the reference being the
+    /// largest value over the train; no label, no nodes.
+    #[test]
+    fn the_blood_interpolation_meets_its_tolerance() {
+        let tol = 1e-4;
+        for (atts, centre) in [(vec![0.5, 0.8, 1.2], 16), (vec![2.3, 2.6], 16), (vec![2.9], 0)] {
+            let (_, vals) = train_reads(&atts, 0.2);
+            let nodes = select_nodes(&vals, centre, tol);
+            let peak = vals.iter().flatten().fold(0.0f64, |m, x| m.max(x.abs()));
+            assert!(peak > 0.0);
+            for v in &vals {
+                for (a, b) in v.iter().zip(interpolate(v, &nodes)) {
+                    assert!((a - b).abs() <= tol * peak, "atts {atts:?}: {a} vs {b}");
+                }
+            }
+            // arrival (ATT 2.3, 2.6, 2.9 s) inside the 2.0-3.24 s train: more than the three starting nodes
+            if atts[0] > 2.0 {
+                assert!(nodes.len() > 3, "atts {atts:?}: nodes {nodes:?}");
+            }
+        }
+        let (_, vals) = train_reads(&[1.0], 0.2);
+        let all: Vec<usize> = (0..32).collect();
+        assert_eq!(interpolate(&vals[0], &all), vals[0]);
+        assert!(select_nodes(&[vec![0.0; 32]], 16, tol).is_empty());
+        // the hat weights sum to one inside the span
+        let nodes = [0, 5, 31];
+        for j in 0..32 {
+            let s: f64 = hat(&nodes, j).iter().map(|w| w.1).sum();
+            assert!((s - 1.0).abs() < 1e-15);
+        }
+    }
+
+    /// The slab-entry lead per voxel; an entry after the arrival is refused, naming the voxel; the
+    /// memory estimate and its refusal.
+    #[test]
+    fn slab_entry_leads_and_the_memory_bound() {
+        assert_eq!(entry_lead(SlabEntryTime::Arrival, 1.2, 0, "ATT").unwrap(), 0.0);
+        assert!((entry_lead(SlabEntryTime::Seconds(0.5), 1.2, 0, "ATT").unwrap() - 0.7).abs() < 1e-15);
+        let e = entry_lead(SlabEntryTime::Seconds(0.9), 0.8, 417, "aATT").unwrap_err();
+        assert!(e.contains("voxel 417") && e.contains("aATT"), "{e}");
+        // with depletion before arrival the read is smaller than with none
+        let (_, early) = train_reads(&[1.0], 0.2);
+        let e = train_times(2.0, 32, 0.04);
+        let none: Vec<f64> = delta_m_read_all(&K, 60.0, 1.0, 1.33, 74.6, &e, &vec![10.0; 32], &[(0.0, K.tau, 1.0)], Some(0.6), 0.0)
+            .iter().map(|p| p.total()).collect();
+        assert!(early[0][31] < none[31] && early[0][0] <= none[0]);
+        // memory: 2^20 voxels x 64 compartments x 4 bytes x 8 in flight = 2 GiB
+        assert!((check_memory(1 << 20, 64, 8, 4.0, "test").unwrap() - 2.0).abs() < 1e-12);
+        let err = check_memory(1 << 20, 64, 8, 1.5, "18 tissue groups, K = 6").unwrap_err();
+        assert!(err.contains("2.00 GiB") && err.contains("max_memory_gib") && err.contains("K = 6"), "{err}");
     }
 }
