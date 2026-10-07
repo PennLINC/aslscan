@@ -220,6 +220,9 @@ pub struct HadamardSeries {
 /// absolute and over the reference tissue's norm.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HadamardLeakage {
+    /// The cycle and, under Look-Locker (P7 part B), the readout decoded (0 without).
+    pub cycle: usize,
+    pub readout: usize,
     pub reference_norm: f64,
     pub per_subbolus: Vec<(f64, f64)>,
 }

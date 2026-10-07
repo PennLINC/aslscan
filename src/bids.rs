@@ -1051,16 +1051,23 @@ mod writer {
         // echo e's leakage, acquired at its own TE
         let echo_leakage = if e == 0 { hs.leakage.clone() } else { hs.leakage_more_echoes.get(e - 1).cloned() };
         let leakage = match &echo_leakage {
-            Some(l) => json!(l.iter().enumerate().map(|(c, x)| json!({
-                "Cycle": c + 1,
-                "ReferenceNorm": x.reference_norm,
-                "Absolute": x.per_subbolus.iter().map(|q| q.0).collect::<Vec<f64>>(),
-                "Normalized": x.per_subbolus.iter().map(|q| q.1).collect::<Vec<f64>>(),
-            })).collect::<Vec<_>>()),
+            Some(l) => json!(l.iter().map(|x| {
+                let mut v = json!({
+                    "Cycle": x.cycle + 1,
+                    "ReferenceNorm": x.reference_norm,
+                    "Absolute": x.per_subbolus.iter().map(|q| q.0).collect::<Vec<f64>>(),
+                    "Normalized": x.per_subbolus.iter().map(|q| q.1).collect::<Vec<f64>>(),
+                });
+                // P7 part B: each readout decoded on its own
+                if h.readouts > 1 {
+                    v["Readout"] = json!(x.readout + 1);
+                }
+                v
+            }).collect::<Vec<_>>()),
             None => json!("not computed (hadamard.report_leakage = false)"),
         };
         let f = hs.flags;
-        Some(json!({
+        let mut block = json!({
             "Order": h.order,
             "Matrix": crate::hadamard::encoding(h.order),
             "MatrixNote": "Sylvester, the all-ones first column removed; row i is raw volume i of a cycle, column j \
@@ -1108,7 +1115,16 @@ mod writer {
                             volumes' encoded truth and desc-preparations_gt.tsv (the factors applied per preparation)",
             "PerVolumeRecords": "the per-volume entries of this block's siblings (background-suppression label factors, \
                                  crushing survival, motion, physiology) index the raw volumes listed in RawVolumes",
-        }))
+        });
+        // P7 part B: each encoded preparation read by M Look-Locker readouts
+        if h.readouts > 1 {
+            block["Readouts"] = json!(h.readouts);
+            block["PostLabelingDelays"] = json!(h.plds);
+            block["ReadoutDecoding"] = json!(
+                "each readout index decoded on its own: output (j, n) = (2/H) sum_r h_rj S_rn over the encoding rows r of \
+                 a cycle, S_rn readout n after row r's preparation; outputs readout-major");
+        }
+        Some(block)
     }
 
     fn resolved_bool(v: (bool, crate::protocol::Source)) -> Value {
@@ -1158,14 +1174,21 @@ mod writer {
             ph_side["Units"] = json!("rad");
             write_json(&PathBuf::from(format!("{prefix_e}_part-phase_asl.json")), &ph_side)?;
         }
-        let mut tsv = String::from("raw_volume\tkind\tcycle\tencoding_row\tlabeled_subboli\tfirst_preparation\tpreparations\n");
+        // P7 part B: under Look-Locker each raw volume is one readout of its preparation
+        let ll = spec.readouts > 1;
+        let mut tsv = String::from("raw_volume\tkind\tcycle\tencoding_row\tlabeled_subboli\tfirst_preparation\tpreparations");
+        tsv.push_str(if ll { "\treadout\n" } else { "\n" });
         for (r, rv) in sched.raws.iter().enumerate() {
-            tsv.push_str(&format!("{r}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            tsv.push_str(&format!("{r}\t{}\t{}\t{}\t{}\t{}\t{}",
                 if rv.encoding_row.is_some() { "encoded" } else { sched.raw_rows[r].kind.as_str() },
                 rv.cycle.map_or("n/a".to_string(), |c| (c + 1).to_string()),
                 rv.encoding_row.map_or("n/a".to_string(), |i| i.to_string()),
                 labeled(spec.order, rv.encoding_row).iter().map(|j| j.to_string()).collect::<Vec<_>>().join(","),
                 rv.prep, rv.n_preps));
+            if ll {
+                tsv.push_str(&format!("\t{}", rv.readout + 1));
+            }
+            tsv.push('\n');
         }
         std::fs::write(format!("{prefix_s}_rawvolumes.tsv"), tsv).map_err(|e| e.to_string())?;
 

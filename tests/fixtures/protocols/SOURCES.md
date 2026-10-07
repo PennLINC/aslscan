@@ -51,3 +51,7 @@ Only the JSON sidecar and aslcontext.tsv are kept; no image data.
 - `p7_ll_multite/`: written for aslscan (P7 plan, Task 6). `p6_ll` read at three echo times, 12, 26 and
   40 ms (`asl-echo-{1,2,3}.json`, identical except `EchoTime`; pass them as repeated `--asl-json`), the
   third echo's block ending inside the 50 ms between slice groups.
+- `p7_ll_hadamard/`: written for aslscan (P7 plan, Task 8) by `tools/make_p7_ll_hadamard.py`. H8 PCASL on the crop,
+  each encoded preparation read by four Look-Locker readouts: seven sub-boli of 0.25 s, PLD_n = 0.5, 0.8, 1.1,
+  1.4 s, 35 degrees, TR 4.5 s, two encoding cycles after an included M0, exchange on; the context lists the 56
+  decoded volumes readout-major.

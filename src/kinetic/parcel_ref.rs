@@ -35,6 +35,9 @@ pub struct Case {
     pub epsilon: f64,
     pub region: Region,
     pub tau_ex: Option<f64>,
+    /// The labeled parcels: their sub-bolus coordinate in `[span.0, span.1)` (`(0, tau)`: all of
+    /// them; a Hadamard sub-bolus otherwise).
+    pub span: (f64, f64),
 }
 
 /// The 8-point Gauss-Legendre nodes and weights on `[-1, 1]`.
@@ -133,7 +136,7 @@ impl Case {
 
     /// `(intravascular, total)` of the label read at `t`, every factor applied, before `sin(a)`.
     pub fn read(&self, sub: usize) -> (f64, f64) {
-        let (lo, hi) = (self.att, (self.att + self.k.tau).min(self.t));
+        let (lo, hi) = (self.att + self.span.0, (self.att + self.span.1.min(self.k.tau)).min(self.t));
         let t1p = self.t1p();
         let breaks = self.breaks(self.att, self.entry_lead);
         let parcel = |u: f64| {

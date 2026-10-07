@@ -2006,3 +2006,62 @@ fn look_locker_reads_every_echo() {
     let err = aslscan::protocol::parse_echoes(&c, &ctx, Some(&cov), crop().params.as_ref()).unwrap_err();
     assert!(err.contains("compat") || err.contains("asldro"), "{err}");
 }
+
+/// A Look-Locker Hadamard-4 PCASL sidecar on the crop: three 0.3 s sub-boli read at PLD_n = 1.0,
+/// 1.3, 1.6 s (35 degrees), two encoding cycles, the context the decoded volumes readout-major.
+fn ll_hadamard_side(te: f64) -> (Value, String) {
+    let (mut ld, mut pld, mut ctx) = (Vec::new(), Vec::new(), String::from("volume_type\n"));
+    for _ in 0..2 {
+        for p_n in [1.0, 1.3, 1.6] {
+            for j in 0..3 {
+                ld.push(0.3);
+                pld.push(p_n + 0.3 * (2 - j) as f64);
+                ctx.push_str("deltam\n");
+            }
+        }
+    }
+    (json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": ld, "PostLabelingDelay": pld,
+        "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "LookLocker": true,
+        "EchoTime": te, "FlipAngle": 35, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0],
+        "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05], "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.012
+    }), ctx)
+}
+
+/// P7 part B: Look-Locker x Hadamard x multi-TE. With noise off each echo's decoded series is the
+/// single-echo series at its echo time, bit for bit; the dataset lists 18 decoded volumes,
+/// TotalAcquiredPairs is the number of encoding cycles, and the raw-volume table has a readout
+/// column.
+#[test]
+fn look_locker_hadamard_reads_every_echo() {
+    let ov: Overlay = toml::from_str("seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\nnoise_variance = 0.0\n\
+        [signal]\nacq_contrast = \"ge\"\n[hadamard]\norder = 4\n[look_locker]\nreadouts_per_cycle = 3\n").unwrap();
+    let tes = [0.012, 0.024];
+    let ctx = ll_hadamard_side(0.012).1;
+    let sides: Vec<Value> = tes.iter().map(|&te| ll_hadamard_side(te).0).collect();
+    let parse_e = |s: &[Value]| aslscan::protocol::parse_echoes(s, &ctx, Some(&ov), crop().params.as_ref()).unwrap();
+    let multi = parse_e(&sides);
+    let out = simulate_with(&multi, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert_eq!(out.n_volumes, 18);
+    for (e, s) in sides.iter().enumerate() {
+        let one = simulate_with(&parse_e(std::slice::from_ref(s)), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+        let (mag, ph) = if e == 0 { (&out.mag, &out.phase) } else { (&out.more_echoes[e - 1].mag, &out.more_echoes[e - 1].phase) };
+        assert_eq!(bits(mag), bits(&one.mag), "echo {}", e + 1);
+        assert_eq!(bits(ph), bits(&one.phase), "echo {}", e + 1);
+    }
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-p7llh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &multi, &out).unwrap();
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("sub-01/perf/sub-01_echo-1_part-mag_asl.json")).unwrap()).unwrap();
+    assert_eq!(side["TotalAcquiredPairs"], json!(2));
+    let had = &side["AslscanSimulation"]["Hadamard"];
+    assert_eq!(had["Readouts"], json!(3));
+    assert_eq!(had["Outputs"][3], json!({ "Cycle": 1, "SubBolus": 1, "Readout": 2 }));
+    let raw = std::fs::read_dir(dir.join("sourcedata")).unwrap().flat_map(|d| std::fs::read_dir(d.unwrap().path()).unwrap())
+        .flat_map(|d| std::fs::read_dir(d.unwrap().path()).unwrap())
+        .map(|f| f.unwrap().path()).find(|p| p.to_string_lossy().ends_with("_rawvolumes.tsv")).expect("the raw-volume table");
+    let tsv = std::fs::read_to_string(raw).unwrap();
+    assert!(tsv.lines().next().unwrap().ends_with("\treadout"), "{tsv}");
+    assert_eq!(tsv.lines().count(), 1 + 24);
+    let _ = std::fs::remove_dir_all(&dir);
+}

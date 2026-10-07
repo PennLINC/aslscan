@@ -61,7 +61,41 @@ fn p4_for_schedule(p: &Protocol, ph: &Phantom, bolus_region: Option<Region>, sch
 }
 
 /// Raw volume `r` of an `n`-volume voxel-major series as complex `f64`, as `complex_from` forms it.
-fn complex_volume(mag: &[f32], phase: &[f32], n: usize, r: usize) -> Vec<(f64, f64)> {
+/// A Hadamard cycle's raw volumes by readout (P7 part B): readout `n`'s `H` raw volumes in
+/// encoding-row order (the schedule lays a cycle out encoding-row-major, `M` readouts each).
+/// Without Look-Locker one group, the cycle's raw volumes in order: P6's.
+fn readout_groups(c: &crate::schedule::Cycle, order: usize) -> Vec<Vec<usize>> {
+    let m = c.raws.len() / order;
+    (0..m).map(|n| (0..order).map(|e| c.raws.start + e * m + n).collect()).collect()
+}
+
+/// The Look-Locker spec on the schedule's raw volumes (P7 part B). Without Hadamard the raw
+/// volumes are the rows and this is the protocol's spec itself. Under Hadamard each preparation's
+/// raw volumes are one cycle (an m0scan raw volume its own), each readout's flip that of sub-bolus
+/// 1 of its row (the protocol checked they agree).
+fn ll_on_raws(p: &Protocol, sched: &Schedule) -> Option<crate::protocol::LookLockerSpec> {
+    let l = p.look_locker.as_ref()?;
+    let Some(h) = &p.hadamard else { return Some(l.clone()) };
+    let mut cycles: Vec<crate::protocol::LookLockerCycle> = Vec::new();
+    let mut flip_deg = vec![0.0; sched.raws.len()];
+    for (r, rv) in sched.raws.iter().enumerate() {
+        if rv.readout == 0 {
+            cycles.push(crate::protocol::LookLockerCycle { rows: Vec::new(), m0scan: rv.encoding_row.is_none() });
+        }
+        cycles.last_mut().expect("a cycle starts at readout 0").rows.push(r);
+        flip_deg[r] = match (rv.cycle, rv.encoding_row) {
+            (Some(c), Some(_)) => l.flip_deg[h.row(&h.cycles[c], 0, rv.readout)],
+            // an m0scan raw volume: its source row is its preparation's
+            _ => l.flip_deg[sched.preps[rv.prep].suppression],
+        };
+    }
+    Some(crate::protocol::LookLockerSpec { cycles, flip_deg, ..l.clone() })
+}
+
+/// One complex volume, voxel-major.
+type Image = Vec<(f64, f64)>;
+
+fn complex_volume(mag: &[f32], phase: &[f32], n: usize, r: usize) -> Image {
     (0..mag.len() / n).map(|x| {
         let (m, p) = (mag[x * n + r] as f64, phase[x * n + r] as f64);
         (m * p.cos(), m * p.sin())
@@ -74,10 +108,13 @@ fn complex_volume(mag: &[f32], phase: &[f32], n: usize, r: usize) -> Vec<(f64, f
 fn decode_series(sched: &Schedule, order: usize, mag: &[f32], phase: &[f32], n_raw: usize) -> (Vec<f32>, Vec<f32>) {
     let nvox = mag.len() / n_raw;
     let n_out = sched.outputs.len();
-    let decoded: Vec<Vec<Vec<(f64, f64)>>> = sched.cycles.iter().map(|c| {
-        let imgs: Vec<Vec<(f64, f64)>> = c.raws.clone().map(|r| complex_volume(mag, phase, n_raw, r)).collect();
-        let refs: Vec<&[(f64, f64)]> = imgs.iter().map(|v| v.as_slice()).collect();
-        crate::hadamard::decode(&refs, order)
+    // per cycle, per readout (P7 part B: one group without Look-Locker), the decoded sub-boli
+    let decoded: Vec<Vec<Vec<Image>>> = sched.cycles.iter().map(|c| {
+        readout_groups(c, order).iter().map(|g| {
+            let imgs: Vec<Vec<(f64, f64)>> = g.iter().map(|&r| complex_volume(mag, phase, n_raw, r)).collect();
+            let refs: Vec<&[(f64, f64)]> = imgs.iter().map(|v| v.as_slice()).collect();
+            crate::hadamard::decode(&refs, order)
+        }).collect()
     }).collect();
     let (mut om, mut op) = (vec![0.0f32; nvox * n_out], vec![0.0f32; nvox * n_out]);
     for (k, o) in sched.outputs.iter().enumerate() {
@@ -88,8 +125,8 @@ fn decode_series(sched: &Schedule, order: usize, mag: &[f32], phase: &[f32], n_r
                     op[x * n_out + k] = phase[x * n_raw + r];
                 }
             }
-            Output::Decoded { cycle, subbolus, .. } => {
-                for (x, &(re, im)) in decoded[cycle][subbolus].iter().enumerate() {
+            Output::Decoded { cycle, subbolus, readout } => {
+                for (x, &(re, im)) in decoded[cycle][readout][subbolus].iter().enumerate() {
                     om[x * n_out + k] = re.hypot(im) as f32;
                     op[x * n_out + k] = im.atan2(re) as f32;
                 }
@@ -115,8 +152,8 @@ fn decoded_truth(
     let mut sup = bolus_region.map(|_| vec![0.0f32; slab * nz * n_out]);
     let mut art = p4.abv.as_ref().map(|_| vec![0.0f32; slab * nz * n_out]);
     for (k, o) in sched.outputs.iter().enumerate() {
-        let Output::Decoded { cycle, subbolus, .. } = *o else { continue };
-        let r0 = sched.cycles[cycle].raws.start;
+        let Output::Decoded { cycle, subbolus, readout } = *o else { continue };
+        let r0 = readout_groups(&sched.cycles[cycle], h.order)[readout][0];
         let row = &sched.raw_rows[r0];
         let kin = p.kinetic(row);
         let (aj, bj) = h.spans[subbolus];
@@ -310,7 +347,9 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
     // P6 part B: Look-Locker readouts. One readout per cycle at one flip is P5's series, which this
     // body already is (the legacy dispatch); every other Look-Locker series takes the readout
     // timeline for the tissue and the depleted label for the blood, each readout its own flip.
-    let ll = p.look_locker.as_ref().filter(|l| !ll_legacy_dispatch(l.cycles.iter().map(|c| c.rows.len()), l.flip_array));
+    // P7 part B: on the raw volumes (under Hadamard they are not the rows)
+    let ll_raw = ll_on_raws(p, sched);
+    let ll = ll_raw.as_ref().filter(|l| !ll_legacy_dispatch(l.cycles.iter().map(|c| c.rows.len()), l.flip_array));
     let tissue_steady = |m0: f64, t1: f64, t2: f64, tr: f64, se: bool| -> f64 {
         match (p.contrast, ir, ge_flip, se) {
             (Contrast::InversionRecovery, Some(q), _, false) => tissue_ir(m0, t1, tr, &q),
@@ -356,7 +395,8 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
         if rows[v].kind == RowKind::M0scan {
             return None;
         }
-        let r0 = sched.cycles[sched.raws[v].cycle?].raws.start;
+        // the cycle's first readout: the first raw volume of v's preparation
+        let r0 = sched.preps[sched.raws[v].prep].raw;
         Some(((r0..=v).map(|r| rows[r].t + off).collect(), (r0..v).map(|r| l.flip_deg[r]).collect()))
     };
     // the encoded weight of the parcel labeled at `a` (the arterial compartment's single parcel)
@@ -413,14 +453,34 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
             (region, s.pulse_times, s.epsilon)
         })
     };
-    // the read of phantom voxel i: every sub-bolus with its parcel factor, the exchange split
-    let ll_parts = |v: usize, kin: &Kinetic, i: usize, e: &[f64], fl: &[f64]| -> ReadParts {
+    // the read of phantom voxel i over the labeled spans `spans` of the bolus: every sub-bolus
+    // with its parcel factor, the exchange split
+    let ll_parts_spans = |v: usize, kin: &Kinetic, i: usize, e: &[f64], fl: &[f64], spans: &[(f64, f64)]| -> ReadParts {
         let att = ph.att[i] as f64;
-        let subs = match bolus_of(v) {
+        let parcels = match bolus_of(v) {
             Some((region, pulses, eps)) => subbolus_factors(&pulses, eps, kin.tau, entry_offset(p.label_type, region, att)),
             None => vec![(0.0, kin.tau, 1.0)],
         };
+        let mut subs = Vec::with_capacity(parcels.len() * spans.len());
+        for &(aj, bj) in spans {
+            for &(a, b, f) in &parcels {
+                let (lo, hi) = (a.max(aj), b.min(bj));
+                if hi > lo {
+                    subs.push((lo, hi, f));
+                }
+            }
+        }
         delta_m_read_parts(kin, ph.perfusion[i] as f64, att, ph.t1[i] as f64, ph.m0[i] as f64, e, fl, &subs, p.exchange_time, 0.0)
+    };
+    // P7 part B: an encoded raw volume reads its labeled sub-boli; any other the whole bolus
+    let labeled_spans = |v: usize, tau: f64| -> Vec<(f64, f64)> {
+        match &enc_w[v] {
+            Some(w) => spans.iter().zip(w).filter(|(_, &w)| w == 1).map(|(&s, _)| s).collect(),
+            None => vec![(0.0, tau)],
+        }
+    };
+    let ll_parts = |v: usize, kin: &Kinetic, i: usize, e: &[f64], fl: &[f64]| -> ReadParts {
+        ll_parts_spans(v, kin, i, e, fl, &labeled_spans(v, kin.tau))
     };
 
     // ---- compat: simasl's one exp(-TE/T2) per phantom voxel, tissue and blood alike, with its
@@ -551,9 +611,9 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
         let mut mz_sum = vec![vec![vec![0.0f64; n_labels]; nz]; n];
         let mut mz_count = vec![vec![0usize; n_labels]; nz];
         for z in 0..nz {
-            let cycles: Vec<LlCycle> = l.cycles.iter().enumerate().map(|(c, cy)| LlCycle {
+            let cycles: Vec<LlCycle> = l.cycles.iter().map(|cy| LlCycle {
                 tr: rows[cy.rows[0]].tr,
-                s: if cy.m0scan { None } else { suppression[sched.cycles[c].raws.start].as_ref() },
+                s: if cy.m0scan { None } else { suppression[cy.rows[0]].as_ref() },
                 t_read: if cy.m0scan { vec![slice_offsets[z]] } else { cy.rows.iter().map(|&r| rows[r].t + slice_offsets[z]).collect() },
                 flip_deg: cy.rows.iter().map(|&r| l.flip_deg[r]).collect(),
             }).collect();
@@ -635,6 +695,8 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
             let read = ll_read(v, slice_offsets[z]);
             let dm_read = |i: usize| -> f64 {
                 match &read {
+                    // P7 part B: an encoded raw volume's labeled sub-boli, depleted
+                    Some((e, fl)) if ph.dseg[i] > 0 && enc_w[v].is_some() => ll_parts(v, &kin, i, e, fl).total(),
                     Some((e, fl)) if ph.dseg[i] > 0 => delta_m_read(
                         &kin, ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64, e, fl),
                     Some(_) => 0.0,
@@ -765,7 +827,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
         } else {
             blood_for(v, row, &r_sim, sign, wants_gt && motion_on)
         };
-        if let (true, Some(gr)) = (wants_gt, gt_read.as_mut()) {
+        if let (true, Some(gr), true) = (wants_gt, gt_read.as_mut(), p.hadamard.is_none()) {
             // P6 part B: what the readout read, sin(a_n) times the depleted label, static
             let kin = p.kinetic(row);
             let fa = ll.map_or(90.0, |l| l.flip_deg[v]).to_radians().sin();
@@ -957,7 +1019,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                     };
                     // P7 part A: under Look-Locker the images read the depleted parts, each with its
                     // parcel factor; the P4 truths below keep their P4 meaning (at t, undepleted)
-                    let (s, dm_img, iv_img) = match (&read, ll_parts_on) {
+                    let (s, dm_img, iv_img) = match (&read, ll_parts_on || enc_w[v].is_some()) {
                         (Some((e, fl)), true) => {
                             let pr = ll_parts(v, &kin, i, e, fl);
                             (sign0, pr.total(), p.exchange_time.map(|_| pr.iv))
@@ -1032,6 +1094,83 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                 }
             }
         }
+    }
+
+    // ---- P7 part B: under Hadamard the read truths are per decoded output: sub-bolus j as readout
+    // n read it, sin(a_n) times its depleted label (each part, with its parcel factors) and its
+    // fresh arterial parcel; zero for m0scan outputs ----
+    if let (Some(h), Some(_)) = (&p.hadamard, ll) {
+        let n_out = sched.outputs.len();
+        let decoded_alloc = |on: bool| on.then(|| vec![0.0f32; nvox_acq * n_out]);
+        let mut d_read = vec![0.0f32; nvox_acq * n_out];
+        let (mut d_iv, mut d_ev) = (decoded_alloc(gt_read_iv.is_some()), decoded_alloc(gt_read_ev.is_some()));
+        let mut d_art = decoded_alloc(gt_read_art.is_some());
+        let [pnx, pny, _] = ph.grid.dims;
+        let pslab = pnx * pny;
+        for (k_out, o) in sched.outputs.iter().enumerate() {
+            let Output::Decoded { cycle, subbolus, readout } = *o else { continue };
+            let r = readout_groups(&sched.cycles[cycle], h.order)[readout][0];
+            let row = &rows[r];
+            let kin = p.kinetic(row);
+            let fa = ll.map_or(90.0, |l| l.flip_deg[r]).to_radians().sin();
+            let span = [h.spans[subbolus]];
+            for z in 0..nz {
+                let read = ll_read(r, slice_offsets[z]);
+                let zs = r_acq.z_slab(z);
+                let (zlo, zhi) = match (zs.first(), zs.last()) {
+                    (Some(a), Some(b)) => (a.0, b.0),
+                    _ => (0, 0),
+                };
+                let base = pslab * zlo;
+                let parts: Vec<ReadParts> = (base..pslab * (zhi + 1))
+                    .map(|i| match &read {
+                        Some((e, fl)) if ph.dseg[i] > 0 => ll_parts_spans(r, &kin, i, e, fl, &span),
+                        _ => ReadParts::default(),
+                    })
+                    .collect();
+                let put = |dst: &mut Vec<f32>, f: &dyn Fn(usize) -> f64| {
+                    let sl = r_acq.mean_slice(z, f);
+                    for (jj, x) in sl.iter().enumerate() {
+                        dst[(z * nx * ny + jj) * n_out + k_out] = *x;
+                    }
+                };
+                put(&mut d_read, &|i| fa * parts[i - base].total());
+                if let Some(g) = d_iv.as_mut() {
+                    put(g, &|i| fa * parts[i - base].iv);
+                }
+                if let Some(g) = d_ev.as_mut() {
+                    put(g, &|i| fa * parts[i - base].ev);
+                }
+                if let (Some(g), Some(abv), Some(aatt)) = (d_art.as_mut(), &p4.abv, &p4.aatt) {
+                    let t = row.t + slice_offsets[z];
+                    let bolus = bolus_of(r);
+                    let (aj, bj) = h.spans[subbolus];
+                    put(g, &|i| {
+                        if ph.dseg[i] <= 0 {
+                            return 0.0;
+                        }
+                        let (va, a) = arterial_dm(&kin, abv[i], aatt[i], ph.m0[i] as f64, t);
+                        match a {
+                            Some(a) if aj <= a && a < bj => {
+                                let g = match &bolus {
+                                    Some((region, pulses, eps)) => {
+                                        arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, aatt[i]))
+                                    }
+                                    None => 1.0,
+                                };
+                                let c = p4.crush.as_ref().map_or(1.0, |cr| cr[r][p4.label_of[i]]);
+                                fa * g * c * va
+                            }
+                            _ => 0.0,
+                        }
+                    });
+                }
+            }
+        }
+        gt_read = Some(d_read);
+        gt_read_iv = d_iv;
+        gt_read_ev = d_ev;
+        gt_read_art = d_art;
     }
 
     // ---- motion: per-volume poses, then multiband shot events ----
@@ -1187,9 +1326,6 @@ pub(super) fn simulate_p6(
 ) -> Result<SeriesOutput, String> {
     let tes = p.echo_times_s.clone();
     let sched = Schedule::new(p);
-    if p.hadamard.as_ref().is_some_and(|h| h.readouts > 1) {
-        return Err("[hadamard] with Look-Locker readouts: the series is not implemented yet (P7 plan, Task 8)".to_string());
-    }
     // P6 part C, compat: the echo-time decay is the signal stage's, so each echo has its own image
     // set, bounded before any is built: the grids and the compartment count resolved alone
     if p.compat.is_some() && tes.len() > 1 {
@@ -1403,15 +1539,18 @@ pub(super) fn simulate_p6(
                 img.iter().zip(&brain).filter(|(_, b)| **b).map(|(z, _)| z.0 * z.0 + z.1 * z.1).sum::<f64>().sqrt()
             };
             let eps = 1e-12 * acq.signal_scale;
-            Some(per_echo.iter().map(|(tm, tp)| sched.cycles.iter().enumerate().map(|(cy, c)| {
-                let raw: Vec<Vec<(f64, f64)>> = c.raws.clone().map(|r| complex_volume(tm, tp, nt, r)).collect();
-                let refs: Vec<&[(f64, f64)]> = raw.iter().map(|v| v.as_slice()).collect();
+            // per cycle, per readout (P7 part B: one group without Look-Locker)
+            Some(per_echo.iter().map(|(tm, tp)| sched.cycles.iter().enumerate().flat_map(|(cy, c)| {
                 let reference = norm(&complex_volume(tm, tp, nt, n + cy));
-                let per_subbolus = crate::hadamard::decode(&refs, h.order).iter().map(|l| {
-                    let a = norm(l);
-                    (a, a / reference.max(eps))
-                }).collect();
-                HadamardLeakage { reference_norm: reference, per_subbolus }
+                readout_groups(c, h.order).into_iter().enumerate().map(move |(readout, g)| {
+                    let raw: Vec<Vec<(f64, f64)>> = g.iter().map(|&r| complex_volume(tm, tp, nt, r)).collect();
+                    let refs: Vec<&[(f64, f64)]> = raw.iter().map(|v| v.as_slice()).collect();
+                    let per_subbolus = crate::hadamard::decode(&refs, h.order).iter().map(|l| {
+                        let a = norm(l);
+                        (a, a / reference.max(eps))
+                    }).collect();
+                    HadamardLeakage { cycle: cy, readout, reference_norm: reference, per_subbolus }
+                }).collect::<Vec<_>>()
             }).collect()).collect())
         }
         _ => None,
@@ -1549,7 +1688,7 @@ pub(super) fn simulate_p6(
             echo_time_s: tes[e + 1], mag, phase, m0: more_m0.get(e).cloned(),
         }).collect(),
         hadamard,
-        look_locker: p.look_locker.as_ref().map(|l| LookLockerSeries {
+        look_locker: ll_on_raws(p, &sched).map(|l| LookLockerSeries {
             delta_m_read: gt_read,
             lines: ll_lines,
             legacy_dispatch: ll_legacy_dispatch(l.cycles.iter().map(|c| c.rows.len()), l.flip_array),
@@ -2285,7 +2424,7 @@ mod tests {
                     let c = Case {
                         k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64, t,
                         excitations: excitations.clone(), entry_lead: 0.0, pulses: vec![1.2], epsilon: eps,
-                        region: PRegion::Slab(0.3), tau_ex: Some(0.6),
+                        region: PRegion::Slab(0.3), tau_ex: Some(0.6), span: (0.0, kin.tau),
                     };
                     let (iv, total) = c.read(4);
                     let l = l as usize;
@@ -2345,5 +2484,184 @@ mod tests {
         // the label read is P6's, bit for bit
         assert_eq!(b.gt_read.as_ref().unwrap().iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                    bm.gt_read.as_ref().unwrap().iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+    }
+
+    // ---- P7 part B: Look-Locker x Hadamard
+
+    const LLH_PLDS: [f64; 3] = [1.0, 1.3, 1.6];
+    const LLH_TAU: f64 = 0.3;
+
+    /// Hadamard-4 PCASL on the crop (three 0.3 s sub-boli), each encoded preparation read at
+    /// PLD_n = 1.0, 1.3, 1.6 s (60 degrees), `cycles` encoding cycles, an m0scan row first with
+    /// `m0`; the context the decoded volumes, readout-major.
+    fn ll_hadamard_p(cycles: usize, m0: bool, extra: &str) -> Protocol {
+        let (mut ld, mut pld, mut tr, mut ctx) = (Vec::new(), Vec::new(), Vec::new(), String::from("volume_type\n"));
+        if m0 {
+            ld.push(0.0);
+            pld.push(0.0);
+            tr.push(6.0);
+            ctx.push_str("m0scan\n");
+        }
+        for _ in 0..cycles {
+            for p_n in LLH_PLDS {
+                for j in 0..3 {
+                    ld.push(LLH_TAU);
+                    pld.push(p_n + LLH_TAU * (2 - j) as f64);
+                    tr.push(4.0);
+                    ctx.push_str("deltam\n");
+                }
+            }
+        }
+        let mut s = sidecar(ld, pld, tr, if m0 { "Included" } else { "Absent" }, true);
+        s["LookLocker"] = json!(true);
+        parse_echoes(&[s], &ctx, Some(&overlay(&format!("[hadamard]\norder = 4\n[look_locker]\nreadouts_per_cycle = 3\n{extra}"), true)), None)
+            .unwrap()
+    }
+
+    /// The raw images summed over compartments, as magnitude and phase (0 or pi), voxel-major.
+    fn summed(b: &Built) -> (Vec<f32>, Vec<f32>) {
+        let n = b.n;
+        let tot: Vec<f32> = (0..b.nvox_sim * n).map(|x| b.images.iter().map(|c| c[x]).sum::<f32>()).collect();
+        (tot.iter().map(|x| x.abs()).collect(), tot.iter().map(|x| if *x < 0.0 { std::f32::consts::PI } else { 0.0 }).collect())
+    }
+
+    /// Decoded output `k` at simulation voxel `x`, as a real number.
+    fn real_at(m: &[f32], ph: &[f32], n_out: usize, x: usize, k: usize) -> f64 {
+        m[x * n_out + k] as f64 * (ph[x * n_out + k] as f64).cos()
+    }
+
+    /// Decoded (j, n) of a noiseless steady-state series is sin(a_n) times sub-bolus j as readout n
+    /// read it (depleted by the readouts before it in its preparation; with exchange), against the
+    /// parcel reference through the series' resampler: the raw images decoded per readout by the
+    /// production decode. Two encoding rows swapped, or one raw volume's sign flipped, fail it.
+    #[test]
+    fn look_locker_hadamard_decodes_per_readout() {
+        use crate::kinetic::parcel_ref::{Case, Region as PRegion};
+        let ph = crop();
+        let p = ll_hadamard_p(2, false, "[kinetic]\nexchange_time = 0.6\n");
+        let sched = Schedule::new(&p);
+        let b = build(&p, &ph, T2Mode::Class, RowOverride::None, p.echo_times_s[0], &sched).unwrap();
+        let n = b.n;
+        assert_eq!(n, 2 * 4 * 3);
+        let r_sim = Resampler::with_offset(ph.grid.dims, crate::resample::axis_aligned_voxels(&ph.grid).unwrap(), b.sim_grid.dims,
+            [p.voxel_size_mm[0] / p.acq.oversample as f64, p.voxel_size_mm[1] / p.acq.oversample as f64, p.voxel_size_mm[2]],
+            crate::resample::corner_offset(&ph.grid, &b.acq_grid).unwrap());
+        let [snx, sny, nz] = b.sim_grid.dims;
+        let n_out = sched.outputs.len();
+        let fa = 60f64.to_radians();
+        let h = p.hadamard.as_ref().unwrap();
+        let kin = p.kinetic(&sched.raw_rows[0]);
+        // the reference of every output, per slice
+        let want: Vec<Vec<Vec<f32>>> = sched.outputs.iter().map(|o| {
+            let Output::Decoded { subbolus, readout, .. } = *o else { unreachable!("no m0scan") };
+            (0..nz).map(|z| {
+                let off = b.slice_offsets[z];
+                let e = |m: usize| 0.9 + LLH_PLDS[m] + off;
+                r_sim.mean_slice(z, |i| {
+                    if ph.dseg[i] <= 0 {
+                        return 0.0;
+                    }
+                    let c = Case {
+                        k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64,
+                        t: e(readout), excitations: (0..readout).map(|m| (e(m), 60.0)).collect(), entry_lead: 0.0, pulses: vec![],
+                        epsilon: 0.0, region: PRegion::Global, tau_ex: Some(0.6), span: h.spans[subbolus],
+                    };
+                    fa.sin() * c.read(4).1
+                })
+            }).collect()
+        }).collect();
+        let peak = want.iter().flatten().flatten().fold(0.0f32, |m, x| m.max(x.abs())) as f64;
+        assert!(peak > 0.0);
+        let worst = |m: &[f32], phs: &[f32]| -> f64 {
+            let mut w = 0.0f64;
+            for (k, per) in want.iter().enumerate() {
+                for (z, sl) in per.iter().enumerate() {
+                    for (jj, &x) in sl.iter().enumerate() {
+                        w = w.max((real_at(m, phs, n_out, z * snx * sny + jj, k) - x as f64).abs());
+                    }
+                }
+            }
+            w
+        };
+        let (m, phs) = summed(&b);
+        let (dm, dp) = decode_series(&sched, 4, &m, &phs, n);
+        let err = worst(&dm, &dp);
+        assert!(err <= 1e-4 * peak, "decoded vs reference: {err:.3e} of peak {peak:.3e}");
+        // negative controls: encoding rows 1 and 2 swapped at readout 0 of cycle 0; raw volume 3's sign
+        let mut swapped = (m.clone(), phs.clone());
+        for x in 0..b.nvox_sim {
+            swapped.0.swap(x * n + 3, x * n + 6);
+            swapped.1.swap(x * n + 3, x * n + 6);
+        }
+        let (sm, sp) = decode_series(&sched, 4, &swapped.0, &swapped.1, n);
+        assert!(worst(&sm, &sp) > 1e-2 * peak, "a swapped column still decodes");
+        let mut flipped = phs.clone();
+        for x in 0..b.nvox_sim {
+            flipped[x * n + 3] = std::f32::consts::PI - flipped[x * n + 3];
+        }
+        let (fm, fp) = decode_series(&sched, 4, &m, &flipped, n);
+        assert!(worst(&fm, &fp) > 1e-2 * peak, "a sign flip still decodes");
+        // the decoded read truth is the same reference, on the acquired grid, its parts summing to it
+        let gt = b.gt_read.as_ref().unwrap();
+        let (giv, gev) = (b.gt_read_iv.as_ref().unwrap(), b.gt_read_ev.as_ref().unwrap());
+        let [anx, any, _] = b.acq_grid.dims;
+        assert_eq!(gt.len(), anx * any * nz * n_out);
+        for (k, o) in sched.outputs.iter().enumerate() {
+            let Output::Decoded { subbolus, readout, .. } = *o else { unreachable!() };
+            for z in 0..nz {
+                let off = b.slice_offsets[z];
+                let e = |m: usize| 0.9 + LLH_PLDS[m] + off;
+                let w = b.r_acq.mean_slice(z, |i| {
+                    if ph.dseg[i] <= 0 {
+                        return 0.0;
+                    }
+                    let c = Case {
+                        k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64,
+                        t: e(readout), excitations: (0..readout).map(|m| (e(m), 60.0)).collect(), entry_lead: 0.0, pulses: vec![],
+                        epsilon: 0.0, region: PRegion::Global, tau_ex: Some(0.6), span: h.spans[subbolus],
+                    };
+                    fa.sin() * c.read(4).1
+                });
+                for (jj, x) in w.iter().enumerate() {
+                    let at = (z * anx * any + jj) * n_out + k;
+                    assert!((gt[at] - x).abs() <= 1e-5 * peak as f32, "truth output {k} slice {z}: {} vs {x}", gt[at]);
+                    assert!((giv[at] + gev[at] - gt[at]).abs() <= 1e-5 * peak as f32);
+                }
+            }
+        }
+    }
+
+    /// In the steady state the encoding rows' tissue is the same and decodes away at every readout;
+    /// an included M0 before the first cycle leaves the first rows' tissue in a transient, and the
+    /// decoded tissue part L_{j,n} is nonzero.
+    #[test]
+    fn look_locker_hadamard_tissue_residual() {
+        let ph = crop();
+        for (m0, transient) in [(false, false), (true, true)] {
+            let p = ll_hadamard_p(1, m0, "");
+            let sched = Schedule::new(&p);
+            let b = build(&p, &ph, T2Mode::Class, RowOverride::None, p.echo_times_s[0], &sched).unwrap();
+            let n = b.n;
+            let to = b.tissue_only.as_ref().unwrap();
+            let tot: Vec<f32> = (0..b.nvox_sim * n).map(|x| to.iter().map(|c| c[x]).sum::<f32>()).collect();
+            let peak = tot.iter().fold(0.0f32, |a, x| a.max(x.abs())) as f64;
+            let (mm, pp): (Vec<f32>, Vec<f32>) = (tot.iter().map(|x| x.abs()).collect(),
+                                                  tot.iter().map(|x| if *x < 0.0 { std::f32::consts::PI } else { 0.0 }).collect());
+            let (dm, dp) = decode_series(&sched, 4, &mm, &pp, n);
+            let n_out = sched.outputs.len();
+            let mut resid = 0.0f64;
+            for (k, o) in sched.outputs.iter().enumerate() {
+                if matches!(o, Output::Decoded { .. }) {
+                    for x in 0..b.nvox_sim {
+                        resid = resid.max(real_at(&dm, &dp, n_out, x, k).abs());
+                    }
+                }
+            }
+            if transient {
+                assert!(resid > 1e-3 * peak, "the transient leaves no residual: {resid:.3e} of {peak:.3e}");
+            } else {
+                assert!(resid < 1e-5 * peak, "the steady state leaves a residual: {resid:.3e} of {peak:.3e}");
+            }
+        }
     }
 }

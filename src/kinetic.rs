@@ -1330,7 +1330,7 @@ mod tests {
     fn case(k: Kinetic, att: f64, t: f64) -> PCase {
         PCase {
             k, f: F, att, t1t: T1T, m0: M0, t, excitations: vec![], entry_lead: 0.0, pulses: vec![], epsilon: 0.0,
-            region: PRegion::Global, tau_ex: None,
+            region: PRegion::Global, tau_ex: None, span: (0.0, k.tau),
         }
     }
 
