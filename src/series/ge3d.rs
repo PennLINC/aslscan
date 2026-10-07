@@ -221,6 +221,14 @@ pub(super) struct Ge3dBuild<'a> {
     pub lead_a: Vec<f64>,
     pub flip_deg: f64,
     pub spacing_s: f64,
+    /// Motion (P5 part D, as on the 3D spin-echo path): each raw volume's pose, each shot's pose
+    /// within its volume (the cumulative jumps of the events before it), each shot's gain (an
+    /// event shot's `1 - severity`), and the simulation grid's voxel-to-world map.
+    pub poses: Vec<Pose>,
+    pub shot_pose: Vec<Vec<Pose>>,
+    pub shot_gain: Vec<Vec<f64>>,
+    pub v2w: [[f64; 4]; 4],
+    pub sim_dims: [usize; 3],
 }
 
 impl Ge3dBuild<'_> {
@@ -328,6 +336,28 @@ pub(super) fn volume_inputs(b: &Ge3dBuild, g: usize) -> mrsim_acq::kspace3d::GeV
             }
         }
     }
+    // motion (P5 part D): the volume's pose moves its images; the shots after a within-volume event
+    // see them moved again by the event's jump (each distinct pose one shot set)
+    let pose = b.poses[g];
+    if pose != Pose::IDENTITY {
+        for im in images.iter_mut().filter(|im| !im.is_empty()) {
+            *im = mrsim_acq::motion::resample_by_pose(im, b.sim_dims, b.v2w, pose);
+        }
+    }
+    let mut distinct: Vec<Pose> = Vec::new();
+    for &q in &b.shot_pose[g] {
+        if q != Pose::IDENTITY && !distinct.contains(&q) {
+            distinct.push(q);
+        }
+    }
+    let shot_images: Option<Vec<mrsim_acq::kspace3d::ShotSet>> = (!distinct.is_empty()).then(|| {
+        distinct.iter().map(|&q| mrsim_acq::kspace3d::ShotSet {
+            shots: (0..b.shot_pose[g].len()).filter(|&s| b.shot_pose[g][s] == q).collect(),
+            images: images.iter().map(|im| {
+                if im.is_empty() { Vec::new() } else { mrsim_acq::motion::resample_by_pose(im, b.sim_dims, b.v2w, q) }
+            }).collect(),
+        }).collect()
+    });
     let ky_segments = b.res.readout.ky_segments;
     let nz = b.table.nz;
     let sin_a = b.flip_deg.to_radians().sin();
@@ -341,6 +371,8 @@ pub(super) fn volume_inputs(b: &Ge3dBuild, g: usize) -> mrsim_acq::kspace3d::GeV
             let prep = first_prep + shot;
             debug_assert_eq!(preps[shot].shot, shot);
             let (tf, lf) = b.prep_factors[prep];
+            let gain = b.shot_gain[g][shot];
+            let (tf, lf) = (tf * gain, lf * gain);
             let at = |c: usize| (p * ky_segments + sy) * ncomp + c;
             if tissue_on {
                 for (gi, mz) in b.group_mz.iter().enumerate() {
@@ -358,7 +390,7 @@ pub(super) fn volume_inputs(b: &Ge3dBuild, g: usize) -> mrsim_acq::kspace3d::GeV
             }
         }
     }
-    mrsim_acq::kspace3d::GeVolume { images, weights, shot_images: None }
+    mrsim_acq::kspace3d::GeVolume { images, weights, shot_images }
 }
 
 /// What [`prepare_ge3d`] resolves for [`simulate_ge3d`]: the build and the series' grids and
@@ -377,6 +409,9 @@ pub(super) struct Ge3dPrepared<'a> {
     pub achieved: f64,
     /// The phantom's foreground voxels.
     pub fg: Vec<usize>,
+    pub motion_seed: Option<u64>,
+    pub events: Vec<MotionEvent>,
+    pub dropped: Vec<DroppedShot>,
 }
 
 /// Everything before the acquisition (P7 Task 15): the grids, the train, the tissue groups and
@@ -389,7 +424,6 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
         return Err("the test-hook row overrides are not available on the 3D gradient-echo series".to_string());
     }
     for (what, on) in [
-        ("[motion] (per-shot motion on the 3D gradient-echo train is deferred, P7 plan, Task 15)", p.motion.is_some()),
         ("LookLocker: true (P7 plan, Task 16)", p.look_locker.is_some()),
         ("[hadamard] (P7 plan, Task 18)", p.hadamard.is_some()),
     ] {
@@ -509,9 +543,42 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
         }
     }
 
+    // ---- motion (P5 part D): per-volume poses; within-volume events per shot, each jump persisting
+    // for the later shots of its volume, each event shot attenuated by 1 - severity ----
+    let n_shots = res.n_shots;
+    let motion_seed = p.motion.as_ref().map(|_| p.seed ^ MOTION_SEED_SALT);
+    let mut poses = vec![Pose::IDENTITY; n];
+    let mut events = Vec::new();
+    if let (Some(m), Some(seed)) = (&p.motion, motion_seed) {
+        poses = resolve_poses(&m.mode, n, seed);
+        events = draw_events(m.within.as_ref(), n, n_shots, seed);
+    }
+    let mut shot_pose = vec![vec![Pose::IDENTITY; n_shots]; n];
+    let mut shot_gain = vec![vec![1.0f64; n_shots]; n];
+    let mut dropped = Vec::new();
+    for (g, sp) in shot_pose.iter_mut().enumerate() {
+        let evs: Vec<&MotionEvent> = events.iter().filter(|e| e.volume == g && e.shot < n_shots).collect();
+        let mut cum = Pose::IDENTITY;
+        for (sh, pose) in sp.iter_mut().enumerate() {
+            for e in evs.iter().filter(|e| e.shot == sh) {
+                for k in 0..3 {
+                    cum.trans_mm[k] += e.jump_mm[k];
+                    cum.rot_deg[k] += e.jump_deg[k];
+                }
+            }
+            *pose = cum;
+        }
+        for e in &evs {
+            let atten = DropoutLaw::Uniform.attenuation(g, e.severity);
+            shot_gain[g][e.shot] *= atten as f64;
+            dropped.push(DroppedShot { volume: g, shot: e.shot, slices: Vec::new(), attenuation: atten });
+        }
+    }
+
     let mut b = Ge3dBuild {
         p, ph, res, table, sched, r_sim, masks, groups, group_images, group_mz, families, k_nodes: 0, nodes: Vec::new(),
-        prep_factors, label_scale, p4, bolus_region, lead, lead_a, flip_deg, spacing_s,
+        prep_factors, label_scale, p4, bolus_region, lead, lead_a, flip_deg, spacing_s, poses, shot_pose, shot_gain,
+        v2w: sim_grid.voxel_to_world, sim_dims: sim_grid.dims,
     };
 
     // ---- the node selection, per raw volume and family; one count for the series ----
@@ -544,6 +611,7 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
     b.nodes = nodes;
     Ok(Ge3dPrepared {
         b, acq_grid, sim_grid, r_acq, relax, mode_used, acq, fmap_sim, physio_lines, label_factors, achieved, fg,
+        motion_seed, events, dropped,
     })
 }
 
@@ -554,8 +622,10 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
     -> Result<SeriesOutput, String>
 {
     let g3 = p.ge3d().expect("a 3D gradient-echo protocol");
-    let Ge3dPrepared { b, acq_grid, sim_grid, r_acq, relax, mode_used, acq, fmap_sim, physio_lines, label_factors, achieved, fg } =
-        prepare_ge3d(p, ph, mode, ov)?;
+    let Ge3dPrepared {
+        b, acq_grid, sim_grid, r_acq, relax, mode_used, acq, fmap_sim, physio_lines, label_factors, achieved, fg, motion_seed,
+        events, dropped,
+    } = prepare_ge3d(p, ph, mode, ov)?;
     let n = b.sched.raw_rows.len();
     let [_, _, nz] = acq_grid.dims;
     let nvox_sim = sim_grid.dims.iter().product::<usize>();
@@ -678,10 +748,48 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
             put(g, &per[f]);
         }
     }
+    // under motion the truths are moved by each volume's pose on the simulation grid (no shot events)
+    // and block-averaged, the unmoved kept as delta_m_static, as on the 3D spin-echo path
+    let (delta_m, delta_m_static, gt_iv, gt_art) = if p.motion.is_some() {
+        let o = p.acq.oversample;
+        let mv = |sim: Vec<f32>| -> Vec<f32> {
+            let mut arr = [sim];
+            apply_motion(&mut arr, sim_grid.dims, n, sim_grid.voxel_to_world, &b.poses);
+            let [moved] = arr;
+            block_mean_inplane(&moved, sim_grid.dims, o, n)
+        };
+        let moved = |which: usize| -> Vec<f32> {
+            let mut sim = vec![0.0f32; nvox_sim * n];
+            for v in 0..n {
+                if !matches!(sched_kind(&b, v), RowKind::Label | RowKind::Deltam) {
+                    continue;
+                }
+                let mut per: Vec<Vec<f32>> = vec![vec![0.0f32; ph.nvox()]; b.families.len()];
+                for &i in &fg {
+                    for (f, r) in b.reads(v, i).iter().enumerate() {
+                        per[f][i] = r[e_c] as f32;
+                    }
+                }
+                let fam = |x: Family| b.families.iter().position(|y| *y == x);
+                let src: Vec<f32> = match which {
+                    0 => (0..ph.nvox()).map(|i| per[0][i] + fam(Family::Extravascular).map_or(0.0, |f| per[f][i])).collect(),
+                    1 => per[0].clone(),
+                    _ => fam(Family::Arterial).map_or(vec![0.0; ph.nvox()], |f| per[f].clone()),
+                };
+                for (vox, x) in b.r_sim.mean(&src).iter().enumerate() {
+                    sim[vox * n + v] = *x;
+                }
+            }
+            mv(sim)
+        };
+        (moved(0), Some(delta_m), gt_iv.map(|_| moved(1)), gt_art.map(|_| moved(2)))
+    } else {
+        (delta_m, None, gt_iv, gt_art)
+    };
     let perfused: Vec<bool> = ph.perfusion.iter().map(|f| *f > 0.0).collect();
     let ground_truth = GroundTruth {
         delta_m,
-        delta_m_static: None,
+        delta_m_static,
         perfusion: r_acq.mean(&ph.perfusion),
         att: r_acq.masked_mean(&ph.att, &perfused),
         t1: r_acq.mean(&ph.t1),
@@ -736,8 +844,7 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
     Ok(SeriesOutput {
         acq_grid, sim_grid, n_volumes: n, mag, phase: phase_out, m0, mode: mode_used, labels: ph.labels.clone(),
         n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(), seeds: (p.seed, m0_seed), acquisition: acq,
-        ground_truth, label_factors, poses: vec![Pose::IDENTITY; n], motion_seed: None, events: Vec::new(),
-        dropped: Vec::new(), compat: None, crush_survival: b.p4.crush.clone(),
+        ground_truth, label_factors, poses: b.poses.clone(), motion_seed, events, dropped, compat: None, crush_survival: b.p4.crush.clone(),
         physio: b.p4.physio.as_ref().map(|_| physio_lines), ge_rule: Some(
             "every excitation of the train an event on the tissue's timeline (spoiled): the first preparation at its \
              steady state, each later one from the end of the one before"),
@@ -1058,8 +1165,71 @@ mod tests {
         assert_eq!(out.n_volumes, 2);
         assert!(out.ge3d.is_some() && out.readout.is_none());
         assert!(out.mag.iter().all(|x| x.is_finite()) && out.mag.iter().any(|x| *x > 0.0));
-        let motion = ge3d_protocol("[motion]\nmode = \"random\"\ntrans_mm = [1.0, 1.0, 0.0]\nrot_deg = [0.0, 0.0, 1.0]\n");
-        assert!(simulate_ge3d(&motion, &ph, T2Mode::Auto, &phase, RowOverride::None).unwrap_err().contains("[motion]"));
         assert!(simulate_ge3d(&ge3d_protocol(""), &ph, T2Mode::Auto, &phase, RowOverride::BloodIntoTissue0).is_err());
+    }
+
+    const MOTION: &str = "[motion]\nmode = \"random\"\ntrans_mm = [1.0, 1.0, 0.0]\nrot_deg = [0.0, 0.0, 2.0]\nvolumes = [1]\n\
+                          [motion.within_volume]\ndropout_rate = 1.0\nseverity = 0.3\njump_mm = [0.5, 0.0, 0.0]\njump_deg = [0.0, 0.0, 1.0]\n";
+
+    /// Motion on the 3D gradient-echo train (P5 part D, as on the spin-echo path): each volume's
+    /// images are the static ones moved by its pose; the shots after a within-volume event see them
+    /// moved again by the cumulative jump (one shot set per distinct pose); an event shot's weights
+    /// are scaled by 1 - severity; the truth is moved by the volume poses, the static one kept.
+    #[test]
+    fn motion_moves_the_volumes_and_their_shots() {
+        let ph = crop();
+        let (ps, pm) = (ge3d_protocol(""), ge3d_protocol(MOTION));
+        let still = prepare_ge3d(&ps, &ph, T2Mode::Class, RowOverride::None).unwrap();
+        let moving = prepare_ge3d(&pm, &ph, T2Mode::Class, RowOverride::None).unwrap();
+        let (bs, bm) = (&still.b, &moving.b);
+        assert_eq!(bm.poses[0], Pose::IDENTITY);
+        assert_ne!(bm.poses[1], Pose::IDENTITY);
+        assert!(!moving.events.is_empty() && moving.dropped.len() == moving.events.len());
+        let ky = bm.res.readout.ky_segments;
+        let ncomp = bm.n_compartments();
+        assert_eq!(ncomp, bs.n_compartments());
+        let mut sets_seen = 0;
+        for g in 0..2 {
+            let (vs, vm) = (volume_inputs(bs, g), volume_inputs(bm, g));
+            for (a, b) in vs.images.iter().zip(&vm.images) {
+                if a.is_empty() {
+                    assert!(b.is_empty());
+                    continue;
+                }
+                let want = if bm.poses[g] == Pose::IDENTITY { a.clone() }
+                           else { mrsim_acq::motion::resample_by_pose(a, bm.sim_dims, bm.v2w, bm.poses[g]) };
+                assert_eq!(b, &want, "volume {g}: the volume's pose");
+            }
+            for set in vm.shot_images.iter().flatten() {
+                sets_seen += 1;
+                let q = bm.shot_pose[g][set.shots[0]];
+                assert!(q != Pose::IDENTITY && set.shots.iter().all(|&s| bm.shot_pose[g][s] == q));
+                for (im, base) in set.images.iter().zip(&vm.images) {
+                    if !base.is_empty() {
+                        assert_eq!(im, &mrsim_acq::motion::resample_by_pose(base, bm.sim_dims, bm.v2w, q));
+                    }
+                }
+            }
+            for pp in 0..8 {
+                for sy in 0..ky {
+                    let gain = bm.shot_gain[g][bm.table.line(pp, sy).shot];
+                    for c in 0..ncomp {
+                        let at = (pp * ky + sy) * ncomp + c;
+                        assert!((vm.weights[at] - gain * vs.weights[at]).abs() <= 1e-12 * vs.weights[at].abs().max(1e-300));
+                    }
+                }
+            }
+            assert!(bm.shot_gain[g].iter().any(|&x| (x - 0.7).abs() < 1e-6), "an event shot in every volume (rate 1)");
+        }
+        assert!(sets_seen > 0, "an event before the last shot moves the later ones");
+        // the series: the truth moved by the volume poses, the static kept; poses and events recorded
+        let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
+        let out_s = simulate_ge3d(&ps, &ph, T2Mode::Class, &phase, RowOverride::None).unwrap();
+        let out_m = simulate_ge3d(&pm, &ph, T2Mode::Class, &phase, RowOverride::None).unwrap();
+        let gt = &out_m.ground_truth;
+        assert_eq!(gt.delta_m_static.as_ref().unwrap(), &out_s.ground_truth.delta_m);
+        assert_ne!(gt.delta_m, out_s.ground_truth.delta_m);
+        assert_eq!((out_m.poses.len(), out_m.events.len(), out_m.motion_seed.is_some()), (2, moving.events.len(), true));
+        assert_ne!(out_m.mag, out_s.mag);
     }
 }
