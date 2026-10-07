@@ -82,11 +82,10 @@ pub(super) fn cycle_of(sched: &Schedule, raw_flip: &[f64], n_exc: usize, spacing
     let r0 = sched.preps[prep].raw;
     let m = sched.raws[r0..].iter().take_while(|r| r.prep == prep).count();
     let (mut times, mut flips) = (Vec::with_capacity(m * n_exc), Vec::with_capacity(m * n_exc));
-    for r in r0..r0 + m {
-        let row = &sched.raw_rows[r];
+    for (row, &fa) in sched.raw_rows[r0..r0 + m].iter().zip(&raw_flip[r0..r0 + m]) {
         let start = if row.kind == RowKind::M0scan { 0.0 } else { row.t };
         times.extend(train_times(start, n_exc, spacing_s));
-        flips.extend(std::iter::repeat_n(raw_flip[r], n_exc));
+        flips.extend(std::iter::repeat_n(fa, n_exc));
     }
     (times, flips, (v - r0) * n_exc)
 }
@@ -1321,9 +1320,9 @@ mod tests {
         let cyc_times = |r0: usize| -> (Vec<f64>, Vec<f64>) {
             let mut t = Vec::new();
             let mut f = Vec::new();
-            for n in 0..3 {
+            for (n, &fa) in flips.iter().enumerate() {
                 t.extend(train_times(b.sched.raw_rows[r0 + n].t, 4, spacing));
-                f.extend(std::iter::repeat_n(flips[n], 4));
+                f.extend(std::iter::repeat_n(fa, 4));
             }
             (t, f)
         };
