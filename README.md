@@ -30,7 +30,8 @@ aslscan simulates this in three stages.
    blood is carried in its own compartments so that it relaxes with its own T2.
 3. **Acquisition.** The images pass through a model of the scanner readout, provided by the
    companion library [mrsim-acq](https://github.com/PennLINC/mrsim-acq). The readout can be 2D
-   echo-planar (EPI), 3D GRASE, or 3D stack-of-spirals. This step can add the following:
+   echo-planar (EPI), 3D GRASE, 3D stack-of-spirals, or a 3D gradient-echo EPI train. This step can add
+   the following:
    - distortion from a B0 fieldmap;
    - signal decay during the readout;
    - Gibbs ringing;
@@ -47,17 +48,19 @@ The design and its validation against ASLDRO, the Python ASL simulator used as t
 are documented in the [mrsim-acq specs](https://github.com/PennLINC/mrsim-acq/tree/main/docs/specs).
 The first spec covers the core. The later addenda cover ASLDRO compatibility (P2); motion,
 background suppression and inversion recovery (P3); the vascular and physiological extensions
-(P4); 3D readouts and gradient echo (P5); and Hadamard, Look-Locker and multi-echo (P6).
+(P4); 3D readouts and gradient echo (P5); Hadamard, Look-Locker and multi-echo (P6); and QUASAR, the
+Look-Locker combinations and the 3D gradient-echo EPI train (P7).
 
 ### Supported protocols
 
 | Area | Supported |
 |---|---|
 | Labeling | PCASL, CASL, PASL (with bolus cut-off, e.g. QUIPSS II/Q2TIPS); Hadamard time-encoded (P)CASL |
-| Delays | Single or multiple post-labeling delays; Look-Locker readouts (several per labeling, 2D) |
-| Readout | 2D multi-slice EPI (with multiband), 3D GRASE, 3D stack-of-spirals |
+| Delays | Single or multiple post-labeling delays; Look-Locker readouts (several per labeling; 2D EPI or 3D EPI) |
+| Readout | 2D multi-slice EPI (with multiband), 3D GRASE, 3D stack-of-spirals, 3D gradient-echo EPI (stack of EPI) |
 | Contrast | Spin echo, inversion recovery, gradient echo |
-| Echoes | One, or several echo times (2D EPI; the BIDS `echo-N` layout) |
+| Echoes | One, or several echo times (2D EPI or 3D EPI; the BIDS `echo-N` layout) |
+| Combinations | Look-Locker with every vascular extension (QUASAR), with Hadamard, and with several echo times |
 | Background suppression | Pulses at any times; a global-bolus model or a per-parcel bolus-position model |
 | Volumes | `control`, `label`, `deltam`, `m0scan`; M0 included, separate, estimated, or absent |
 | Vascular | Water exchange, an arterial compartment, vascular crushing |
@@ -65,8 +68,8 @@ background suppression and inversion recovery (P3); the vascular and physiologic
 
 Not supported, each reported as an error:
 - velocity-selective labeling, which has no BIDS labeling type yet;
-- Look-Locker or several echo times with 3D readouts;
-- Look-Locker combined with Hadamard or with several echo times;
+- Look-Locker or several echo times with GRASE or spiral readouts;
+- the 3D gradient-echo EPI train with a smooth (not label-wise) T1 map;
 - `cbf` volumes;
 - phase encoding along any axis other than the second (`j` or `j-`).
 
@@ -122,6 +125,9 @@ describes each one:
 | `p6_multite`, `p6_multite_se` | Three echo times (one sidecar per echo) |
 | `p6_hadamard`, `p6_hadamard_grase`, `p6_hadamard_multite` | Hadamard-encoded PCASL in 2D, in 3D, and with three echoes |
 | `p6_ll` | Look-Locker PASL, twelve readouts per labeling |
+| `p7_quasar` | QUASAR-like Look-Locker PASL: crushed and uncrushed cycles, exchange, the arterial compartment |
+| `p7_ll_multite`, `p7_ll_hadamard` | Look-Locker with three echo times; Look-Locker with Hadamard (H8, four readouts) |
+| `p7_ge3d`, `p7_ll3d`, `p7_multite3d` | The 3D gradient-echo EPI train: plain, Look-Locker, three echoes per excitation |
 
 ## Usage
 
@@ -158,9 +164,9 @@ want to reproduce. aslscan reads, among others:
 What each acquisition type needs:
 - **2D:** `MRAcquisitionType: "2D"`, `SliceTiming`, `PhaseEncodingDirection` and
   `TotalReadoutTime`.
-- **3D:** `MRAcquisitionType: "3D"` with `PulseSequenceType` naming GRASE or spiral. For details
-  that BIDS does not carry (segmentation, spiral interleaves and readout time), use the overlay's
-  `[readout]` table.
+- **3D:** `MRAcquisitionType: "3D"` with `PulseSequenceType` naming GRASE, spiral or EPI (for example
+  `"3D EPI"`). For details that BIDS does not carry (segmentation, spiral interleaves and readout time,
+  the gradient-echo train's excitation spacing), use the overlay's `[readout]` table.
 
 ### Overlay file
 
@@ -280,6 +286,25 @@ dwell_time = 4e-6              # s; spiral (otherwise the sidecar's DwellTime)
 refocusing_flip_angle = 150.0  # degrees (default: the sidecar's FlipAngle, else 180)
 ```
 
+The 3D gradient-echo EPI train (`type = "epi3d"`, or a `PulseSequenceType` containing "EPI") has its
+own keys, described under [3D gradient-echo EPI](#3d-gradient-echo-epi):
+
+```toml
+[readout]
+type = "epi3d"
+excitation_spacing = 40.0      # ms between the train's excitations (required)
+slab_entry_time = 0.5          # s after labeling that the label enters the slab, or "arrival"
+                               # (required, unless [background_suppression] gives it)
+kz_segments = 2                # partitions split over shots; ky segments are NumberShots / kz_segments
+kz_order = "centric"           # or "linear"
+excitation_time = 2.0          # ms reserved for each excitation pulse (default 2)
+node_tolerance = 1e-4          # the label interpolation's tolerance, relative to its peak (default 1e-4)
+max_t1_groups = 16             # distinct tissue T1 values allowed (default 16)
+
+[images]
+max_memory_gib = 4.0           # limit on the compartment images held at once (default 4)
+```
+
 The P6 features have their own tables, described in the next section.
 
 ### Multi-echo, Hadamard and Look-Locker
@@ -319,18 +344,64 @@ report_leakage = true          # also decode the tissue alone and report its lea
 ```
 
 **Look-Locker readouts.** Set `LookLocker: true` in the sidecar, with gradient echo
-(`acq_contrast = "ge"`) and a 2D readout.
+(`acq_contrast = "ge"`) and a 2D EPI or 3D gradient-echo EPI readout.
 - `FlipAngle` is required: a scalar, or one value per volume.
 - Each run of consecutive volumes of one type with increasing `PostLabelingDelay` is one labeling
   followed by several readouts.
 - Each readout depletes both the tissue magnetization and the label that has already arrived.
 - One readout per labeling with a single scalar flip reproduces the ordinary gradient-echo series
   exactly.
+- With a `FlipAngle` array and a separate M0, give the M0's flip in `[m0] flip_angle`.
 
 ```toml
 [look_locker]
 readouts_per_cycle = 12        # optional check against the grouping the arrays give
 ```
+
+**Look-Locker combinations.**
+- **QUASAR.** Every vascular extension works under Look-Locker: water exchange, the arterial
+  compartment, vascular crushing with a VENC per volume (for example alternating crushed and
+  uncrushed cycles), and bolus-position suppression. Each readout depletes the intravascular,
+  extravascular and arterial label it reads. In 2D the arterial blood is taken to be fresh at each
+  readout, because it crosses a slice much faster than the readouts are spaced. The sidecar states
+  this assumption.
+- **With several echo times.** Give one sidecar per echo, as above. The echoes of a readout share its
+  depletion.
+- **With Hadamard.** The `aslcontext.tsv` lists the decoded volumes readout by readout: for each
+  readout, its `H - 1` sub-boli in order, each row's `PostLabelingDelay` that sub-bolus's effective
+  delay to the readout. `FlipAngle` and VENC must agree across the sub-boli of one readout. Each
+  readout is decoded on its own.
+
+### 3D gradient-echo EPI
+
+A 3D gradient-echo EPI acquisition (a "stack of EPI") excites the whole slab once per partition. A
+train of small-flip excitations is each followed by an EPI readout of one partition's k-space plane,
+or one ky segment of it in a segmented acquisition. aslscan simulates every excitation of the train.
+- `FlipAngle` is the excitation, in (0, 90] degrees. `EffectiveEchoSpacing` or `TotalReadoutTime`
+  gives the line spacing (the effective spacing times the number of ky segments). `NumberShots` is
+  the number of trains per volume: `kz_segments` times the ky segments.
+- `EchoTime` is the time of each partition readout's k-space centre. aslscan checks that every
+  echo's readout fits between the excitation pulses and that the train fits in the repetition time.
+  A large field of view needs a short effective echo spacing: each echo's readout lasts the number
+  of phase-encoding lines times the effective spacing, however the shots are segmented.
+- The tissue magnetization is followed exactly through every excitation, for each distinct tissue
+  T1. A smooth T1 map has too many distinct values and is refused (see `max_t1_groups`).
+- **Depletion from slab entry.** A 3D excitation covers the whole slab, including its feeding
+  arteries. Label is therefore depleted by every excitation after it enters the slab, not only after
+  it reaches its voxel. `slab_entry_time` is when the label enters the slab, in seconds after
+  labeling, with one value for all arteries. `"arrival"` turns off depletion before the voxel.
+- The label is read at each excitation, interpolated between node excitations chosen to meet
+  `node_tolerance`. All voxels share the same nodes. On a realistic phantom, whose arrival times vary
+  from voxel to voxel, nearly every excitation becomes a node. The result is then exact, but memory
+  and run time grow with the length of the train.
+- **Memory.** The sidecar records the estimated size of the images held at once, and a series over
+  `max_memory_gib` is refused before it runs. The estimate counts only these images; the whole
+  process uses about 1.3 to 1.5 times as much. A train with fewer excitations (more `kz_segments`)
+  needs fewer nodes.
+- The ground truth (`desc-deltam_gt`) is the label at the excitation that reads the centre of
+  k-space, depleted from slab entry.
+- Look-Locker, several echo times per excitation, Hadamard, the vascular extensions, physiology, and
+  motion (per volume and per shot) all work with this readout.
 
 ### Comparing with ASLDRO
 
@@ -405,7 +476,8 @@ Optional features add files:
 | Physiology | `ground-truth/sub-01_desc-physio_gt.tsv`, with the factors applied per volume and slice (or shot). |
 | Several echo times | One series per echo: `sub-01_echo-<n>_part-{mag,phase}_asl.nii.gz` with its own sidecar, and a separate M0 per echo. The one `aslcontext.tsv` and the ground truth are shared by all echoes. |
 | Hadamard | The main series is the *decoded* data. `sourcedata/sub-01/perf/` holds the raw encoded series, a table of the raw volumes, the raw truth, and `desc-preparations_gt.tsv` (the factors applied to each labeling). `TotalAcquiredPairs` is the number of encoding cycles. |
-| Look-Locker | `ground-truth/sub-01_desc-deltamRead_gt` (what each readout read, after depletion) and `desc-lookLocker_gt.tsv` (the tissue magnetization before each readout). |
+| Look-Locker | `ground-truth/sub-01_desc-deltamRead_gt` (what each readout read, after depletion) and `desc-lookLocker_gt.tsv` (the tissue magnetization before each readout). With the vascular extensions, the parts of that read: `_desc-deltamReadIV_gt`, `_desc-deltamReadEV_gt` and `_desc-arterialRead_gt`. |
+| 3D gradient-echo EPI | No extra files. The sidecar's `AslscanSimulation.Readout` records the train, the slab entry, the interpolation nodes and the memory estimate. Physiology is recorded per shot. |
 
 The dataset passes the BIDS validator. The `ground-truth/` directories are listed in
 `.bidsignore`, and validators skip `sourcedata/` by design. Each `*_asl.json` sidecar repeats the
@@ -437,6 +509,8 @@ Two longer checks need locally converted phantoms under `work/`:
   every earlier feature. Use it to show that a change leaves existing outputs unchanged.
 - `tools/compat_asldro.py` (run in a Python environment with ASLDRO) compares `--compat-asldro`
   output with ASLDRO voxel by voxel.
+- `tools/acceptance_p7.sh <out> [--large]` runs the P7 acceptance series through the BIDS validator.
+  With `--large` it also runs the 3D trains on the full 3T phantom and reports run time and memory.
 
 ## License
 
