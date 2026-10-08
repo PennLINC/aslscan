@@ -230,8 +230,10 @@ pub(super) struct Ge3dBuild<'a> {
     pub k_nodes: usize,
     /// Per raw volume, per family: the node excitations (empty: no label read).
     pub nodes: Vec<Vec<Vec<usize>>>,
-    /// Per preparation: the tissue and label physiological factors.
-    pub prep_factors: Vec<(f64, f64)>,
+    /// Per raw volume and shot: the tissue factor at that volume's readout and the label factor of
+    /// the shot's labeling (P4 part E, per shot as P5 part D; under Look-Locker each readout of a
+    /// preparation at its own time).
+    pub shot_factors: Vec<Vec<(f64, f64)>>,
     /// Per raw volume: the label's sign times P3's global suppression factor.
     pub label_scale: Vec<f64>,
     pub p4: P4,
@@ -430,7 +432,7 @@ pub(super) fn volume_inputs_with(b: &Ge3dBuild, g: usize, labels: bool) -> mrsim
             let (shot, j) = (line.shot, line.excitation);
             let prep = first_prep + shot;
             debug_assert_eq!(preps[shot].shot, shot);
-            let (tf, lf) = b.prep_factors[prep];
+            let (tf, lf) = b.shot_factors[g][shot];
             let gain = b.shot_gain[g][shot];
             let (tf, lf) = (tf * gain, lf * gain);
             let at = |c: usize| (p * ky_segments + sy) * ncomp + c;
@@ -569,11 +571,12 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
     // per raw volume (P6: the crushing survival and the label factors on the schedule's raw volumes)
     let p4 = super::p6::p4_for_schedule(p, ph, bolus_region, &sched)?;
     let mut physio_lines: Vec<PhysioLine> = Vec::new();
-    let prep_factors: Vec<(f64, f64)> = sched.preps.iter().map(|pr| {
-        let row = &sched.raw_rows[pr.raw];
-        match &p4.physio {
+    let shot_factors: Vec<Vec<(f64, f64)>> = (0..n).map(|v| {
+        let row = &sched.raw_rows[v];
+        sched.preps_of(v).iter().map(|pr| match &p4.physio {
             None => (1.0, 1.0),
             Some(phys) => {
+                // the labeling is the preparation's, the excitation this volume's readout of it
                 let time = pr.start_s + row.t;
                 let tf = phys.tissue_factor(time);
                 let (lf, means) = match p.label_type {
@@ -581,14 +584,14 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
                     _ => phys.label_factor_window(pr.start_s, pr.start_s + row.tau),
                 };
                 physio_lines.push(PhysioLine {
-                    volume: pr.raw, slice: pr.shot, time,
+                    volume: v, slice: pr.shot, time,
                     cardiac_phase: phys.cardiac.phase(time), respiratory_phase: phys.respiratory.phase(time),
                     drift: phys.drift.value(time), tissue_factor: tf, label_window: (pr.labeling_window[0], pr.labeling_window[1]),
                     label_means: means, label_factor: lf,
                 });
                 (tf, lf)
             }
-        }
+        }).collect()
     }).collect();
     let label_factors: Option<Vec<f64>> = match (&p.suppression, bolus_region) {
         (Some(spec), None) => Some((0..n).map(|v| label_factor(&spec.for_row(sched.preps[sched.raws[v].prep].suppression))).collect()),
@@ -646,7 +649,7 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
 
     let mut b = Ge3dBuild {
         p, ph, res, table, sched, r_sim, masks, groups, group_images, group_mz, families, k_nodes: 0, nodes: Vec::new(),
-        prep_factors, label_scale, p4, bolus_region, lead, lead_a, flip_deg, raw_flip, spans, spacing_s, poses, shot_pose, shot_gain,
+        shot_factors, label_scale, p4, bolus_region, lead, lead_a, flip_deg, raw_flip, spans, spacing_s, poses, shot_pose, shot_gain,
         v2w: sim_grid.voxel_to_world, sim_dims: sim_grid.dims,
     };
 
@@ -708,7 +711,18 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
     let in_flight = 1;
     let what = format!("{} tissue group(s), {} label famil(ies) x {} mask(s) x {} node(s)", b.groups.len(), b.families.len(),
                        b.masks.len(), b.k_nodes);
-    let memory_gib = check_memory(nvox_sim, ncomp, in_flight, g3.max_memory_gib.0, &what)?;
+    // a volume with within-volume motion also holds one image set per distinct shot pose
+    let sets = 1 + b.shot_pose.iter().map(|sp| {
+        let mut distinct: Vec<Pose> = Vec::new();
+        for &q in sp {
+            if q != Pose::IDENTITY && !distinct.contains(&q) {
+                distinct.push(q);
+            }
+        }
+        distinct.len()
+    }).max().unwrap_or(0);
+    let what = if sets > 1 { format!("{what}; {sets} image sets per volume with the shot poses") } else { what };
+    let memory_gib = check_memory(nvox_sim, ncomp * sets, in_flight, g3.max_memory_gib.0, &what)?;
 
     // ---- relaxation per compartment ----
     let t2_blood_ms = p.t2_blood_ms();
@@ -953,8 +967,8 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
             // the decoded series, every echo
             let raw_echoes = std::mem::take(&mut echoes);
             echoes = raw_echoes.iter().map(|(m, ph_)| super::p6::decode_series(&b.sched, order, m, ph_, n)).collect();
-            let prep_factors: Vec<PrepFactors> = b.sched.preps.iter().enumerate().map(|(pi, pr)| {
-                let (tf, lf) = b.prep_factors[pi];
+            let prep_factors: Vec<PrepFactors> = b.sched.preps.iter().map(|pr| {
+                let (tf, lf) = b.shot_factors[pr.raw][pr.shot];
                 PrepFactors {
                     raw: pr.raw, shot: pr.shot, encoding_row: b.sched.raws[pr.raw].encoding_row, start_s: pr.start_s,
                     labeling_window: pr.labeling_window, label: lf, tissue: tf,
@@ -1023,10 +1037,7 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
         memory_gib,
         slab_entry: g3.slab_entry,
         cumulative_depletion: (0..n).map(|v| b.cumulative_depletion(v)).collect(),
-        readouts_per_cycle: p.look_locker.as_ref().map(|_| {
-            let prep = b.sched.raws[0].prep;
-            b.sched.raws.iter().take_while(|r| r.prep == prep).count()
-        }),
+        readouts_per_cycle: p.look_locker.as_ref().map(|_| b.sched.raws.iter().map(|r| r.readout + 1).max().unwrap_or(1)),
         mean_lead_s: ph.labels.iter().enumerate().map(|(li, (_, nm))| {
             let (s, c) = (0..ph.nvox()).filter(|&i| b.p4.label_of[i] == li && ph.perfusion[i] > 0.0)
                 .fold((0.0, 0usize), |(s, c), i| (s + b.lead[i], c + 1));
@@ -1642,6 +1653,76 @@ mod tests {
         g["EchoTime"] = json!(0.012);
         let e = crate::protocol::parse_echoes(&[g, g2], "volume_type\nlabel\n", None, None).unwrap_err();
         assert!(e.contains("multi-echo spin-echo"), "{e}");
+    }
+
+    // ---- Task 21: the Codex review's findings
+
+    /// 3D Look-Locker with tissue physiology: each readout of a preparation takes the tissue factor
+    /// at its own excitation time (the preparation's start plus its row's), the label factor of the
+    /// shared labeling, and its own line in the physiology table.
+    #[test]
+    fn look_locker_physiology_is_per_readout() {
+        let ph = crop();
+        let p = ll3d_protocol(&[0.5, 0.75, 1.0], json!(12), "[physio]\ntissue_cardiac = 0.1\nlabel_cardiac = 0.05\n");
+        let pr = prepare_ge3d(&p, &ph, T2Mode::Class, RowOverride::None).unwrap();
+        let b = &pr.b;
+        let phys = b.p4.physio.as_ref().unwrap();
+        assert_eq!(pr.physio_lines.len(), 6 * 4, "a line per raw volume and shot");
+        let mut distinct = Vec::new();
+        for g in 0..6 {
+            for (s, prep) in b.sched.preps_of(g).iter().enumerate() {
+                let time = prep.start_s + b.sched.raw_rows[g].t;
+                let (tf, lf) = b.shot_factors[g][s];
+                assert_eq!(tf, phys.tissue_factor(time), "volume {g} shot {s}");
+                assert_eq!(lf, b.shot_factors[g - g % 3][s].1, "the readouts share their labeling");
+                assert!(pr.physio_lines.iter().any(|l| l.volume == g && l.slice == s && l.time == time));
+                distinct.push(tf);
+            }
+        }
+        // the three readouts of a preparation see different cardiac phases
+        assert!(distinct[0] != distinct[4] && distinct[4] != distinct[8], "{distinct:?}");
+    }
+
+    /// Within-volume motion holds one image set per distinct shot pose besides the volume's: the
+    /// memory estimate counts them.
+    #[test]
+    fn the_memory_estimate_counts_the_shot_images() {
+        let ph = crop();
+        let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
+        let (ps, pm) = (ge3d_protocol(""), ge3d_protocol(MOTION));
+        let moving = prepare_ge3d(&pm, &ph, T2Mode::Class, RowOverride::None).unwrap();
+        let sets = 1 + moving.b.shot_pose.iter().map(|sp| {
+            let mut d: Vec<Pose> = sp.iter().copied().filter(|q| *q != Pose::IDENTITY).collect();
+            d.dedup();
+            d.len()
+        }).max().unwrap();
+        assert!(sets > 1);
+        let mem = |p: &Protocol| simulate_ge3d(p, &ph, T2Mode::Class, &phase, RowOverride::None).unwrap().ge3d.unwrap().memory_gib;
+        let (still, moved) = (mem(&ps), mem(&pm));
+        assert!((moved - sets as f64 * still).abs() <= 1e-12 * moved, "{moved} vs {sets} x {still}");
+    }
+
+    /// An included M0 before a 3D Look-Locker series is its own one-readout cycle: the series still
+    /// reads three per cycle.
+    #[test]
+    fn readouts_per_cycle_skips_an_included_m0() {
+        let ph = crop();
+        let s: Value = json!({
+            "ArterialSpinLabelingType": "PCASL", "LabelingDuration": [0.0, 1.8, 1.8, 1.8, 1.8, 1.8, 1.8],
+            "PostLabelingDelay": [0.0, 0.5, 0.75, 1.0, 0.5, 0.75, 1.0],
+            "BackgroundSuppression": false, "M0Type": "Included", "RepetitionTimePreparation": 4.0, "EchoTime": 0.012,
+            "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 0.75], "MRAcquisitionType": "3D",
+            "PulseSequenceType": "3D EPI", "PhaseEncodingDirection": "j-", "EffectiveEchoSpacing": 0.0005, "NumberShots": 4,
+            "FlipAngle": 12, "LookLocker": true
+        });
+        let ov: Overlay = toml::from_str(
+            "seed = 5\n[acquisition]\noversample = 2\nsignal_scale = 100.0\n[signal]\nacq_contrast = \"ge\"\n\
+             [readout]\nexcitation_spacing = 40.0\nslab_entry_time = 0.5\nkz_segments = 2\n").unwrap();
+        let p = parse(&s, "volume_type\nm0scan\ncontrol\ncontrol\ncontrol\nlabel\nlabel\nlabel\n", Some(&ov), crop().params.as_ref())
+            .unwrap();
+        let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
+        let out = simulate_ge3d(&p, &ph, T2Mode::Class, &phase, RowOverride::None).unwrap();
+        assert_eq!(out.ge3d.unwrap().readouts_per_cycle, Some(3));
     }
 
     // ---- Task 18: Hadamard, and the P4 parts, in 3D

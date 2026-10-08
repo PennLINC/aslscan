@@ -281,11 +281,16 @@ mod writer {
                                             the refocusing angle)",
                 "ExcitationTimeConvention": "PostLabelingDelay ends at the train's first excitation (BIDS's \"the \
                                              excitation\" read as the first); CentreExcitation reads the kz centre",
-                "KzCentreExcitationTimes": p.rows.iter().map(|row| {
+                // per acquired raw volume (under Hadamard the encoded ones, not the decoded rows)
+                "KzCentreExcitationTimes": out.hadamard.as_ref().map_or(&p.rows, |h| &h.schedule.raw_rows).iter().map(|row| {
                     if row.kind == crate::rows::RowKind::M0scan { centre(0.0) } else { centre(row.t) }
                 }).collect::<Vec<f64>>(),
-                "EffectivePostLabelingDelay": p.rows.iter().map(|row| match row.kind {
-                    crate::rows::RowKind::M0scan => 0.0,
+                "KzCentreExcitationTimesIndex": if out.hadamard.is_some() { "raw volumes (sourcedata)" } else { "volumes" },
+                // per row of the dataset: (P)CASL from the end of labeling (of its sub-bolus under
+                // Hadamard), PASL from the labeling pulse (BIDS's PostLabelingDelay is then the inversion time)
+                "EffectivePostLabelingDelay": p.rows.iter().map(|row| match (row.kind, p.label_type) {
+                    (crate::rows::RowKind::M0scan, _) => 0.0,
+                    (_, crate::kinetic::LabelType::Pasl) => centre(row.t),
                     _ => centre(row.t) - row.tau,
                 }).collect::<Vec<f64>>(),
                 "ShotOrder": "s = ky_segment * KzSegments + kz_segment, one RepetitionTimePreparation apart",
@@ -810,16 +815,17 @@ mod writer {
                 // series' excitation angle, except under gradient echo, whose M0 is the same
                 // excitation and readout (P5 part A); its FlipAngle says which, the input kept as
                 // replaced.
+                let ll_m0_flip = p.look_locker.as_ref().and_then(|l| l.m0_flip_deg).map(|f| f.0);
                 let (m0_flip, m0_contrast, m0_note) = match (&p.ge, &p.readout) {
+                    // P7 part C: the same 3D EPI train (a Look-Locker series' at its own excitation)
+                    (Some(g), Some(rs)) if rs.ge3d.is_some() => (ll_m0_flip.unwrap_or(g.flip_deg).rem_euclid(360.0), "ge",
+                        "the series' 3D gradient-echo train at its own repetition time, excited from its start, at its \
+                         steady state: no labeling, no suppression, no motion; one train, not a Look-Locker series"),
                     // P6 part B: a Look-Locker series' M0 at its own excitation, not a Look-Locker file
                     (Some(_), _) if p.look_locker.as_ref().is_some_and(|l| l.m0_flip_deg.is_some()) => (
                         p.look_locker.as_ref().and_then(|l| l.m0_flip_deg).map_or(90.0, |f| f.0), "ge",
                         "a gradient-echo readout at its own repetition time and excitation (overlay m0.flip_angle, or the \
                      series' scalar FlipAngle): one excitation, not a Look-Locker series; no suppression, no motion"),
-                    // P7 part C: the same 3D EPI train
-                    (Some(g), Some(rs)) if rs.ge3d.is_some() => (g.flip_deg.rem_euclid(360.0), "ge",
-                        "the series' 3D gradient-echo train at its own repetition time, excited from its start, at its \
-                         steady state: no labeling, no suppression, no motion"),
                     (Some(g), _) => (g.flip_deg.rem_euclid(360.0), "ge",
                                      "the series' gradient-echo readout at its own repetition time: no suppression, no motion"),
                     // P5 part B: the same echo train, its FlipAngle the refocusing angle
@@ -883,13 +889,18 @@ mod writer {
                 if p.physio.is_some() {
                     m0sim["Physio"] = json!("not applied: the separate M0 scan is not a row of the series' clock");
                 }
-                if let Some(r3) = &out.readout {
-                    // the series' readout block without its excitation times (the M0 is excited at the
-                    // start of its own repetition)
+                let shots = out.readout.as_ref().map(|r3| r3.n_shots)
+                    .or_else(|| out.ge3d.as_ref().map(|g| g.resolution.n_shots));
+                if let Some(shots) = shots {
+                    // the series' readout block without its per-volume timing (the M0 is excited at the
+                    // start of its own repetition) or, for the 3D EPI train, its label's
                     let mut ro = simulation_block(p, out)["Readout"].clone();
                     if let Some(o) = ro.as_object_mut() {
-                        o.remove("ExcitationTimes");
-                        o.insert("VolumeDuration".to_string(), json!(r3.n_shots as f64 * p.m0_repetition_time_s.unwrap_or(0.0)));
+                        for k in ["ExcitationTimes", "KzCentreExcitationTimes", "KzCentreExcitationTimesIndex",
+                                  "EffectivePostLabelingDelay", "SlabEntry", "LabelInterpolation", "GroundTruth", "LookLocker"] {
+                            o.remove(k);
+                        }
+                        o.insert("VolumeDuration".to_string(), json!(shots as f64 * p.m0_repetition_time_s.unwrap_or(0.0)));
                     }
                     m0sim["Readout"] = ro;
                 }
@@ -918,7 +929,19 @@ mod writer {
         let moved = out.ground_truth.delta_m_static.is_some();
         write_json(&PathBuf::from(format!("{gt_prefix}_desc-deltam_gt.json")), &json!({
             "Units": "arbitrary (same as M0map)",
-            "Description": if out.look_locker.as_ref().is_some_and(|l| !l.legacy_dispatch) {
+            "Description": if out.ge3d.is_some() && out.hadamard.is_some() {
+                "the ideal sub-bolus truth (P6 part A) of the 3D gradient-echo train: each decoded volume's sub-bolus \
+                 as the raw volumes' kz-centre excitation (Readout.CentreExcitation) reads it, depleted from slab \
+                 entry by the earlier excitations of its cycle (earlier Look-Locker sub-trains included), with the \
+                 exchange split and the bolus-position parcel factors; before sin(a), sign, P3's global suppression \
+                 factor or physiology; static (a decoded volume has no single pose), box-averaged; zero for m0scan \
+                 rows. The raw volumes' truth is under sourcedata"
+            } else if out.ge3d.is_some() {
+                "+delta_m of each label/deltam row as its kz-centre excitation (Readout.CentreExcitation) reads it: \
+                 depleted from slab entry by the earlier excitations of its cycle (earlier Look-Locker sub-trains \
+                 included), with the exchange split and the bolus-position parcel factors; before sin(a), sign, P3's \
+                 global suppression factor or physiology; box-averaged; zero for other rows"
+            } else if out.look_locker.as_ref().is_some_and(|l| !l.legacy_dispatch) {
                 "+delta_m at each readout's own excitation per slice (e = t_n + slice offset), undepleted: the label \
                  delivered, before the readouts deplete it (desc-deltamRead_gt is what each readout read); \
                  box-averaged; zero for other rows"
@@ -947,10 +970,27 @@ mod writer {
         }
         // P4 ground truth (addendum, "Outputs"): each names the stages it includes.
         let frame = if moved { "moved by each row's pose like desc-deltam_gt" } else { "static" };
+        let stages_of = if out.ge3d.is_some() {
+            // P7 part C: the reads at the kz-centre excitation, every factor of the read applied
+            [
+                "the not-yet-exchanged part of desc-deltam_gt, with the same stages (the read at the kz-centre \
+                 excitation, depleted from slab entry, with the bolus-position parcel factors)",
+                "kinetics and the bolus-position pulse factors (part D), both parts of the tissue label",
+                "the arterial term as the kz-centre excitation reads it: depleted by the excitations since its slab \
+                 entry, with its bolus-position parcel factor and its crushing survival; before sin(a), sign or \
+                 physiology",
+            ]
+        } else {
+            [
+                "kinetics and the exchange split (part A); no pulse or physiological factor",
+                "kinetics and the bolus-position pulse factors (part D), both parts of the tissue label",
+                "the arterial term with parcel factor 1 (part B), before crushing",
+            ]
+        };
         for (desc, data, stages) in [
-            ("deltamIntravascular", &gt.delta_m_iv, "kinetics and the exchange split (part A); no pulse or physiological factor"),
-            ("deltamSuppressed", &gt.delta_m_suppressed, "kinetics and the bolus-position pulse factors (part D), both parts of the tissue label"),
-            ("deltamArterial", &gt.delta_m_arterial, "the arterial term with parcel factor 1 (part B), before crushing"),
+            ("deltamIntravascular", &gt.delta_m_iv, stages_of[0]),
+            ("deltamSuppressed", &gt.delta_m_suppressed, stages_of[1]),
+            ("deltamArterial", &gt.delta_m_arterial, stages_of[2]),
         ] {
             if let Some(d) = data {
                 write_4d(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.nii.gz")), out.acq_grid.dims, out.n_volumes, d, &out.acq_grid)
@@ -1327,8 +1367,14 @@ mod writer {
             .map_err(|e| e.to_string())?;
         write_json(&PathBuf::from(format!("{gt_prefix}_desc-deltam_gt.json")), &json!({
             "Units": "arbitrary (same as M0map)",
-            "Description": "+ the encoded kinetic sum of each raw volume's labeled sub-boli (no suppression or \
-                            physiological factor), today's conventions; zero for m0scan raw volumes",
+            "Description": if out.ge3d.is_some() {
+                "+ each raw volume's labeled sub-boli as its kz-centre excitation reads them (depleted from slab entry, \
+                 with the exchange split and the bolus-position parcel factors; before sin(a), sign, P3's global \
+                 suppression factor or physiology); zero for m0scan raw volumes"
+            } else {
+                "+ the encoded kinetic sum of each raw volume's labeled sub-boli (no suppression or \
+                 physiological factor), today's conventions; zero for m0scan raw volumes"
+            },
             "Frame": if out.readout.is_some() || out.ge3d.is_some() { "static (a 3D raw volume's shots have their own poses)" }
                      else if moved { "moved by the raw volume's pose" } else { "static" },
             "Resampling": mean,
@@ -1343,7 +1389,13 @@ mod writer {
                 write_4d(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.nii.gz")), out.acq_grid.dims, h.n_raw, d, &out.acq_grid)
                     .map_err(|e| e.to_string())?;
                 write_json(&PathBuf::from(format!("{gt_prefix}_desc-{desc}_gt.json")), &json!({
-                    "Units": "arbitrary (same as M0map)", "Description": "per raw volume, the encoded sum of its labeled sub-boli's part (P4's definition per row)", "Resampling": mean,
+                    "Units": "arbitrary (same as M0map)", "Resampling": mean,
+                    "Description": if out.ge3d.is_some() {
+                        "per raw volume, its labeled sub-boli's part as its kz-centre excitation reads it (the stages of \
+                         this directory's desc-deltam_gt)"
+                    } else {
+                        "per raw volume, the encoded sum of its labeled sub-boli's part (P4's definition per row)"
+                    },
                 }))?;
             }
         }

@@ -2163,10 +2163,47 @@ fn hadamard3d_writes_its_cycles_and_raw_volumes() {
     let had = &side["AslscanSimulation"]["Hadamard"];
     assert_eq!((had["Readout"].clone(), had["Readouts"].clone()), (json!("3D EPI"), json!(2)));
     assert_eq!(had["TissueLeakage"].as_array().unwrap().len(), 2 * 2);
+    // the kz-centre times are the raw volumes' (all of an encoding row's readout n at the same time)
+    let ro = &side["AslscanSimulation"]["Readout"];
+    let kc: Vec<f64> = ro["KzCentreExcitationTimes"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+    assert_eq!((kc.len(), ro["KzCentreExcitationTimesIndex"].clone()), (16, json!("raw volumes (sourcedata)")));
+    assert!(kc.chunks(2).all(|c| c == &kc[..2]), "{kc:?}");
     assert_eq!(side["AslscanSimulation"]["Readout"]["Type"], json!("epi3d"));
     let raw = std::fs::read_dir(dir.join("sourcedata")).unwrap().flat_map(|d| std::fs::read_dir(d.unwrap().path()).unwrap())
         .flat_map(|d| std::fs::read_dir(d.unwrap().path()).unwrap())
         .map(|f| f.unwrap().path()).find(|p| p.to_string_lossy().ends_with("_rawvolumes.tsv")).expect("the raw-volume table");
     assert_eq!(std::fs::read_to_string(raw).unwrap().lines().count(), 1 + 16);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P7 Task 21 (the Codex review): the p7_ll3d fixture's writer output. PASL's effective delay is the
+/// kz-centre excitation time itself (BIDS's PostLabelingDelay is the inversion time); the separate
+/// M0 is described as the 3D train, its readout block the train's without the label's timing.
+#[test]
+fn ll3d_fixture_writes_its_delays_and_m0() {
+    let (s, ctx) = fixture("p7_ll3d");
+    let p = parse_named("p7_ll3d", &s, &ctx, &fixture_overlay("p7_ll3d"));
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-p7ll3dw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let perf = dir.join("sub-01/perf");
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    let ro = &side["AslscanSimulation"]["Readout"];
+    let (kc, eff) = (ro["KzCentreExcitationTimes"].as_array().unwrap(), ro["EffectivePostLabelingDelay"].as_array().unwrap());
+    assert_eq!(kc.len(), 12);
+    for (a, b) in kc.iter().zip(eff) {
+        assert_eq!(a.as_f64(), b.as_f64(), "PASL: the delay is the kz-centre time");
+    }
+    assert!(kc[0].as_f64().unwrap() >= 0.8);
+    assert_eq!(ro["LookLocker"]["ReadoutsPerCycle"], json!(6));
+    let m0: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("sub-01_m0scan.json")).unwrap()).unwrap();
+    let sim = &m0["AslscanSimulation"];
+    assert!(sim["Note"].as_str().unwrap().contains("3D gradient-echo train"), "{}", sim["Note"]);
+    assert_eq!(sim["Readout"]["Type"], json!("epi3d"));
+    for k in ["SlabEntry", "LookLocker", "KzCentreExcitationTimes", "EffectivePostLabelingDelay", "LabelInterpolation"] {
+        assert!(sim["Readout"].get(k).is_none(), "the M0 readout block has {k}");
+    }
+    assert_eq!(m0["FlipAngle"].as_f64(), Some(8.0));
     let _ = std::fs::remove_dir_all(&dir);
 }
