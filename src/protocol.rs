@@ -1302,7 +1302,7 @@ fn hadamard_spec(
                 }
             }
         }
-        if let Some(f) = flips.filter(|_| m > 1) {
+        if let Some(f) = flips {
             for (k, &r) in cy.rows.iter().enumerate() {
                 let (j, n) = (k % n_sub, k / n_sub);
                 let f0 = f[cy.rows[n * n_sub]];
@@ -3144,8 +3144,8 @@ pub fn resolve_ge3d(p: &Protocol, acq_dims: [usize; 3]) -> Result<Option<Ge3dRes
         }
     }
     let effective = ees.or(trt_ees);
-    let (t_line_ms, t_line_source) = match (r.line_spacing_ms, effective) {
-        (Some(v), eff) => {
+    let (t_line_ms, t_line_source) = match (r.line_spacing_ms, effective, r.dwell_time_s) {
+        (Some(v), eff, _) => {
             if let Some(e) = eff {
                 let want = e * 1000.0 * ky_segments as f64;
                 if (v - want).abs() > 0.01 * want {
@@ -3156,10 +3156,15 @@ pub fn resolve_ge3d(p: &Protocol, acq_dims: [usize; 3]) -> Result<Option<Ge3dRes
             }
             (v, "overlay readout.line_spacing")
         }
-        (None, Some(e)) => (e * 1000.0 * ky_segments as f64, "effective echo spacing x ky segments"),
-        (None, None) => return Err(
-            "a 3D EPI readout needs its line spacing: the sidecar has no EffectiveEchoSpacing or TotalReadoutTime; give \
-             [readout] line_spacing (ms)".to_string()),
+        (None, Some(e), _) => (e * 1000.0 * ky_segments as f64, "effective echo spacing x ky segments"),
+        // as GRASE's (P5 part B)
+        (None, None, Some((d, _))) => {
+            let samples = r.readout_samples.unwrap_or(acq_dims[0]);
+            (samples as f64 * d * 1000.0, "DwellTime x readout samples (a lower bound: no ramps, no receiver oversampling)")
+        }
+        (None, None, None) => return Err(
+            "a 3D EPI readout needs its line spacing: the sidecar has no EffectiveEchoSpacing, TotalReadoutTime or \
+             DwellTime; give [readout] line_spacing (ms) or effective echo spacing".to_string()),
     };
     let block = grase_block(ny, ky_segments, t_line_ms, p.reverse_phase)?;
     let t_kyc_ms = block.t_ms[ny / 2];
@@ -4542,6 +4547,15 @@ mod tests {
         let tight = ok(&epi3d(), &EPI3D.replace("50.0", "12.0")).unwrap();
         let e = resolve_ge3d(&tight, [32, 32, 8]).unwrap_err();
         assert!(e.contains("row 0") && e.contains("next excitation pulse"), "{e}");
+        // the line spacing from DwellTime and readout_samples when nothing else gives it, as GRASE's
+        // (final review 6): 64 x 5 us = 0.32 ms, a lower bound
+        let mut nosp = epi3d();
+        nosp.as_object_mut().unwrap().remove("EffectiveEchoSpacing");
+        nosp.as_object_mut().unwrap().remove("TotalReadoutTime");
+        assert!(resolve_ge3d(&ok(&nosp, EPI3D).unwrap(), [32, 32, 8]).unwrap_err().contains("line spacing"));
+        nosp["DwellTime"] = json!(5e-6);
+        let dw = resolve_ge3d(&ok(&nosp, &format!("{EPI3D}readout_samples = 64\n")).unwrap(), [32, 32, 8]).unwrap().unwrap();
+        assert!((dw.t_line_ms - 0.32).abs() < 1e-12 && dw.t_line_source.contains("lower bound"), "{}", dw.t_line_ms);
         // a GRASE protocol has no 3D EPI resolution
         assert!(resolve_ge3d(&ok(&grase(), "").unwrap(), [32, 32, 8]).unwrap().is_none());
     }
@@ -5256,6 +5270,22 @@ mod tests {
         let mut flok = s1.clone();
         flok["FlipAngle"] = json!([35, 35, 35, 30, 30, 30, 25, 25, 25]);
         ok(&flok, &ctx1, LLH).unwrap();
+        // one readout per cycle: its sub-boli still share the excitation (final review 1)
+        let mut one = s1.clone();
+        for (_, v) in one.as_object_mut().unwrap().iter_mut() {
+            if let Value::Array(a) = v {
+                if a.len() == 9 {
+                    a.truncate(3);
+                }
+            }
+        }
+        let ctx_one = "volume_type\ndeltam\ndeltam\ndeltam\n";
+        let one_ov = "[hadamard]\norder = 4\n[look_locker]\nreadouts_per_cycle = 1\n";
+        one["FlipAngle"] = json!([35, 35, 35]);
+        ok(&one, ctx_one, one_ov).unwrap();
+        one["FlipAngle"] = json!([35, 30, 35]);
+        let e = err(&one, ctx_one, one_ov);
+        assert!(e.contains("FlipAngle") && e.contains("row 1") && e.contains("sub-bolus 2"), "{e}");
         // crushing: one VENC per readout, the same for its sub-boli
         let crush = format!("{LLH}{MACRO}{VEL}");
         let mut cr = s1.clone();

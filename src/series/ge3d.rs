@@ -171,16 +171,19 @@ pub(super) fn interpolate(values: &[f64], nodes: &[usize]) -> Vec<f64> {
     (0..values.len()).map(|j| hat(nodes, j).iter().map(|&(k, w)| w * values[nodes[k]]).sum()).collect()
 }
 
-/// The images one volume holds while it is simulated (P7 addendum, part C, "Memory"), in bytes:
-/// `compartments` images of `nvox_sim` `f32` voxels, times the volumes in flight (the worker
-/// threads). Over `limit_gib` it is refused, naming the estimate and the remedies.
-pub(super) fn check_memory(nvox_sim: usize, compartments: usize, in_flight: usize, limit_gib: f64, what: &str) -> Result<f64, String> {
-    let bytes = 4.0 * nvox_sim as f64 * compartments as f64 * in_flight as f64;
+/// The images held while the series is simulated (P7 addendum, part C, "Memory"), in bytes:
+/// `compartments` images of `nvox_sim` `f32` voxels per volume, times the volumes in flight (the
+/// worker threads), plus `cached` images held for the whole series (the tissue groups' `M0`). Over
+/// `limit_gib` it is refused, naming the estimate and the remedies.
+pub(super) fn check_memory(nvox_sim: usize, compartments: usize, in_flight: usize, cached: usize, limit_gib: f64, what: &str)
+    -> Result<f64, String>
+{
+    let bytes = 4.0 * nvox_sim as f64 * (compartments as f64 * in_flight as f64 + cached as f64);
     let gib = bytes / (1u64 << 30) as f64;
     if gib > limit_gib {
         return Err(format!(
             "the 3D gradient-echo series would hold {gib:.2} GiB of images at once ({compartments} compartment images of \
-             {nvox_sim} voxels x {in_flight} volumes in flight; {what}), over the limit of {limit_gib} GiB ([images] \
+             {nvox_sim} voxels x {in_flight} volumes in flight, and {cached} cached; {what}), over the limit of {limit_gib} GiB ([images] \
              max_memory_gib): more kz segments (shorter trains need fewer interpolation nodes), a looser \
              [readout] node_tolerance, fewer worker threads, or a higher limit"));
     }
@@ -722,7 +725,8 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
         distinct.len()
     }).max().unwrap_or(0);
     let what = if sets > 1 { format!("{what}; {sets} image sets per volume with the shot poses") } else { what };
-    let memory_gib = check_memory(nvox_sim, ncomp * sets, in_flight, g3.max_memory_gib.0, &what)?;
+    let cached = b.group_images.iter().filter(|im| !im.is_empty()).count();
+    let memory_gib = check_memory(nvox_sim, ncomp * sets, in_flight, cached, g3.max_memory_gib.0, &what)?;
 
     // ---- relaxation per compartment ----
     let t2_blood_ms = p.t2_blood_ms();
@@ -833,7 +837,8 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
     }
     // under motion the truths are moved by each volume's pose on the simulation grid (no shot events)
     // and block-averaged, the unmoved kept as delta_m_static, as on the 3D spin-echo path
-    let (delta_m, delta_m_static, gt_iv, gt_art) = if p.motion.is_some() {
+    // (not under Hadamard: a decoded volume has no single pose, and the raw truth is static, as P6's 3D)
+    let (delta_m, delta_m_static, gt_iv, gt_art) = if p.motion.is_some() && p.hadamard.is_none() {
         let o = p.acq.oversample;
         let mv = |sim: Vec<f32>| -> Vec<f32> {
             let mut arr = [sim];
@@ -1037,7 +1042,10 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
         memory_gib,
         slab_entry: g3.slab_entry,
         cumulative_depletion: (0..n).map(|v| b.cumulative_depletion(v)).collect(),
-        readouts_per_cycle: p.look_locker.as_ref().map(|_| b.sched.raws.iter().map(|r| r.readout + 1).max().unwrap_or(1)),
+        cycle_readouts: p.look_locker.as_ref().map(|_| {
+            b.sched.cycles.iter().filter(|c| b.sched.raw_rows[c.raws.start].kind != RowKind::M0scan)
+                .map(|c| c.raws.clone().map(|r| b.sched.raws[r].readout + 1).max().unwrap_or(1)).collect()
+        }),
         mean_lead_s: ph.labels.iter().enumerate().map(|(li, (_, nm))| {
             let (s, c) = (0..ph.nvox()).filter(|&i| b.p4.label_of[i] == li && ph.perfusion[i] > 0.0)
                 .fold((0.0, 0usize), |(s, c), i| (s + b.lead[i], c + 1));
@@ -1257,8 +1265,10 @@ mod tests {
             .iter().map(|p| p.total()).collect();
         assert!(early[0][31] < none[31] && early[0][0] <= none[0]);
         // memory: 2^20 voxels x 64 compartments x 4 bytes x 8 in flight = 2 GiB
-        assert!((check_memory(1 << 20, 64, 8, 4.0, "test").unwrap() - 2.0).abs() < 1e-12);
-        let err = check_memory(1 << 20, 64, 8, 1.5, "18 tissue groups, K = 6").unwrap_err();
+        assert!((check_memory(1 << 20, 64, 8, 0, 4.0, "test").unwrap() - 2.0).abs() < 1e-12);
+        // plus 128 cached images: 0.5 GiB
+        assert!((check_memory(1 << 20, 64, 8, 128, 4.0, "test").unwrap() - 2.5).abs() < 1e-12);
+        let err = check_memory(1 << 20, 64, 8, 0, 1.5, "18 tissue groups, K = 6").unwrap_err();
         assert!(err.contains("2.00 GiB") && err.contains("max_memory_gib") && err.contains("K = 6"), "{err}");
     }
 
@@ -1699,7 +1709,31 @@ mod tests {
         assert!(sets > 1);
         let mem = |p: &Protocol| simulate_ge3d(p, &ph, T2Mode::Class, &phase, RowOverride::None).unwrap().ge3d.unwrap().memory_gib;
         let (still, moved) = (mem(&ps), mem(&pm));
-        assert!((moved - sets as f64 * still).abs() <= 1e-12 * moved, "{moved} vs {sets} x {still}");
+        // the cached tissue-group images are held once, whatever the poses
+        let nvox_sim: usize = moving.sim_grid.dims.iter().product();
+        let cached = 4.0 * nvox_sim as f64 * moving.b.group_images.iter().filter(|im| !im.is_empty()).count() as f64
+            / (1u64 << 30) as f64;
+        assert!(cached > 0.0);
+        assert!((moved - cached - sets as f64 * (still - cached)).abs() <= 1e-12 * moved, "{moved} vs {sets} x {still}, {cached}");
+    }
+
+    /// Final review 3: under Hadamard with motion the raw truth and its parts are all static (the
+    /// same as without motion), and so is the decoded truth.
+    #[test]
+    fn hadamard_truths_are_static_under_motion() {
+        let ph = crop();
+        let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
+        let run = |extra: &str| simulate_ge3d(&had3d_protocol(&[0.5], 1, extra), &ph, T2Mode::Class, &phase, RowOverride::None).unwrap();
+        let (still, moving) = (run(MACRO), run(&format!("{MACRO}{MOTION}")));
+        let (hs, hm) = (still.hadamard.as_ref().unwrap(), moving.hadamard.as_ref().unwrap());
+        assert_eq!(hm.raw_delta_m, hs.raw_delta_m);
+        assert_eq!(hm.raw_delta_m_iv, hs.raw_delta_m_iv);
+        assert_eq!(hm.raw_delta_m_arterial, hs.raw_delta_m_arterial);
+        assert!(hm.raw_delta_m_iv.as_ref().unwrap().iter().any(|x| *x != 0.0));
+        assert_eq!(moving.ground_truth.delta_m, still.ground_truth.delta_m);
+        assert_eq!(moving.ground_truth.delta_m_iv, still.ground_truth.delta_m_iv);
+        assert!(moving.ground_truth.delta_m_static.is_none());
+        assert_ne!(moving.mag, still.mag, "the data move");
     }
 
     /// An included M0 before a 3D Look-Locker series is its own one-readout cycle: the series still
@@ -1722,7 +1756,7 @@ mod tests {
             .unwrap();
         let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
         let out = simulate_ge3d(&p, &ph, T2Mode::Class, &phase, RowOverride::None).unwrap();
-        assert_eq!(out.ge3d.unwrap().readouts_per_cycle, Some(3));
+        assert_eq!(out.ge3d.unwrap().cycle_readouts, Some(vec![3, 3]));
     }
 
     // ---- Task 18: Hadamard, and the P4 parts, in 3D

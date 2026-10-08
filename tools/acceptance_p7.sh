@@ -18,15 +18,22 @@ cd "$(dirname "$0")/.."
 BIN=./target/release/aslscan
 FX=tests/fixtures/protocols
 mkdir -p "$OUT"
+FAILED=0
 
-run() { # name fixture-dir phantom
+run() { # name fixture-dir phantom [expected refusal text]
   local f=$2 jsons=""
   if [ -f "$f/asl.json" ]; then jsons="--asl-json $f/asl.json"; else for j in "$f"/asl-echo-*.json; do jsons="$jsons --asl-json $j"; done; fi
   rm -rf "$OUT/$1"
   /usr/bin/time -f "%e s, peak RSS %M KiB" -o "$OUT/$1.time" $BIN $jsons --aslcontext "$f/aslcontext.tsv" \
       --overlay "$f/overlay.toml" --phantom "$3" --out "$OUT/$1" > "$OUT/$1.log" 2>&1
-  echo "== $1: exit $?, $(tail -1 "$OUT/$1.time")"
+  local rc=$?
+  echo "== $1: exit $rc, $(tail -1 "$OUT/$1.time")"
   grep "^aslscan:" "$OUT/$1.log"
+  if [ -n "${4:-}" ]; then
+    if [ $rc -eq 0 ] || ! grep -q "$4" "$OUT/$1.log"; then echo "FAIL: $1 should be refused ($4)"; FAILED=1; fi
+    return
+  fi
+  [ $rc -ne 0 ] && { echo "FAIL: $1 exited $rc"; FAILED=1; }
   local s
   s=$(find "$OUT/$1/sub-01/perf" -maxdepth 1 -name '*part-mag_asl.json' 2>/dev/null | sort | head -1)
   [ -n "$s" ] && python3 - "$s" <<'EOF'
@@ -41,7 +48,12 @@ EOF
 
 validate() { # name
   echo "-- bids-validator $1"
-  deno run -A jsr:@bids/validator "$OUT/$1" 2>&1 | grep -E "\[ERROR\]|\[WARNING\]" | sort | uniq -c
+  local log="$OUT/$1.validator.log"
+  deno run -A jsr:@bids/validator "$OUT/$1" > "$log" 2>&1
+  local rc=$?
+  grep -E "\[ERROR\]|\[WARNING\]" "$log" | sort | uniq -c
+  # the validator exits 1 on errors; anything else it prints as an error is a failure too
+  if [ $rc -ne 0 ] || grep -qE "\[ERROR\]|^error:" "$log"; then echo "FAIL: $1 does not validate (exit $rc)"; FAILED=1; fi
 }
 
 variant() { # fixture kz ky effective-echo-spacing-s [repetition-s] [overlay lines]
@@ -79,6 +91,7 @@ if [ "$LARGE" = "--large" ]; then
   validate ll3d-3t
   validate multite3d-3t
   # one long train: refused at the default image-memory limit, then run with a higher one
-  run ge3d-3t-long "$(variant p7_ge3d 3 3 0.0001 5.0)" $P3T
+  run ge3d-3t-long "$(variant p7_ge3d 3 3 0.0001 5.0)" $P3T "max_memory_gib"
   run ge3d-3t-long-8gib "$(variant p7_ge3d 3 3 0.0001 5.0 '\n[images]\nmax_memory_gib = 8.0\n')" $P3T
 fi
+exit $FAILED

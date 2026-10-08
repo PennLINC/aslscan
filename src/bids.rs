@@ -338,9 +338,11 @@ mod writer {
             });
             // P7 part C, 3D Look-Locker: each readout a sub-train of the cycle, segmented across the
             // NumberShots cycles of a group; every excitation of the cycle depletes the label
-            if let Some(m) = g.readouts_per_cycle {
+            if let Some(cr) = &g.cycle_readouts {
                 block["Readout"]["LookLocker"] = json!({
-                    "ReadoutsPerCycle": m,
+                    // one count when every cycle reads the same number, as P6's
+                    "ReadoutsPerCycle": if cr.windows(2).all(|w| w[0] == w[1]) { json!(cr.first()) } else { Value::Null },
+                    "CycleReadouts": cr,
                     "Segmentation": "a group of NumberShots cycles, each reading one shot of every readout: readout n's \
                                      volume is its sub-train's partitions over the group's cycles",
                     "Depletion": "every excitation of a cycle (each readout's sub-train) depletes the label in the slab \
