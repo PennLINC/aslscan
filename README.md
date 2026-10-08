@@ -377,7 +377,7 @@ readouts_per_cycle = 12        # optional check against the grouping the arrays 
 A 3D gradient-echo EPI acquisition (a "stack of EPI") excites the whole slab once per partition. A
 train of small-flip excitations is each followed by an EPI readout of one partition's k-space plane,
 or one ky segment of it in a segmented acquisition. aslscan simulates every excitation of the train.
-- `FlipAngle` is the excitation, in (0, 90] degrees. `EffectiveEchoSpacing` or `TotalReadoutTime`
+- `FlipAngle` is the excitation, in (0, 90] degrees: a scalar, or one value per volume under Look-Locker. `EffectiveEchoSpacing` or `TotalReadoutTime`
   gives the line spacing (the effective spacing times the number of ky segments). `NumberShots` is
   the number of trains per volume: `kz_segments` times the ky segments.
 - `EchoTime` is the time of each partition readout's k-space centre. aslscan checks that every
