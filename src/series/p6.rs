@@ -1472,14 +1472,14 @@ pub(super) fn simulate_p6(
                 .collect();
             let mut all = simulate_acquisition_echoes(
                 sim_grid.dims, acq_grid.dims, n, &per, &t2_vols, &fmap_sim, Some(&ti_vols), &acq, &echo_ms,
-                &eddy_drive, &prep_drive, phase, p.seed, None, None,
+                &eddy_drive, &prep_drive, phase, p.seed, None,
             );
             more_mag = all.split_off(1);
             all.pop().expect("one echo at least")
         }
         None => simulate_acquisition_oversampled(
             sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, &fmap_sim, Some(&ti_vols), &acq,
-            &eddy_drive, &prep_drive, phase, p.seed, None, None,
+            &eddy_drive, &prep_drive, phase, p.seed, None,
         ),
         Some(r3) => simulate_acquisition_3d(
             sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, t1_vols.as_deref(), &fmap_sim, Some(&ti_vols), &acq,
@@ -1516,12 +1516,12 @@ pub(super) fn simulate_p6(
                     let per: Vec<&[Vec<f32>]> = vec![&imgs[..]; tes.len()];
                     simulate_acquisition_echoes(
                         sim_grid.dims, acq_grid.dims, nt, &per, &t2_vols, &fmap_sim, Some(&ti_vols), &quiet, &echo_ms,
-                        &vec![None; nt], &vec![None; nt], phase, p.seed, None, None,
+                        &vec![None; nt], &vec![None; nt], phase, p.seed, None,
                     )
                 }
                 None => vec![simulate_acquisition_oversampled(
                     sim_grid.dims, acq_grid.dims, nt, &imgs, &t2_vols, &fmap_sim, Some(&ti_vols), &quiet,
-                    &vec![None; nt], &vec![None; nt], phase, p.seed, None, None,
+                    &vec![None; nt], &vec![None; nt], phase, p.seed, None,
                 )],
                 Some(r3) => {
                     let lw = line_weights.as_ref().map(|l| {
@@ -1569,14 +1569,14 @@ pub(super) fn simulate_p6(
                 let per: Vec<&[Vec<f32>]> = vec![&imgs[..]; tes.len()];
                 let mut all = simulate_acquisition_echoes(
                     sim_grid.dims, acq_grid.dims, 1, &per, &t2_vols, &fmap_sim, Some(&ti_vols), &acq, &echo_ms,
-                    &[None], &[None], phase, seed, None, None,
+                    &[None], &[None], phase, seed, None,
                 );
                 more_m0 = all.split_off(1);
                 all.pop().expect("one echo at least")
             }
             None => simulate_acquisition_oversampled(
                 sim_grid.dims, acq_grid.dims, 1, imgs, &t2_vols, &fmap_sim, Some(&ti_vols), &acq,
-                &[None], &[None], phase, seed, None, None,
+                &[None], &[None], phase, seed, None,
             ),
             // the same readout and train, no labeling, no physiology, no motion (P5 part B)
             Some(r3) => simulate_acquisition_3d(
@@ -1790,7 +1790,7 @@ mod tests {
             let tiv = [T2Volume::Map(tpm), T2Volume::Map(tpm)];
             let (m, ph_out) = simulate_acquisition_oversampled(
                 b.sim_grid.dims, b.acq_grid.dims, b.n, &images, &t2v, &b.fmap_sim, Some(&tiv), &b.acq,
-                &vec![None; b.n], &vec![None; b.n], &phase, p.seed, None, None,
+                &vec![None; b.n], &vec![None; b.n], &phase, p.seed, None,
             );
             let want = complex_from(&m, &ph_out);
             let peak = want.iter().map(|z| z.0.hypot(z.1)).fold(0.0f64, f64::max);
@@ -1945,7 +1945,7 @@ mod tests {
         let (t2v, tiv) = class_volumes(&b);
         let acquire = |img: &[Vec<f32>]| simulate_acquisition_oversampled(
             b.sim_grid.dims, b.acq_grid.dims, n, img, &t2v, &b.fmap_sim, Some(&tiv), &b.acq, &vec![None; n], &vec![None; n],
-            &zero_phase(), p.seed, None, None);
+            &zero_phase(), p.seed, None);
         let decoded_of = |m: &[f32], ph_: &[f32]| -> Vec<Vec<(f64, f64)>> {
             let raw: Vec<Vec<(f64, f64)>> = (0..n).map(|i| cvol(m, ph_, n, i)).collect();
             let refs: Vec<&[(f64, f64)]> = raw.iter().map(|v| v.as_slice()).collect();
@@ -2246,7 +2246,7 @@ mod tests {
         let (t2v, tiv) = class_volumes(&b);
         let acquire = |img: &[Vec<f32>]| simulate_acquisition_oversampled(
             b.sim_grid.dims, b.acq_grid.dims, n, img, &t2v, &b.fmap_sim, Some(&tiv), &b.acq, &vec![None; n], &vec![None; n],
-            &zero_phase(), p.seed, None, None);
+            &zero_phase(), p.seed, None);
         let decoded = |(m, ph_): (Vec<f32>, Vec<f32>)| -> Vec<Vec<(f64, f64)>> {
             let raw: Vec<Vec<(f64, f64)>> = sched.cycles[0].raws.clone().map(|i| cvol(&m, &ph_, n, i)).collect();
             let refs: Vec<&[(f64, f64)]> = raw.iter().map(|v| v.as_slice()).collect();

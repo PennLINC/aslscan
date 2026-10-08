@@ -1304,7 +1304,7 @@ fn simulate_legacy(
     let (mag, phase_out) = match &res3d {
         None => simulate_acquisition_oversampled(
             sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, &fmap_sim, Some(&ti_vols), &acq,
-            &eddy_drive, &prep_drive, phase, p.seed, None, None,
+            &eddy_drive, &prep_drive, phase, p.seed, None,
         ),
         Some(r3) => simulate_acquisition_3d(
             sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, t1_vols.as_deref(), &fmap_sim, Some(&ti_vols), &acq,
@@ -1329,7 +1329,7 @@ fn simulate_legacy(
             Some(match &res3d {
                 None => simulate_acquisition_oversampled(
                     sim_grid.dims, acq_grid.dims, 1, &imgs, &t2_vols, &fmap_sim, Some(&ti_vols), &acq,
-                    &[None], &[None], phase, seed, None, None,
+                    &[None], &[None], phase, seed, None,
                 ),
                 // the same readout and train, no labeling, no physiology, no motion (P5 part B)
                 Some(r3) => simulate_acquisition_3d(
