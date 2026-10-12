@@ -67,3 +67,12 @@ Only the JSON sidecar and aslcontext.tsv are kept; no image data.
   the 3D EPI train, 12, 22 and 32 ms (`asl-echo-{1,2,3}.json`, identical except `EchoTime`; pass them as repeated
   `--asl-json`): the last echo's block (centred at 32.5 ms, 3 ms each side) ends before the next excitation's
   pulse, which starts at 39 ms.
+
+## P8 acceptance case
+
+- `p8_spiral_kz/`: written for aslscan, not fetched. The accelerated stack-of-spirals pCASL of Vidorreta et al.
+  (2017, PLoS ONE 12(8):e0183762) as the Siemens Prisma protocol `SPIRAL_V20_HCP` prescribes it: two-shot,
+  6/8 partial Fourier and acceleration 2 along kz (`PartialFourier`, `PartialFourierDirection` and
+  `ParallelReductionFactorOutOfPlane` in the sidecar). The overlay's header lists what neither source gives
+  and was chosen (the suppression pulse times, the spiral's duration and dwell time, the coil array). It needs
+  the 3 T phantom cropped to 135 mm in z, so it is parsed and resolved in the tests, not simulated.

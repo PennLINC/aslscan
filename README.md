@@ -57,7 +57,7 @@ Look-Locker combinations and the 3D gradient-echo EPI train (P7).
 |---|---|
 | Labeling | PCASL, CASL, PASL (with bolus cut-off, e.g. QUIPSS II/Q2TIPS); Hadamard time-encoded (P)CASL |
 | Delays | Single or multiple post-labeling delays; Look-Locker readouts (several per labeling; 2D EPI or 3D EPI) |
-| Readout | 2D multi-slice EPI (with multiband), 3D GRASE, 3D stack-of-spirals, 3D gradient-echo EPI (stack of EPI) |
+| Readout | 2D multi-slice EPI (with multiband), 3D GRASE, 3D stack-of-spirals (with partial Fourier and acceleration along kz), 3D gradient-echo EPI (stack of EPI) |
 | Contrast | Spin echo, inversion recovery, gradient echo |
 | Echoes | One, or several echo times (2D EPI or 3D EPI; the BIDS `echo-N` layout) |
 | Combinations | Look-Locker with every vascular extension (QUASAR), with Hadamard, and with several echo times |
@@ -69,6 +69,7 @@ Look-Locker combinations and the 3D gradient-echo EPI train (P7).
 Not supported, each reported as an error:
 - velocity-selective labeling, which has no BIDS labeling type yet;
 - Look-Locker or several echo times with GRASE or spiral readouts;
+- partial Fourier or acceleration along kz with GRASE or the 3D EPI train, or with Hadamard encoding;
 - the 3D gradient-echo EPI train with a smooth (not label-wise) T1 map;
 - `cbf` volumes;
 - phase encoding along any axis other than the second (`j` or `j-`).
@@ -128,6 +129,7 @@ describes each one:
 | `p7_quasar` | QUASAR-like Look-Locker PASL: crushed and uncrushed cycles, exchange, the arterial compartment |
 | `p7_ll_multite`, `p7_ll_hadamard` | Look-Locker with three echo times; Look-Locker with Hadamard (H8, four readouts) |
 | `p7_ge3d`, `p7_ll3d`, `p7_multite3d` | The 3D gradient-echo EPI train: plain, Look-Locker, three echoes per excitation |
+| `p8_spiral_kz` | An accelerated stack-of-spirals pCASL: 6/8 partial Fourier and acceleration 2 along kz (needs a full phantom) |
 
 ## Usage
 
@@ -201,6 +203,7 @@ matrix = [64, 64]              # in-plane scan matrix; default: phantom extent /
 noise_variance = 0.0           # default 0: no noise
 signal_scale = 100.0           # overall intensity scale (default 100)
 n_coils = 1                    # receive coils (default 1)
+coil_rows = 1                  # rings of coils along z (default 1); spiral readouts only
 acs_lines = 24                 # parallel-imaging calibration lines (default 24)
 partial_fourier = 1.0          # fraction of phase-encode lines acquired (default 1.0)
 pf_mode = "fiberfox"           # "fiberfox" or "contiguous"
@@ -284,6 +287,9 @@ interleaves = 8                # spiral (required)
 spiral_readout_time = 4.0      # ms; spiral (required)
 dwell_time = 4e-6              # s; spiral (otherwise the sidecar's DwellTime)
 refocusing_flip_angle = 150.0  # degrees (default: the sidecar's FlipAngle, else 180)
+kz_partial_fourier = 0.75      # spiral: fraction of the kz partitions read (default: the sidecar's, else 1)
+kz_acceleration = 2            # spiral: every second partition is read (default: the sidecar's, else 1)
+kz_partial_fourier_reconstruction = "zero-fill"  # spiral: or "pocs"
 ```
 
 The 3D gradient-echo EPI train (`type = "epi3d"`, or a `PulseSequenceType` containing "EPI") has its
@@ -371,6 +377,67 @@ readouts_per_cycle = 12        # optional check against the grouping the arrays 
   readout, its `H - 1` sub-boli in order, each row's `PostLabelingDelay` that sub-bolus's effective
   delay to the readout. `FlipAngle` and VENC must agree across the sub-boli of one readout. Each
   readout is decoded on its own.
+
+### Stack of spirals: undersampling along kz
+
+A stack of spirals can skip kz partitions in two ways, which shorten its echo train (the echo train
+length is the number of partitions read, divided by `kz_segments`).
+
+- **Partial Fourier** (`kz_partial_fourier`, or the sidecar's `PartialFourier` with
+  `PartialFourierDirection: "k"`). The train reads the `round(fraction x partitions)` highest
+  partitions: the kz centre, all of the positive side, and part of the negative side. The partitions
+  left out are zero-filled by default, or reconstructed by POCS (below). The fraction must be above
+  0.5.
+- **Acceleration** (`kz_acceleration`, or the sidecar's `ParallelReductionFactorOutOfPlane`). The
+  train reads every R-th partition, counted from the kz centre. The missing partitions are filled in
+  from their nearest acquired neighbours in every coil (a GRAPPA-like kernel with four source
+  partitions and no in-plane extent, after Vidorreta et al. 2017).
+
+Acceleration needs receive coils whose sensitivities differ along z:
+
+```toml
+[acquisition]
+n_coils = 8                    # must be a multiple of coil_rows
+coil_rows = 4                  # at least kz_acceleration
+```
+
+The coils form `coil_rows` rings along z, each of `n_coils / coil_rows` elements.
+
+The kernel is fitted once per series, on a calibration acquisition that stands in for the sequence's
+preparation repetitions:
+- it reads the first control or label volume of the series (failing that its first `m0scan`, then its
+  first `deltam`), before any motion, without noise sources other than
+  thermal noise;
+- it uses the same train without the acceleration, which is longer and must also fit in the
+  repetition time;
+- its noise is drawn from the series seed.
+
+Because the kernel does not depend on the volume being reconstructed, the reconstruction stays linear
+within a series.
+
+**POCS** (`kz_partial_fourier_reconstruction = "pocs"`) reconstructs the partitions that partial
+Fourier leaves out, as the paper's sequence does, instead of leaving them zero:
+- it works per coil along z, after the in-plane reconstruction and before the coils are combined;
+- it takes the image's phase from a low-resolution image of the acquired centre partitions, then
+  repeats ten times: give the image that phase, and put the acquired partitions back;
+- it recovers through-plane resolution that zero filling loses. On a test object, zero filling was
+  off by 20% of the image peak and POCS by 2%.
+
+POCS is not linear: the reconstruction of a sum of two objects is not the sum of their
+reconstructions. Two things follow.
+- A `deltam` row is refused with POCS. aslscan simulates a `deltam` volume as the image of the
+  label difference alone, which matches control minus label only for a linear reconstruction. List
+  `control` and `label` rows and subtract the volumes yourself, as a scanner would.
+- With POCS, each coil is reconstructed on its own, so run time grows with `n_coils`.
+
+What is not modeled:
+- homodyne partial-Fourier reconstruction;
+- 2D (CAIPI) or in-plane acceleration of a spiral;
+- undersampling along kz with GRASE, the 3D EPI train, or Hadamard encoding.
+
+On a small test object, the kernel alone (against the same partitions without the acceleration)
+was wrong by 1% to 3% of the image peak without noise. Run time
+grows with `n_coils / coil_rows`, because coils in different rings share their in-plane computation.
 
 ### 3D gradient-echo EPI
 

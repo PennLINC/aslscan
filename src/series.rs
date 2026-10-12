@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use mrsim_acq::grid::Grid;
 use mrsim_acq::io::hires_grid;
 use mrsim_acq::kspace::{simulate_acquisition_oversampled, Acquisition, T2Volume};
-use mrsim_acq::kspace3d::{simulate_acquisition_3d, LineWeights, ShotSet};
+use mrsim_acq::kspace3d::{simulate_acquisition_3d_kz, KzOptions, LineWeights, ShotSet};
 use mrsim_acq::motion::{
     apply_motion, apply_multiband_motion, resolve_poses, slice_schedule, DropoutLaw, DroppedShot, MotionEvent, Pose,
 };
@@ -1167,6 +1167,22 @@ fn simulate_legacy(
         }
     }
 
+    // P8: the calibration acquisition of an acceleration along kz reads preparation repetitions of
+    // the calibration volume resolve_readout chose: its compartment images as they are here, before any motion
+    // (physiology and shot events act later still, on line weights and shot sets), on a noise stream
+    // of the series seed.
+    let kz_cal_images: Vec<Vec<f32>> = match res3d.as_ref().and_then(|r3| r3.spiral.as_ref()).and_then(|sp| sp.calibration) {
+        Some(cal) => images.iter().map(|im| (0..nvox_sim).map(|v| im[v * n + cal.volume]).collect()).collect(),
+        None => Vec::new(),
+    };
+    if let Some(cal) = res3d.as_ref().and_then(|r3| r3.spiral.as_ref()).and_then(|sp| sp.calibration) {
+        if kz_cal_images.iter().all(|im| im.iter().all(|v| *v == 0.0)) {
+            return Err(format!(
+                "the kz calibration volume (row {}, the series' first control or label volume, else its first m0scan, else \
+                 its first deltam) holds no signal, so the kz kernel cannot be fitted to it", cal.volume));
+        }
+    }
+
     // ---- motion: per-volume poses, then multiband shot events ----
     let motion_seed = p.motion.as_ref().map(|_| p.seed ^ MOTION_SEED_SALT);
     let mut poses = vec![Pose::IDENTITY; n];
@@ -1301,15 +1317,21 @@ fn simulate_legacy(
     };
     #[cfg(not(feature = "kspace"))]
     let spiral_segmentation = None;
+    // P8: a spiral's coil rings along z and, for an acceleration along kz, its calibration (the images
+    // captured before the motion). The separate M0 is reconstructed with the same kernel.
+    let kz_opts = res3d.as_ref().and_then(|r3| r3.spiral.as_ref()).map(|sp| KzOptions {
+        coil_rows: sp.coil_rows, calibration_images: &kz_cal_images, calibration_seed: p.seed,
+        partial_fourier_recon: sp.partial_fourier_recon,
+    });
     let (mag, phase_out) = match &res3d {
         None => simulate_acquisition_oversampled(
             sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, &fmap_sim, Some(&ti_vols), &acq,
             &eddy_drive, &prep_drive, phase, p.seed, None,
         ),
-        Some(r3) => simulate_acquisition_3d(
+        Some(r3) => simulate_acquisition_3d_kz(
             sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, t1_vols.as_deref(), &fmap_sim, Some(&ti_vols), &acq,
             &r3.train, &r3.readout, line_weights.as_ref(), shot_sets.iter().any(|s| !s.is_empty()).then_some(&shot_sets[..]),
-            phase, p.seed,
+            phase, p.seed, kz_opts.as_ref(),
         ),
     };
     drop(images);
@@ -1332,9 +1354,9 @@ fn simulate_legacy(
                     &[None], &[None], phase, seed, None,
                 ),
                 // the same readout and train, no labeling, no physiology, no motion (P5 part B)
-                Some(r3) => simulate_acquisition_3d(
+                Some(r3) => simulate_acquisition_3d_kz(
                     sim_grid.dims, acq_grid.dims, 1, &imgs, &t2_vols, t1_vols.as_deref(), &fmap_sim, Some(&ti_vols),
-                    &acq, &r3.train, &r3.readout, None, None, phase, seed,
+                    &acq, &r3.train, &r3.readout, None, None, phase, seed, kz_opts.as_ref(),
                 ),
             })
         }

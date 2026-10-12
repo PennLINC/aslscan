@@ -372,6 +372,21 @@ mod writer {
             if let Some(sp) = &r3.spiral {
                 approx.push("the spiral's sampling bound is on k-space speed (one cycle/FOV per dwell time), not a gradient or slew limit");
                 approx.push("an ideal trajectory: no gradient delays or eddy currents");
+                if sp.kz.partial_fourier < 1.0 {
+                    approx.push(match sp.partial_fourier_recon {
+                        mrsim_acq::kspace3d::KzPartialFourierRecon::ZeroFill =>
+                            "partial Fourier along kz is zero-filled: no homodyne or POCS reconstruction",
+                        mrsim_acq::kspace3d::KzPartialFourierRecon::Pocs =>
+                            "partial Fourier along kz is reconstructed by POCS per coil, which is not linear in the data",
+                    });
+                }
+                if sp.coil_rows > 1 {
+                    approx.push("the coils' z profiles are Gaussians about evenly spaced rings, known exactly to the combine");
+                }
+                if sp.calibration.is_some() {
+                    approx.push("the kz kernel is calibrated on clean compartment images of one series volume (no motion or \
+                                 physiology in the preparation repetitions), with the series' noise level");
+                }
                 let segs = out.spiral_segmentation.as_deref().unwrap_or(&[]);
                 let fold = |voxel: bool| {
                     let s: Vec<_> = segs.iter().filter(|g| g.voxel == voxel).collect();
@@ -419,6 +434,10 @@ mod writer {
                               not asserted (about the Cartesian 3D value in the tests)",
                     "Approximations": approx,
                 });
+                // P8: recorded only when used, so a fully sampled spiral's sidecar is unchanged
+                if !sp.kz.is_full() || sp.coil_rows > 1 {
+                    block["Readout"]["KzSampling"] = kz_sampling_block(sp, nz, out.acquisition.n_coils);
+                }
             } else {
             block["Readout"] = json!({
                 "Type": rs.kind.0.as_str(), "TypeSource": rs.kind.1.as_str(),
@@ -456,7 +475,8 @@ mod writer {
                 for (name, a) in amps {
                     labels.insert(name.clone(), json!(a));
                     if let Some(e) = &echo_of {
-                        kz.insert(name.clone(), json!(e.iter().map(|&x| a[x - 1]).collect::<Vec<f64>>()));
+                        // P8: a partition the train does not read has echo 0 and no amplitude
+                        kz.insert(name.clone(), json!(e.iter().map(|&x| if x == 0 { 0.0 } else { a[x - 1] }).collect::<Vec<f64>>()));
                     }
                 }
                 block["EchoAmplitudes"] = json!({
@@ -722,6 +742,18 @@ mod writer {
                 if let Some(sp) = &r3.spiral {
                     // a spiral has no phase-encode readout (its EES, TRT and PED were refused)
                     effective.push(("DwellTime", json!(sp.dwell_ms / 1000.0)));
+                    // P8: the undersampling along kz, as resolved
+                    let kz_accel = json!(sp.kz.accel);
+                    if sp.kz.accel > 1 || side.get("ParallelReductionFactorOutOfPlane").is_some_and(|v| !same_number(v, &kz_accel)) {
+                        effective.push(("ParallelReductionFactorOutOfPlane", kz_accel));
+                    }
+                    if sp.kz.partial_fourier < 1.0 {
+                        // in place of the in-plane value pushed above (1 for a spiral), so the
+                        // input is compared with what was simulated, once
+                        effective.retain(|(k, _)| *k != "PartialFourier");
+                        effective.push(("PartialFourier", json!(sp.kz.partial_fourier)));
+                        effective.push(("PartialFourierDirection", json!("k")));
+                    }
                 } else {
                     let ny = out.acq_grid.dims[1];
                     let ees = r3.effective_spacing_s.unwrap_or(r3.t_line_ms / 1000.0 / rs.ky_segments.0 as f64);
@@ -839,6 +871,14 @@ mod writer {
                 if let (Some(r3), Some(rs)) = (&out.readout, &p.readout) {
                     if let Some(sp) = &r3.spiral {
                         m0side.insert("DwellTime".to_string(), json!(sp.dwell_ms / 1000.0));
+                        // P8: the M0 is read by the same undersampled train
+                        if sp.kz.accel > 1 {
+                            m0side.insert("ParallelReductionFactorOutOfPlane".to_string(), json!(sp.kz.accel));
+                        }
+                        if sp.kz.partial_fourier < 1.0 {
+                            m0side.insert("PartialFourier".to_string(), json!(sp.kz.partial_fourier));
+                            m0side.insert("PartialFourierDirection".to_string(), json!("k"));
+                        }
                     } else {
                         let ny = out.acq_grid.dims[1];
                         let ees = r3.effective_spacing_s.unwrap_or(r3.t_line_ms / 1000.0 / rs.ky_segments.0 as f64);
@@ -1450,6 +1490,53 @@ mod writer {
     #[cfg(not(feature = "kspace"))]
     fn spiral_reconstruction_block() -> Value {
         unreachable!("spiral readouts are refused without the kspace feature")
+    }
+
+    /// The sampling along kz of a stack of spirals and what fills the partitions not read (P8).
+    fn kz_sampling_block(sp: &crate::protocol::SpiralResolution, nz: usize, n_coils: usize) -> Value {
+        use mrsim_acq::kspace3d as k3;
+        let c = (nz / 2) as i64;
+        let read: Vec<i64> = sp.kz.acquired(nz).map_or_else(|_| Vec::new(), |a| {
+            (0..nz).filter(|&p| a[p]).map(|p| p as i64 - c).collect()
+        });
+        json!({
+            "Partitions": nz, "PartitionsRead": sp.partitions_read,
+            "KzRead": read,
+            "PartialFourier": { "Value": sp.kz.partial_fourier, "Source": sp.kz_partial_fourier_source.as_str() },
+            "PartialFourierBand": format!("kz in [{}, {}]: the round(PartialFourier x Partitions) highest partitions",
+                                          sp.band_start as i64 - c, nz as i64 - 1 - c),
+            "PartialFourierReconstruction": match sp.partial_fourier_recon {
+                k3::KzPartialFourierRecon::ZeroFill => json!("zero filling"),
+                k3::KzPartialFourierRecon::Pocs => json!({
+                    "Method": "POCS per coil along z, after the in-plane least squares of each partition and before the coil \
+                               combine: the phase of the Hann-windowed symmetric centre of the band, imposed at the current \
+                               magnitude, the acquired partitions restored each iteration",
+                    "Iterations": k3::POCS_ITERATIONS,
+                    "Linear": false,
+                }),
+            },
+            "Acceleration": { "Value": sp.kz.accel, "Source": sp.kz_acceleration_source.as_str() },
+            "AccelerationPattern": "kz a multiple of Acceleration, from the centre outward (Vidorreta et al. 2017)",
+            "Coils": {
+                "NCoils": n_coils, "Rows": sp.coil_rows,
+                "Model": "rings along z of NCoils / Rows elements; a coil's sensitivity is the in-plane ring profile times a \
+                          Gaussian about its ring's position (on a 0.15 floor), the rings evenly spaced over the slab",
+                "RowSigma": format!("{} ring spacings", k3::COIL_ROW_SIGMA),
+            },
+            "Kernel": sp.calibration.map(|cal| json!({
+                "Method": "per missing partition of the partial-Fourier band and per coil, a combination of every coil's \
+                           samples at the nearest acquired partitions, sample by sample (no in-plane extent), fitted once \
+                           by regularized least squares on the calibration acquisition and applied to every volume",
+                "SourcePartitions": k3::KZ_KERNEL_SOURCES,
+                "RelativeRegularization": k3::KZ_KERNEL_LAMBDA,
+                "Calibration": {
+                    "Volume": cal.volume, "EchoTrainLength": cal.etl,
+                    "Meaning": "preparation repetitions reading the clean compartment images of this series volume with \
+                                the train without the acceleration (its own echo amplitudes), at the series' noise level",
+                    "SeedSalt": format!("{:#x}", k3::SEED_SALT_KZCAL),
+                },
+            })),
+        })
     }
 }
 

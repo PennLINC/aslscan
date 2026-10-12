@@ -858,6 +858,89 @@ fn spiral_sidecars() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// P8: a stack of spirals at partial Fourier 6/8 and acceleration 2 along kz (six 1 mm partitions,
+/// four coil rings), the sidecar naming both. One series holds control, label and deltam: its kernel
+/// is fitted once, on the calibration, so the linearity identity holds between its volumes.
+#[cfg(feature = "kspace")]
+#[test]
+fn kz_undersampled_spiral_series_and_sidecar() {
+    let s = json!({
+        "ArterialSpinLabelingType": "PCASL", "LabelingDuration": 1.8, "PostLabelingDelay": 1.8,
+        "BackgroundSuppression": false, "M0Type": "Absent", "RepetitionTimePreparation": 4.0,
+        "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 1.0],
+        "MRAcquisitionType": "3D", "PulseSequenceType": "spiral", "FlipAngle": 150,
+        "VascularCrushing": false,
+        "ParallelReductionFactorOutOfPlane": 2, "PartialFourier": 0.75, "PartialFourierDirection": "k"
+    });
+    let ov = |extra: &str| -> Overlay {
+        toml::from_str(&format!(
+            "seed = 11\n[acquisition]\noversample = 2\nsignal_scale = 100.0\nn_coils = 4\ncoil_rows = 4\n\
+             [readout]\ninterleaves = 2\nspiral_readout_time = 4.0\ndwell_time = 2e-5\n{extra}")).unwrap()
+    };
+    let ctx = "volume_type\ncontrol\nlabel\ndeltam\n";
+    let p = parse(&s, ctx, Some(&ov("")), crop().params.as_ref()).unwrap();
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert_eq!(out.acq_grid.dims, [12, 12, 6]);
+    let r3 = out.readout.as_ref().unwrap();
+    let sp = r3.spiral.as_ref().unwrap();
+    // six partitions: the band keeps kz -2..2 (round(4.5) = 5), of which -2, 0, 2 are read
+    assert_eq!((r3.etl, sp.partitions_read, sp.band_start, sp.coil_rows), (3, 3, 1, 4));
+    assert_eq!(sp.calibration.map(|c| (c.volume, c.etl)), Some((0, 5)));
+    assert_eq!(out.echo_amplitudes.as_ref().unwrap()[0].1.len(), 3);
+    // within the series: control - label = deltam
+    let all = complex_from(&out.mag, &out.phase);
+    let vol = |g: usize| -> Vec<(f64, f64)> { all.iter().skip(g).step_by(3).copied().collect() };
+    let worst = residual_of(&vol(0), &vol(1), &vol(2));
+    println!("linearity within a kz-accelerated spiral series: worst residual / tolerance = {worst:.3}");
+    assert!(worst <= 1.0, "{worst}");
+    // the image is close to the fully sampled one's on the same coils, and not it
+    let full = simulate_with(&parse(&s, ctx, Some(&ov("kz_partial_fourier = 1.0\nkz_acceleration = 1\n")), crop().params.as_ref())
+                             .unwrap(), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert_eq!(full.readout.as_ref().unwrap().etl, 6);
+    let pk = full.mag.iter().fold(0.0f32, |a, &b| a.max(b));
+    let d = out.mag.iter().zip(&full.mag).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("kz 6/8 and R = 2 against full sampling: {:.3} of peak", d / pk);
+    assert!(d > 1e-4 * pk && d < 0.5 * pk, "{d} of {pk}");
+    // the sidecar
+    let dir = std::env::temp_dir().join(format!("aslscan-kz-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("sub-01/perf/sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    assert_eq!(side["ParallelReductionFactorOutOfPlane"], json!(2));
+    assert_eq!((&side["PartialFourier"], &side["PartialFourierDirection"]), (&json!(0.75), &json!("k")));
+    let ro = &side["AslscanSimulation"]["Readout"];
+    assert_eq!(ro["EchoTrainLength"], json!(3));
+    let kz = &ro["KzSampling"];
+    assert_eq!((&kz["Partitions"], &kz["PartitionsRead"], &kz["KzRead"]), (&json!(6), &json!(3), &json!([-2, 0, 2])));
+    assert_eq!((&kz["PartialFourier"]["Source"], &kz["Acceleration"]["Value"]), (&json!("Sidecar"), &json!(2)));
+    assert_eq!(kz["PartialFourierReconstruction"], json!("zero filling"));
+    assert_eq!((&kz["Coils"]["NCoils"], &kz["Coils"]["Rows"]), (&json!(4), &json!(4)));
+    assert_eq!((&kz["Kernel"]["Calibration"]["Volume"], &kz["Kernel"]["Calibration"]["EchoTrainLength"]), (&json!(0), &json!(5)));
+    assert!(ro["Approximations"].as_array().unwrap().iter().any(|a| a.as_str().unwrap().contains("zero-filled")));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // POCS for the partitions partial Fourier leaves out: another image, recorded as such, and not
+    // linear, so a deltam row is refused and control - label is taken from the volumes
+    let ctx2 = "volume_type\ncontrol\nlabel\n";
+    let pocs_ov = ov("kz_partial_fourier_reconstruction = \"pocs\"\n");
+    let pp = parse(&s, ctx2, Some(&pocs_ov), crop().params.as_ref()).unwrap();
+    let po = simulate_with(&pp, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let zf = simulate_with(&parse(&s, ctx2, Some(&ov("")), crop().params.as_ref()).unwrap(), &crop(), T2Mode::Auto, &phase(),
+                           RowOverride::None).unwrap();
+    let d = po.mag.iter().zip(&zf.mag).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(po.mag.iter().all(|v| v.is_finite()) && d > 1e-3 * pk, "{d} of {pk}");
+    assert!(parse(&s, ctx, Some(&pocs_ov), crop().params.as_ref()).unwrap_err().contains("with deltam rows"));
+    let dir = std::env::temp_dir().join(format!("aslscan-kz-pocs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &pp, &po).unwrap();
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("sub-01/perf/sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    let rec = &side["AslscanSimulation"]["Readout"]["KzSampling"]["PartialFourierReconstruction"];
+    assert_eq!((&rec["Iterations"], &rec["Linear"]), (&json!(mrsim_acq::kspace3d::POCS_ITERATIONS), &json!(false)));
+    assert!(side["AslscanSimulation"]["Readout"]["Approximations"].as_array().unwrap().iter()
+        .any(|a| a.as_str().unwrap().contains("POCS")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Without the `kspace` feature a spiral is an error naming it, before anything is simulated.
 #[cfg(not(feature = "kspace"))]
 #[test]

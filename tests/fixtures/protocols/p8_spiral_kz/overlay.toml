@@ -1,0 +1,31 @@
+# The stack-of-spirals pCASL of Vidorreta et al. (2017, PLoS ONE 12(8):e0183762) as the Siemens
+# Prisma protocol SPIRAL_V20_HCP prescribes it (P8): unbalanced pCASL (1.8 s label, 1.8 s delay),
+# TR 4.2 s, 64 x 64 at 3.75 mm, 36 partitions (34 slices and the paper's 5.9% oversampling), two
+# interleaves each its own shot, centric, 6/8 partial Fourier and acceleration 2 along kz: 13 of the
+# 36 partitions are read, kz = -8, -6, ..., 16. An m0scan and 14 label/control pairs (the
+# protocol's 29 measurements; their order is assumed). Run it on the 3 T phantom cropped to
+# 135 mm in z (tools/hrgt_to_bids.py --crop 0:197 0:233 20:155).
+#
+# Not in the protocol or the paper, chosen here:
+# - the two background-suppression pulse times (asl.json), which leave grey and white matter at
+#   10% of equilibrium at the excitation after the presaturation, the paper's stated target;
+# - the 4 ms spiral and its 1 us dwell time: EchoTime 10 ms is the echo spacing of a centric
+#   spiral-out train, which leaves 4 ms between refocusing pulses, and aslscan's sampling bound
+#   then needs a dwell below 1.04 us (the paper's 400 kHz receiver gives 2.5 us; its readout
+#   durations imply an echo spacing near 16.5 ms, which this model cannot hold at EchoTime 10 ms);
+# - the coil array: eight coils in four rings along z (the scan used a 64-channel head coil).
+seed = 1
+
+[acquisition]
+matrix = [64, 64]
+n_coils = 8
+coil_rows = 4
+
+[readout]
+interleaves = 2
+spiral_readout_time = 4.0
+dwell_time = 1.0e-6
+refocusing_flip_angle = 180.0
+
+[background_suppression]
+presaturation = true

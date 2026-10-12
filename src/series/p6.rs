@@ -8,6 +8,7 @@
 
 use super::*;
 use mrsim_acq::kspace::simulate_acquisition_echoes;
+use mrsim_acq::kspace3d::simulate_acquisition_3d;
 use crate::kinetic::{delta_m_read, delta_m_read_parts, Kinetic, ReadParts};
 use crate::longitudinal::{ll_legacy_dispatch, tissue_mz_ll_series, LlCycle};
 use crate::protocol::{check_excitation_timing, HadamardSpec};
