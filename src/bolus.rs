@@ -22,7 +22,7 @@ pub enum Region {
 }
 
 /// The entry offset `delta`: parcel `a` is inside the region from `a + delta`. `att` is the
-/// voxel's `ATT` (or `aATT` for the arterial compartment). `None`: inside from the start (a
+/// voxel's `ATT` (or `ATT_arterial` for the arterial compartment). `None`: inside from the start (a
 /// PASL bolus is labeled whole at `t = 0`, so a global pulse acts on every parcel).
 pub fn entry_offset(label_type: LabelType, region: Region, att: f64) -> Option<f64> {
     match (region, label_type) {

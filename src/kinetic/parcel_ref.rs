@@ -19,8 +19,8 @@ pub enum Region {
 #[derive(Debug, Clone)]
 pub struct Case {
     pub k: Kinetic,
-    /// Perfusion (ml/100g/min), ATT (s), tissue T1 (s), M0.
-    pub f: f64,
+    /// Perfusion (CBF, mL/100 g/min), ATT (s), tissue T1 (s), M0.
+    pub f_ml_100g_min: f64,
     pub att: f64,
     pub t1t: f64,
     pub m0: f64,
@@ -81,7 +81,7 @@ impl Case {
 
     /// `T1'`: the tissue T1 with the flow's outflow, the GKM's residue time.
     fn t1p(&self) -> f64 {
-        1.0 / (1.0 / self.t1t + (self.f / 6000.0) / self.k.lambda)
+        1.0 / (1.0 / self.t1t + (self.f_ml_100g_min / 6000.0) / self.k.lambda)
     }
 
     /// The parcel's sub-bolus coordinate (its labeling time for (P)CASL, its arrival less ATT for
@@ -118,7 +118,7 @@ impl Case {
             // labeled at 0, carried u in blood
             LabelType::Pasl => (-u / k.t1b).exp(),
         };
-        2.0 * k.alpha * self.m0b() * (self.f / 6000.0) * carried
+        2.0 * k.alpha * self.m0b() * (self.f_ml_100g_min / 6000.0) * carried
     }
 
     fn breaks(&self, att: f64, lead: f64) -> Vec<f64> {
@@ -155,16 +155,16 @@ impl Case {
 
     /// The arterial read at `t` before `sin(a)` and survival: the one parcel in the voxel's
     /// arteries, entered into the slab `entry_lead_a` before `t`.
-    pub fn arterial(&self, abv: f64, aatt: f64, entry_lead_a: f64) -> f64 {
+    pub fn arterial(&self, abv: f64, att_arterial: f64, entry_lead_a: f64) -> f64 {
         let k = &self.k;
         let t = self.t;
-        if !(aatt <= t && t < aatt + k.tau) {
+        if !(att_arterial <= t && t < att_arterial + k.tau) {
             return 0.0;
         }
         let carried = match k.label_type {
-            LabelType::Casl | LabelType::Pcasl => (-aatt / k.t1b).exp(),
+            LabelType::Casl | LabelType::Pcasl => (-att_arterial / k.t1b).exp(),
             LabelType::Pasl => (-t / k.t1b).exp(),
         };
-        2.0 * k.alpha * self.m0b() * abv * carried * self.suppression(t, aatt) * self.depletion(t - entry_lead_a)
+        2.0 * k.alpha * self.m0b() * abv * carried * self.suppression(t, att_arterial) * self.depletion(t - entry_lead_a)
     }
 }

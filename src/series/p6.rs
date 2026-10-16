@@ -190,9 +190,9 @@ fn decoded_truth(
                         .sum()
                 });
             }
-            if let (Some(out), Some(abv), Some(aatt)) = (art.as_mut(), &p4.abv, &p4.aatt) {
+            if let (Some(out), Some(abv), Some(att_arterial)) = (art.as_mut(), &p4.abv, &p4.att_arterial) {
                 put(out, &|i| {
-                    let (va, a) = arterial_dm(&kin, abv[i], aatt[i], ph.m0[i] as f64, t);
+                    let (va, a) = arterial_dm(&kin, abv[i], att_arterial[i], ph.m0[i] as f64, t);
                     if a.is_some_and(|a| aj <= a && a < bj) { va } else { 0.0 }
                 });
             }
@@ -873,18 +873,18 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                 }
                 // P7 part A: the arterial read, fresh (2D), with its crushing survival and parcel
                 // factor, sin(a_n) as the image takes it
-                if let (Some(ga), Some(abv), Some(aatt)) = (gt_read_art.as_mut(), &p4.abv, &p4.aatt) {
+                if let (Some(ga), Some(abv), Some(att_arterial)) = (gt_read_art.as_mut(), &p4.abv, &p4.att_arterial) {
                     let t = row.t + slice_offsets[z];
                     let bolus = bolus_of(v);
                     let sl = r_acq.mean_slice(z, |i| {
                         if ph.dseg[i] <= 0 {
                             return 0.0;
                         }
-                        let (va, a) = arterial_dm(&kin, abv[i], aatt[i], ph.m0[i] as f64, t);
+                        let (va, a) = arterial_dm(&kin, abv[i], att_arterial[i], ph.m0[i] as f64, t);
                         let Some(a) = a else { return 0.0 };
                         let g = match &bolus {
                             Some((region, pulses, eps)) => {
-                                arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, aatt[i]))
+                                arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, att_arterial[i]))
                             }
                             None => 1.0,
                         };
@@ -969,7 +969,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                     if ph.dseg[i] <= 0 {
                         continue;
                     }
-                    let (f_ml, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
+                    let (f_ml_100g_min, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
                     // the tissue label: (scale, total, intravascular), the single-sub-bolus factor
                     // folded into the scale as P3 folds its factor into the sign
                     let (scale, dm, iv) = match (&enc_w[v], &bolus) {
@@ -988,9 +988,9 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                                 for &(a, b, f) in &parcels {
                                     let (lo, hi) = (a.max(aj), b.min(bj));
                                     if hi > lo {
-                                        dm += f * delta_m_sub(&kin, f_ml, att, t1t, m0, t, lo, hi);
+                                        dm += f * delta_m_sub(&kin, f_ml_100g_min, att, t1t, m0, t, lo, hi);
                                         if let Some(te) = p.exchange_time {
-                                            iv += f * delta_m_iv_sub(&kin, f_ml, att, t1t, m0, t, lo, hi, te);
+                                            iv += f * delta_m_iv_sub(&kin, f_ml_100g_min, att, t1t, m0, t, lo, hi, te);
                                         }
                                     }
                                 }
@@ -1002,21 +1002,21 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                             let key = delta.map_or(u64::MAX, f64::to_bits);
                             let sb = partitions.entry(key).or_insert_with(|| subbolus_factors(pulses, *eps, kin.tau, delta));
                             if sb.len() == 1 {
-                                let iv = p.exchange_time.map(|te| delta_m_iv(&kin, f_ml, att, t1t, m0, t, te));
-                                (sb[0].2, delta_m(&kin, f_ml, att, t1t, m0, t), iv)
+                                let iv = p.exchange_time.map(|te| delta_m_iv(&kin, f_ml_100g_min, att, t1t, m0, t, te));
+                                (sb[0].2, delta_m(&kin, f_ml_100g_min, att, t1t, m0, t), iv)
                             } else {
-                                let dm: f64 = sb.iter().map(|&(a, b, f)| f * delta_m_sub(&kin, f_ml, att, t1t, m0, t, a, b)).sum();
+                                let dm: f64 = sb.iter().map(|&(a, b, f)| f * delta_m_sub(&kin, f_ml_100g_min, att, t1t, m0, t, a, b)).sum();
                                 let iv = p.exchange_time.map(|te| {
-                                    sb.iter().map(|&(a, b, f)| f * delta_m_iv_sub(&kin, f_ml, att, t1t, m0, t, a, b, te)).sum::<f64>()
+                                    sb.iter().map(|&(a, b, f)| f * delta_m_iv_sub(&kin, f_ml_100g_min, att, t1t, m0, t, a, b, te)).sum::<f64>()
                                 });
                                 (1.0, dm, iv)
                             }
                         }
                         (None, None) => (1.0, match &read {
                             // P6 part B: the depleted read (exchange is refused with Look-Locker)
-                            Some((e, fl)) => delta_m_read(&kin, f_ml, att, t1t, m0, e, fl),
-                            None => delta_m(&kin, f_ml, att, t1t, m0, t),
-                        }, p.exchange_time.map(|te| delta_m_iv(&kin, f_ml, att, t1t, m0, t, te))),
+                            Some((e, fl)) => delta_m_read(&kin, f_ml_100g_min, att, t1t, m0, e, fl),
+                            None => delta_m(&kin, f_ml_100g_min, att, t1t, m0, t),
+                        }, p.exchange_time.map(|te| delta_m_iv(&kin, f_ml_100g_min, att, t1t, m0, t, te))),
                     };
                     // P7 part A: under Look-Locker the images read the depleted parts, each with its
                     // parcel factor; the P4 truths below keep their P4 meaning (at t, undepleted)
@@ -1038,20 +1038,20 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                         // the unsuppressed intravascular part: kinetics and the split only
                         let te = p.exchange_time.unwrap();
                         giv[j] = match &enc_w[v] {
-                            None => delta_m_iv(&kin, f_ml, att, t1t, m0, t, te),
+                            None => delta_m_iv(&kin, f_ml_100g_min, att, t1t, m0, t, te),
                             Some(w) => spans.iter().zip(w).filter(|(_, &w)| w == 1)
-                                .map(|(&(a, b), _)| delta_m_iv_sub(&kin, f_ml, att, t1t, m0, t, a, b, te)).sum(),
+                                .map(|(&(a, b), _)| delta_m_iv_sub(&kin, f_ml_100g_min, att, t1t, m0, t, a, b, te)).sum(),
                         };
                     }
                     if !gsup.is_empty() {
                         gsup[j] = scale * dm;
                     }
-                    if let (Some(abv), Some(aatt)) = (&p4.abv, &p4.aatt) {
-                        let (va, a) = arterial_dm(&kin, abv[i], aatt[i], m0, t);
+                    if let (Some(abv), Some(att_arterial)) = (&p4.abv, &p4.att_arterial) {
+                        let (va, a) = arterial_dm(&kin, abv[i], att_arterial[i], m0, t);
                         if let Some(a) = a {
                             let g = match &bolus {
                                 Some((region, pulses, eps)) => {
-                                    arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, aatt[i]))
+                                    arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, att_arterial[i]))
                                 }
                                 None => 1.0,
                             };
@@ -1142,7 +1142,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                 if let Some(g) = d_ev.as_mut() {
                     put(g, &|i| fa * parts[i - base].ev);
                 }
-                if let (Some(g), Some(abv), Some(aatt)) = (d_art.as_mut(), &p4.abv, &p4.aatt) {
+                if let (Some(g), Some(abv), Some(att_arterial)) = (d_art.as_mut(), &p4.abv, &p4.att_arterial) {
                     let t = row.t + slice_offsets[z];
                     let bolus = bolus_of(r);
                     let (aj, bj) = h.spans[subbolus];
@@ -1150,12 +1150,12 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                         if ph.dseg[i] <= 0 {
                             return 0.0;
                         }
-                        let (va, a) = arterial_dm(&kin, abv[i], aatt[i], ph.m0[i] as f64, t);
+                        let (va, a) = arterial_dm(&kin, abv[i], att_arterial[i], ph.m0[i] as f64, t);
                         match a {
                             Some(a) if aj <= a && a < bj => {
                                 let g = match &bolus {
                                     Some((region, pulses, eps)) => {
-                                        arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, aatt[i]))
+                                        arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, att_arterial[i]))
                                     }
                                     None => 1.0,
                                 };
@@ -1671,7 +1671,7 @@ pub(super) fn simulate_p6(
         delta_m_suppressed: gt_sup,
         delta_m_arterial: gt_art,
         abv: p4.abv.as_ref().map(|a| r_acq.mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>())),
-        aatt: match (&p4.abv, &p4.aatt) {
+        att_arterial: match (&p4.abv, &p4.att_arterial) {
             (Some(b), Some(a)) => {
                 let has: Vec<bool> = b.iter().map(|x| *x > 0.0).collect();
                 Some(r_acq.masked_mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>(), &has))
@@ -2383,7 +2383,7 @@ mod tests {
 
     const QUASAR_PARTS: &str = "[kinetic]\nexchange_time = 0.6\n\
         [macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-        arterial_transit_time = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n\
+        arterial_compartment_att = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n\
         [vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n\
         [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n";
 
@@ -2405,7 +2405,7 @@ mod tests {
         let eps = p.suppression.as_ref().unwrap().for_row(0).epsilon;
         let vel = [0.0, 10.0, 6.0, 3.0];
         let abv = [0.0, 0.03, 0.015, 0.0];
-        let aatt = [0.0, 1.2, 1.8, 0.0];
+        let att_arterial = [0.0, 1.2, 1.8, 0.0];
         let fl = p.look_locker.as_ref().unwrap().flip_deg.clone();
         let [nx, ny, nz] = b.acq_grid.dims;
         let r_sim = Resampler::with_offset(ph.grid.dims, crate::resample::axis_aligned_voxels(&ph.grid).unwrap(), b.sim_grid.dims,
@@ -2428,13 +2428,13 @@ mod tests {
                         return (0.0, 0.0, 0.0);
                     }
                     let c = Case {
-                        k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64, t,
+                        k: kin, f_ml_100g_min: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64, t,
                         excitations: excitations.clone(), entry_lead: 0.0, pulses: vec![1.2], epsilon: eps,
                         region: PRegion::Slab(0.3), tau_ex: Some(0.6), span: (0.0, kin.tau),
                     };
                     let (iv, total) = c.read(4);
                     let l = l as usize;
-                    let art = c.arterial(abv[l], aatt[l], 0.0) * survival(vel[l], venc);
+                    let art = c.arterial(abv[l], att_arterial[l], 0.0) * survival(vel[l], venc);
                     (iv, total - iv, art)
                 };
                 // the truths, on the acquired grid
@@ -2483,7 +2483,7 @@ mod tests {
         let b = build(&p, &ph, T2Mode::Class, RowOverride::None, p.echo_times_s[0], &Schedule::new(&p)).unwrap();
         assert!(b.gt_read.is_some() && b.gt_read_iv.is_none() && b.gt_read_ev.is_none() && b.gt_read_art.is_none());
         let macro_only = "[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-            arterial_transit_time = { grey_matter = 0.5, white_matter = 0.7, csf = 0.0 }\n";
+            arterial_compartment_att = { grey_matter = 0.5, white_matter = 0.7, csf = 0.0 }\n";
         let pm = parse_echoes(&[s], &ctx, Some(&overlay(macro_only, true)), None).unwrap();
         let bm = build(&pm, &ph, T2Mode::Class, RowOverride::None, pm.echo_times_s[0], &Schedule::new(&pm)).unwrap();
         assert!(bm.gt_read_art.is_some() && bm.gt_read_iv.is_none());
@@ -2568,7 +2568,7 @@ mod tests {
                         return 0.0;
                     }
                     let c = Case {
-                        k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64,
+                        k: kin, f_ml_100g_min: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64,
                         t: e(readout), excitations: (0..readout).map(|m| (e(m), 60.0)).collect(), entry_lead: 0.0, pulses: vec![],
                         epsilon: 0.0, region: PRegion::Global, tau_ex: Some(0.6), span: h.spans[subbolus],
                     };
@@ -2622,7 +2622,7 @@ mod tests {
                         return 0.0;
                     }
                     let c = Case {
-                        k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64,
+                        k: kin, f_ml_100g_min: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64,
                         t: e(readout), excitations: (0..readout).map(|m| (e(m), 60.0)).collect(), entry_lead: 0.0, pulses: vec![],
                         epsilon: 0.0, region: PRegion::Global, tau_ex: Some(0.6), span: h.spans[subbolus],
                     };

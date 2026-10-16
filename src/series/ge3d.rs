@@ -101,7 +101,7 @@ pub(super) fn m0_train_mz(t1_s: f64, m0_tr_s: f64, n_exc: usize, spacing_s: f64,
 
 /// How long before its arrival a voxel's label entered the slab (P7 addendum, part C, "Depletion
 /// from slab entry"): `arrival - d`, zero for `"arrival"`. A slab entry after the arrival is
-/// refused, naming the voxel (`what` names the arrival: "ATT" or "aATT").
+/// refused, naming the voxel (`what` names the arrival: "ATT" or "ATT_arterial").
 pub(super) fn entry_lead(entry: SlabEntryTime, arrival_s: f64, voxel: usize, what: &str) -> Result<f64, String> {
     match entry {
         SlabEntryTime::Arrival => Ok(0.0),
@@ -305,7 +305,7 @@ impl Ge3dBuild<'_> {
         let kin = p.kinetic(row);
         let (e, flips, offset) = self.cycle(v);
         let n = self.res.n_exc;
-        let (f_ml, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
+        let (f_ml_100g_min, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
         let bolus = self.bolus_region.map(|region| {
             let s = p.suppression.as_ref().unwrap().for_row(self.sched.preps[self.sched.raws[v].prep].suppression);
             (region, s.pulse_times, s.epsilon)
@@ -323,27 +323,27 @@ impl Ge3dBuild<'_> {
                 }
             }
         }
-        let all = crate::kinetic::delta_m_read_all(&kin, f_ml, att, t1t, m0, &e, &flips, &subs, p.exchange_time, self.lead[i]);
+        let all = crate::kinetic::delta_m_read_all(&kin, f_ml_100g_min, att, t1t, m0, &e, &flips, &subs, p.exchange_time, self.lead[i]);
         let parts = &all[offset..offset + n];
         self.families.iter().map(|fam| match fam {
             Family::Blood => parts.iter().map(|q| q.iv).collect(),
             Family::Extravascular => parts.iter().map(|q| q.ev).collect(),
             Family::Arterial => {
-                let (Some(abv), Some(aatt)) = (&self.p4.abv, &self.p4.aatt) else { return vec![0.0; n] };
+                let (Some(abv), Some(att_arterial)) = (&self.p4.abv, &self.p4.att_arterial) else { return vec![0.0; n] };
                 let crush = self.p4.crush.as_ref().map_or(1.0, |cr| cr[v][self.p4.label_of[i]]);
                 (offset..offset + n).map(|x| {
                     // the parcel the arteries hold at e_x counts only where its labeling is in a span
-                    let a = e[x] - aatt[i];
+                    let a = e[x] - att_arterial[i];
                     if !spans.iter().any(|&(lo, hi)| lo <= a && a < hi) {
                         return 0.0;
                     }
                     let g = match &bolus {
-                        Some((region, pulses, eps)) => arterial_factor(pulses, *eps, e[x] - aatt[i],
-                                                                       entry_offset(p.label_type, *region, aatt[i])),
+                        Some((region, pulses, eps)) => arterial_factor(pulses, *eps, e[x] - att_arterial[i],
+                                                                       entry_offset(p.label_type, *region, att_arterial[i])),
                         None => 1.0,
                     };
                     let earlier: Vec<(f64, f64)> = e[..x].iter().copied().zip(flips[..x].iter().copied()).collect();
-                    crate::kinetic::arterial_read(&kin, abv[i], aatt[i], m0, e[x], &earlier, self.lead_a[i], g * crush)
+                    crate::kinetic::arterial_read(&kin, abv[i], att_arterial[i], m0, e[x], &earlier, self.lead_a[i], g * crush)
                 }).collect()
             }
         }).collect()
@@ -611,9 +611,9 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
         if ph.dseg[i] > 0 && ph.perfusion[i] > 0.0 {
             lead[i] = entry_lead(g3.slab_entry.0, ph.att[i] as f64, i, "ATT")?;
         }
-        if let (Some(abv), Some(aatt)) = (&p4.abv, &p4.aatt) {
+        if let (Some(abv), Some(att_arterial)) = (&p4.abv, &p4.att_arterial) {
             if ph.dseg[i] > 0 && abv[i] > 0.0 {
-                lead_a[i] = entry_lead(g3.slab_entry.0, aatt[i], i, "aATT")?;
+                lead_a[i] = entry_lead(g3.slab_entry.0, att_arterial[i], i, "ATT_arterial")?;
             }
         }
     }
@@ -1017,7 +1017,7 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
         delta_m_suppressed: None,
         delta_m_arterial: gt_art,
         abv: b.p4.abv.as_ref().map(|a| r_acq.mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>())),
-        aatt: match (&b.p4.abv, &b.p4.aatt) {
+        att_arterial: match (&b.p4.abv, &b.p4.att_arterial) {
             (Some(bv), Some(a)) => {
                 let has: Vec<bool> = bv.iter().map(|x| *x > 0.0).collect();
                 Some(r_acq.masked_mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>(), &has))
@@ -1256,8 +1256,8 @@ mod tests {
     fn slab_entry_leads_and_the_memory_bound() {
         assert_eq!(entry_lead(SlabEntryTime::Arrival, 1.2, 0, "ATT").unwrap(), 0.0);
         assert!((entry_lead(SlabEntryTime::Seconds(0.5), 1.2, 0, "ATT").unwrap() - 0.7).abs() < 1e-15);
-        let e = entry_lead(SlabEntryTime::Seconds(0.9), 0.8, 417, "aATT").unwrap_err();
-        assert!(e.contains("voxel 417") && e.contains("aATT"), "{e}");
+        let e = entry_lead(SlabEntryTime::Seconds(0.9), 0.8, 417, "ATT_arterial").unwrap_err();
+        assert!(e.contains("voxel 417") && e.contains("ATT_arterial"), "{e}");
         // with depletion before arrival the read is smaller than with none
         let (_, early) = train_reads(&[1.0], 0.2);
         let e = train_times(2.0, 32, 0.04);
@@ -1350,7 +1350,7 @@ mod tests {
                             let mut v = ph.m0[i] as f64 * m;
                             if sign != 0.0 && ph.perfusion[i] > 0.0 {
                                 let c = Case {
-                                    k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
+                                    k: kin, f_ml_100g_min: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
                                     m0: ph.m0[i] as f64, t: e[j], excitations: e[..j].iter().map(|&t| (t, 12.0)).collect(),
                                     entry_lead: if lead_on { ph.att[i] as f64 - 0.5 } else { 0.0 }, pulses: vec![2.0],
                                     epsilon: eps, region: PRegion::Global, tau_ex: Some(0.4), span: (0.0, kin.tau),
@@ -1544,7 +1544,7 @@ mod tests {
                         let mut v = ph.m0[i] as f64 * brute(ph.t1[i] as f64, &cycles)[prep][x];
                         if sign != 0.0 && ph.perfusion[i] > 0.0 {
                             let c = Case {
-                                k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
+                                k: kin, f_ml_100g_min: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
                                 m0: ph.m0[i] as f64, t: e_all[x],
                                 excitations: e_all[..x].iter().copied().zip(f_all[..x].iter().copied()).collect(),
                                 entry_lead: ph.att[i] as f64 - 0.5, pulses: vec![2.0], epsilon: eps, region: PRegion::Global,
@@ -1762,9 +1762,9 @@ mod tests {
     // ---- Task 18: Hadamard, and the P4 parts, in 3D
 
     const MACRO: &str = "[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-                         arterial_transit_time = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n";
+                         arterial_compartment_att = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n";
     const ABV: [f64; 4] = [0.0, 0.03, 0.015, 0.0];
-    const AATT: [f64; 4] = [0.0, 1.2, 1.8, 0.0];
+    const ATT_ARTERIAL: [f64; 4] = [0.0, 1.2, 1.8, 0.0];
 
     /// `ge3d_protocol`'s train, Hadamard order 4 (sub-boli of 0.6 s), `cycles` encoding cycles, each
     /// row read at every PLD of `plds` (Look-Locker with more than one), no suppression.
@@ -1810,15 +1810,15 @@ mod tests {
             return 0.0;
         }
         let c = Case {
-            k, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
+            k, f_ml_100g_min: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
             m0: ph.m0[i] as f64, t: e_all[x], excitations: e_all[..x].iter().map(|&t| (t, 12.0)).collect(),
             entry_lead: ph.att[i] as f64 - 0.5, pulses: vec![], epsilon: 0.0, region: PRegion::Global, tau_ex: Some(0.4), span,
         };
         let mut v = if ph.perfusion[i] > 0.0 { c.read(4).1 } else { 0.0 };
         let l = l as usize;
-        let a = e_all[x] - AATT[l];
+        let a = e_all[x] - ATT_ARTERIAL[l];
         if arterial && ABV[l] > 0.0 && span.0 <= a && a < span.1 {
-            v += c.arterial(ABV[l], AATT[l], AATT[l] - 0.5);
+            v += c.arterial(ABV[l], ATT_ARTERIAL[l], ATT_ARTERIAL[l] - 0.5);
         }
         v
     }
@@ -1871,8 +1871,8 @@ mod tests {
                             if arterial && !art_seen {
                                 art_seen = (0..ph.nvox()).any(|i| {
                                     let l = ph.dseg[i].max(0) as usize;
-                                    let a = e_all[x] - AATT[l];
-                                    ABV[l] > 0.0 && h.spans[j].0 <= a && a < h.spans[j].1 && AATT[l] <= e_all[x]
+                                    let a = e_all[x] - ATT_ARTERIAL[l];
+                                    ABV[l] > 0.0 && h.spans[j].0 <= a && a < h.spans[j].1 && ATT_ARTERIAL[l] <= e_all[x]
                                 });
                             }
                             let want = b.r_sim.mean(&per);
@@ -1894,7 +1894,7 @@ mod tests {
     }
 
     /// 3D Hadamard: decoded (j, n) against the independent sub-bolus read, with exchange and the
-    /// arterial term, both entering the slab at d = 0.5 s < aATT; each shot repeats its encoding row.
+    /// arterial term, both entering the slab at d = 0.5 s < ATT_arterial; each shot repeats its encoding row.
     #[test]
     fn hadamard_decodes_to_each_sub_bolus_with_the_arterial_term() {
         let p = had3d_protocol(&[0.5], 1, MACRO);

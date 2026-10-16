@@ -146,10 +146,10 @@ printf 'seed = 3\n' > $A/crop-seed.toml
 # P4 cases on the crop: physiological noise alone; the arterial compartment with crushing and
 # exchange; bolus-position suppression with a slab pulse during labeling
 printf 'seed = 3\n[physio]\ntissue_cardiac = 0.02\ntissue_drift = 0.01\nlabel_respiratory = 0.03\n' > $A/crop-physio.toml
-printf 'seed = 3\n[kinetic]\nexchange_time = 0.5\n[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\narterial_transit_time = { grey_matter = 3.0, white_matter = 3.2, csf = 0.0 }\n[vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n' > $A/crop-macro.toml
+printf 'seed = 3\n[kinetic]\nexchange_time = 0.5\n[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\narterial_compartment_att = { grey_matter = 3.0, white_matter = 3.2, csf = 0.0 }\n[vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n' > $A/crop-macro.toml
 printf 'seed = 3\n[background_suppression]\nmodel = "bolus-position"\npulse_region = "slab"\nslab_entry_time = 0.3\n' > $A/crop-bolus.toml
 crop_json '"BackgroundSuppression": true, "BackgroundSuppressionNumberPulses": 2, "BackgroundSuppressionPulseTime": [1.5, 2.7]' > $A/crop-bs-early.json
-# PASL on the crop: cutoff 0.7 s, PLD 1.8 s; suppression after the cutoff, and motion
+# PASL on the crop: cutoff 0.7 s, TI 1.8 s; suppression after the cutoff, and motion
 pasl_json() {
   printf '{"ArterialSpinLabelingType": "PASL", "BolusCutOffFlag": true, "BolusCutOffTechnique": "Q2TIPS", "BolusCutOffDelayTime": 0.7, "PostLabelingDelay": 1.8, "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0], "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05], "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.012, %s}\n' "$1"
 }

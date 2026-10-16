@@ -86,9 +86,9 @@ pub struct GroundTruth {
     pub delta_m_suppressed: Option<Vec<f32>>,
     /// P4, part B: the arterial `delta_m` with `g = 1` (before factors and crushing).
     pub delta_m_arterial: Option<Vec<f32>>,
-    /// P4, part B: `aBV` (mean) and `aATT` (mean over `aBV > 0`), static.
+    /// P4, part B: `aBV` (mean) and `ATT_arterial` (mean over `aBV > 0`), static.
     pub abv: Option<Vec<f32>>,
-    pub aatt: Option<Vec<f32>>,
+    pub att_arterial: Option<Vec<f32>>,
 }
 
 /// The physiological factors applied (P4, part E): one line per volume and slice.
@@ -415,7 +415,7 @@ struct P4 {
     label_of: Vec<usize>,
     /// Per phantom voxel, part B.
     abv: Option<Vec<f64>>,
-    aatt: Option<Vec<f64>>,
+    att_arterial: Option<Vec<f64>>,
     /// Per row, per label (part C); all ones without crushing.
     crush: Option<Vec<Vec<f64>>>,
     physio: Option<Physio>,
@@ -438,8 +438,8 @@ impl P4 {
                 if let QuantitySource::Table(x) = &m.abv {
                     t.push(("macrovascular.arterial_blood_volume", x));
                 }
-                if let QuantitySource::Table(x) = &m.aatt {
-                    t.push(("macrovascular.arterial_transit_time", x));
+                if let QuantitySource::Table(x) = &m.att_arterial {
+                    t.push(("macrovascular.arterial_compartment_att", x));
                 }
             }
             if let Some(v) = p.crushing.as_ref().and_then(|c| c.arterial_velocity.as_ref()) {
@@ -483,8 +483,8 @@ impl P4 {
                 }
             }
         };
-        let (abv, aatt) = match &p.macrovascular {
-            Some(m) => (Some(resolve(&m.abv, &ph.abv, "abv")?), Some(resolve(&m.aatt, &ph.aatt, "aatt")?)),
+        let (abv, att_arterial) = match &p.macrovascular {
+            Some(m) => (Some(resolve(&m.abv, &ph.abv, "abv")?), Some(resolve(&m.att_arterial, &ph.att_arterial, "att_arterial")?)),
             None => (None, None),
         };
 
@@ -496,10 +496,10 @@ impl P4 {
                         "background_suppression.slab_entry_time {d} s exceeds the ATT {} s of perfused voxel {i}: the \
                          label would enter the slab after reaching the voxel", ph.att[i]));
                 }
-                if let (Some(b), Some(a)) = (&abv, &aatt) {
+                if let (Some(b), Some(a)) = (&abv, &att_arterial) {
                     if b[i] > 0.0 && d > a[i] {
                         return Err(format!(
-                            "background_suppression.slab_entry_time {d} s exceeds the arterial transit time {} s of \
+                            "background_suppression.slab_entry_time {d} s exceeds the arterial compartment's ATT {} s of \
                              voxel {i}", a[i]));
                     }
                 }
@@ -541,7 +541,7 @@ impl P4 {
                 }
             })
             .collect();
-        Ok(P4 { label_path, label_of, abv, aatt, crush, physio, label_physio })
+        Ok(P4 { label_path, label_of, abv, att_arterial, crush, physio, label_physio })
     }
 }
 
@@ -1085,7 +1085,7 @@ fn simulate_legacy(
                     if ph.dseg[i] <= 0 {
                         continue;
                     }
-                    let (f_ml, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
+                    let (f_ml_100g_min, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
                     // the tissue label: (scale, total, intravascular), the single-sub-bolus factor
                     // folded into the scale as P3 folds its factor into the sign
                     let (scale, dm, iv) = match &bolus {
@@ -1094,17 +1094,17 @@ fn simulate_legacy(
                             let key = delta.map_or(u64::MAX, f64::to_bits);
                             let sb = partitions.entry(key).or_insert_with(|| subbolus_factors(pulses, *eps, kin.tau, delta));
                             if sb.len() == 1 {
-                                let iv = p.exchange_time.map(|te| delta_m_iv(&kin, f_ml, att, t1t, m0, t, te));
-                                (sb[0].2, delta_m(&kin, f_ml, att, t1t, m0, t), iv)
+                                let iv = p.exchange_time.map(|te| delta_m_iv(&kin, f_ml_100g_min, att, t1t, m0, t, te));
+                                (sb[0].2, delta_m(&kin, f_ml_100g_min, att, t1t, m0, t), iv)
                             } else {
-                                let dm: f64 = sb.iter().map(|&(a, b, f)| f * delta_m_sub(&kin, f_ml, att, t1t, m0, t, a, b)).sum();
+                                let dm: f64 = sb.iter().map(|&(a, b, f)| f * delta_m_sub(&kin, f_ml_100g_min, att, t1t, m0, t, a, b)).sum();
                                 let iv = p.exchange_time.map(|te| {
-                                    sb.iter().map(|&(a, b, f)| f * delta_m_iv_sub(&kin, f_ml, att, t1t, m0, t, a, b, te)).sum::<f64>()
+                                    sb.iter().map(|&(a, b, f)| f * delta_m_iv_sub(&kin, f_ml_100g_min, att, t1t, m0, t, a, b, te)).sum::<f64>()
                                 });
                                 (1.0, dm, iv)
                             }
                         }
-                        None => (1.0, delta_m(&kin, f_ml, att, t1t, m0, t), p.exchange_time.map(|te| delta_m_iv(&kin, f_ml, att, t1t, m0, t, te))),
+                        None => (1.0, delta_m(&kin, f_ml_100g_min, att, t1t, m0, t), p.exchange_time.map(|te| delta_m_iv(&kin, f_ml_100g_min, att, t1t, m0, t, te))),
                     };
                     let s = sign0 * scale;
                     match iv {
@@ -1116,17 +1116,17 @@ fn simulate_legacy(
                     }
                     if !giv.is_empty() {
                         // the unsuppressed intravascular part: kinetics and the split only
-                        giv[j] = delta_m_iv(&kin, f_ml, att, t1t, m0, t, p.exchange_time.unwrap());
+                        giv[j] = delta_m_iv(&kin, f_ml_100g_min, att, t1t, m0, t, p.exchange_time.unwrap());
                     }
                     if !gsup.is_empty() {
                         gsup[j] = scale * dm;
                     }
-                    if let (Some(abv), Some(aatt)) = (&p4.abv, &p4.aatt) {
-                        let (va, a) = arterial_dm(&kin, abv[i], aatt[i], m0, t);
+                    if let (Some(abv), Some(att_arterial)) = (&p4.abv, &p4.att_arterial) {
+                        let (va, a) = arterial_dm(&kin, abv[i], att_arterial[i], m0, t);
                         if let Some(a) = a {
                             let g = match &bolus {
                                 Some((region, pulses, eps)) => {
-                                    arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, aatt[i]))
+                                    arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, att_arterial[i]))
                                 }
                                 None => 1.0,
                             };
@@ -1399,7 +1399,7 @@ fn simulate_legacy(
         delta_m_suppressed: gt_sup,
         delta_m_arterial: gt_art,
         abv: p4.abv.as_ref().map(|a| r_acq.mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>())),
-        aatt: match (&p4.abv, &p4.aatt) {
+        att_arterial: match (&p4.abv, &p4.att_arterial) {
             (Some(b), Some(a)) => {
                 let has: Vec<bool> = b.iter().map(|x| *x > 0.0).collect();
                 Some(r_acq.masked_mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>(), &has))
@@ -2006,7 +2006,7 @@ mod tests {
 
     const HOM: &str = "[acquisition]\noversample = 1\n";
     const TABLES: &str = "[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-                          arterial_transit_time = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n";
+                          arterial_compartment_att = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n";
 
     fn run(s: &Value, rows: &str, ov: &str, mode: T2Mode) -> SeriesOutput {
         simulate(&protocol_from(s, rows, ov), &phantom(), mode, &no_phase()).unwrap()
@@ -2051,10 +2051,10 @@ mod tests {
     }
 
     #[allow(clippy::needless_range_loop)]
-    fn check_arterial_image(s: &Value, rows: &str, aatt_gm: f64, expect_signal: bool) {
+    fn check_arterial_image(s: &Value, rows: &str, att_arterial_gm: f64, expect_signal: bool) {
         let ph = phantom();
         let ov = format!("{HOM}[macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.0, csf = 0.0 }}\n\
-                          arterial_transit_time = {{ grey_matter = {aatt_gm}, white_matter = 0.0, csf = 0.0 }}\n");
+                          arterial_compartment_att = {{ grey_matter = {att_arterial_gm}, white_matter = 0.0, csf = 0.0 }}\n");
         let p = protocol_from(s, rows, &ov);
         let (img, out) = simulate_compartments(&p, &ph, T2Mode::Class, &no_phase(), RowOverride::None).unwrap();
         let k = out.labels.len();
@@ -2066,7 +2066,7 @@ mod tests {
         for i in 0..ph.nvox() {
             let z = i / (nx * ny);
             let t = row.t + p.slice_offsets[z];
-            let want = if ph.dseg[i] == 1 { -arterial_dm(&kin, 0.03, aatt_gm, ph.m0[i] as f64, t).0 } else { 0.0 };
+            let want = if ph.dseg[i] == 1 { -arterial_dm(&kin, 0.03, att_arterial_gm, ph.m0[i] as f64, t).0 } else { 0.0 };
             let got = img[2 * k][i] as f64;
             assert!((got - want).abs() <= 1e-6 * want.abs().max(1e-9), "voxel {i}: {got} vs {want}");
             seen = seen.max(got.abs());
@@ -2081,7 +2081,7 @@ mod tests {
         // PCASL: t = 3.6 + offsets, window [2.5, 4.3)
         check_arterial_image(&sidecar([1.0, 1.0, 1.0], 6), "label", 2.5, true);
         check_arterial_image(&sidecar([1.0, 1.0, 1.0], 6), "label", 0.5, false);
-        // PASL: t = PLD 1.8 + offsets, bolus 0.7, window [1.5, 2.2)
+        // PASL: t = TI 1.8 + offsets, bolus 0.7, window [1.5, 2.2)
         let mut s = sidecar([1.0, 1.0, 1.0], 6);
         s["ArterialSpinLabelingType"] = json!("PASL");
         s["BolusCutOffFlag"] = json!(true);
@@ -2099,7 +2099,7 @@ mod tests {
             s["VascularCrushing"] = json!(true);
             s["VascularCrushingVENC"] = json!(venc);
             let ov = format!("{HOM}{vel}[macrovascular]\narterial_blood_volume = {{ grey_matter = {}, white_matter = {}, csf = 0.0 }}\n\
-                              arterial_transit_time = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n", abv.0, abv.1);
+                              arterial_compartment_att = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n", abv.0, abv.1);
             let o = run(&s, "label", &ov, mode);
             (complex_from(&o.mag, &o.phase), o)
         };
@@ -2367,7 +2367,7 @@ mod tests {
         assert!(e.contains("share the name"), "{e}");
         let p = protocol_from(&sidecar([1.0, 1.0, 1.0], 6), "label",
                               &format!("{HOM}[macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.0 }}\n\
-                                        arterial_transit_time = {{ grey_matter = 1.0, white_matter = 1.0, csf = 0.0, other = 1.0 }}\n"));
+                                        arterial_compartment_att = {{ grey_matter = 1.0, white_matter = 1.0, csf = 0.0, other = 1.0 }}\n"));
         let e = simulate(&p, &phantom(), T2Mode::Class, &no_phase()).unwrap_err();
         assert!(e.contains("csf") || e.contains("other"), "{e}");
         // a slab entry after a voxel's arrival

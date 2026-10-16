@@ -69,10 +69,10 @@ pub struct PhantomParams {
     pub lambda: Option<f64>,
     pub t1b: Option<f64>,
     pub field_strength: Option<f64>,
-    /// The phantom carries `abv.nii.gz` / `aatt.nii.gz` (P4, part B), so activation can be
+    /// The phantom carries `abv.nii.gz` / `att_arterial.nii.gz` (P4, part B), so activation can be
     /// decided here, before the compat check.
     pub has_abv: bool,
-    pub has_aatt: bool,
+    pub has_att_arterial: bool,
 }
 
 /// The acquisition knobs BIDS does not express, all from the overlay with these defaults.
@@ -245,7 +245,7 @@ pub struct ReadoutOverlay {
 #[serde(deny_unknown_fields)]
 pub struct MacroOverlay {
     pub arterial_blood_volume: Option<BTreeMap<String, f64>>,
-    pub arterial_transit_time: Option<BTreeMap<String, f64>>,
+    pub arterial_compartment_att: Option<BTreeMap<String, f64>>,
 }
 
 /// `[vascular_crushing]` (P4, part C).
@@ -295,7 +295,7 @@ pub enum QuantitySource {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MacroSpec {
     pub abv: QuantitySource,
-    pub aatt: QuantitySource,
+    pub att_arterial: QuantitySource,
     /// s
     pub t2_arterial: (f64, Source),
 }
@@ -423,7 +423,7 @@ pub struct WithinVolumeOverlay {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KineticOverlay {
-    pub label_efficiency: Option<f64>,
+    pub labeling_efficiency: Option<f64>,
     pub lambda_blood_brain: Option<f64>,
     pub t1_arterial_blood: Option<f64>,
     /// s; turns the intravascular/extravascular split on (P4, part A).
@@ -1714,7 +1714,8 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
         require_finite_positive(tr[i], &format!("asl.json: RepetitionTimePreparation for row {i}"))?;
         if kinds[i] != RowKind::M0scan {
             require_finite_nonneg(pld[i], &format!("asl.json: PostLabelingDelay for row {i}"))?;
-            require_finite_positive(tau[i], &format!("asl.json: bolus duration for row {i}"))?;
+            let what = if label_type == LabelType::Pasl { "bolus duration" } else { "labeling duration" };
+            require_finite_positive(tau[i], &format!("asl.json: {what} for row {i}"))?;
         }
         let t = match (kinds[i], label_type) {
             (RowKind::M0scan, _) => 0.0,
@@ -1773,7 +1774,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
         // m0scan rows have t = 0: their readout starts at the excitation and spans the offsets
         if r.t + max_offset > r.tr {
             return Err(format!(
-                "asl.json: row {i} reads its last slice at {} s (signal time {} s + slice offset {} s), after \
+                "asl.json: row {i} reads its last slice at {} s (inflow time {} s + slice offset {} s), after \
                  its RepetitionTimePreparation {} s", r.t + max_offset, r.t, max_offset, r.tr));
         }
     }
@@ -1917,14 +1918,14 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     // Kinetic constants: overlay > sidecar (alpha only) > phantom > default.
     let ko = overlay.and_then(|o| o.kinetic.as_ref());
     if let Some(k) = ko {
-        for (name, v) in [("label_efficiency", k.label_efficiency), ("lambda_blood_brain", k.lambda_blood_brain),
+        for (name, v) in [("labeling_efficiency", k.labeling_efficiency), ("lambda_blood_brain", k.lambda_blood_brain),
                           ("t1_arterial_blood", k.t1_arterial_blood)] {
             if let Some(v) = v {
                 require_finite_nonneg(v, &format!("overlay kinetic.{name}"))?;
             }
         }
     }
-    let alpha = if let Some(v) = ko.and_then(|k| k.label_efficiency) {
+    let alpha = if let Some(v) = ko.and_then(|k| k.labeling_efficiency) {
         (v, Source::Overlay)
     } else if let Some(v) = opt_num(sidecar, "LabelingEfficiency")? {
         (v, Source::Sidecar)
@@ -2532,8 +2533,8 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     // 1. The arterial compartment: on with [macrovascular] or either map; then each quantity
     //    needs exactly one source.
     let mo = overlay.and_then(|o| o.macrovascular.as_ref());
-    let (has_abv, has_aatt) = phantom.map_or((false, false), |p| (p.has_abv, p.has_aatt));
-    let macro_on = mo.is_some() || has_abv || has_aatt;
+    let (has_abv, has_att_arterial) = phantom.map_or((false, false), |p| (p.has_abv, p.has_att_arterial));
+    let macro_on = mo.is_some() || has_abv || has_att_arterial;
     let check_table = |t: &BTreeMap<String, f64>, what: &str, upper: Option<f64>| -> Result<(), String> {
         for (name, v) in t {
             if !(v.is_finite() && *v >= 0.0 && upper.is_none_or(|u| *v <= u)) {
@@ -2560,8 +2561,8 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     };
     let macro_partial = if macro_on {
         let abv = source(has_abv, mo.and_then(|m| m.arterial_blood_volume.as_ref()), "arterial_blood_volume", Some(1.0))?;
-        let aatt = source(has_aatt, mo.and_then(|m| m.arterial_transit_time.as_ref()), "arterial_transit_time", None)?;
-        Some((abv, aatt))
+        let att_arterial = source(has_att_arterial, mo.and_then(|m| m.arterial_compartment_att.as_ref()), "arterial_compartment_att", None)?;
+        Some((abv, att_arterial))
     } else {
         None
     };
@@ -2571,16 +2572,16 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
         None => {
             if t2_arterial_in.is_some() {
                 return Err("overlay: signal.t2_arterial without an arterial compartment ([macrovascular] or the \
-                            abv/aatt maps)".to_string());
+                            abv/att_arterial maps)".to_string());
             }
             None
         }
-        Some((abv, aatt)) => {
+        Some((abv, att_arterial)) => {
             let t2_arterial = match t2_arterial_in {
                 Some(v) => (require_finite_positive(v, "overlay signal.t2_arterial")?, Source::Overlay),
                 None => (t2_blood_s.0, Source::T2Blood),
             };
-            Some(MacroSpec { abv, aatt, t2_arterial })
+            Some(MacroSpec { abv, att_arterial, t2_arterial })
         }
     };
     // 3. Crushing.
@@ -3594,7 +3595,7 @@ mod tests {
     }
 
     #[test]
-    fn pcasl_signal_time_adds_the_labeling_duration() {
+    fn pcasl_inflow_time_adds_the_labeling_duration() {
         let p = parse(&base(), CTX, Some(&m0_overlay()), None).unwrap();
         assert_eq!(p.rows.len(), 4);
         for r in &p.rows {
@@ -3604,7 +3605,7 @@ mod tests {
     }
 
     #[test]
-    fn pasl_signal_time_is_the_pld_itself() {
+    fn pasl_inflow_time_is_the_ti_itself() {
         let mut s = base();
         s["ArterialSpinLabelingType"] = json!("PASL");
         s["BolusCutOffFlag"] = json!(true);
@@ -3622,7 +3623,7 @@ mod tests {
         assert!((p.rows[0].tau - 0.7).abs() < 1e-12);
         s["BolusCutOffDelayTime"] = json!([1.6, 0.7]);
         assert!(parse(&s, CTX, Some(&m0_overlay()), None).is_err());
-        // PLD <= cutoff: the cutoff pulse would fall after the readout
+        // TI <= cutoff: the cutoff pulse would fall after the readout
         s["BolusCutOffDelayTime"] = json!(1.8);
         assert!(parse(&s, CTX, Some(&m0_overlay()), None).unwrap_err().contains("cutoff"));
         // no flag: no bolus duration to assume
@@ -3802,7 +3803,7 @@ mod tests {
         s["LabelingEfficiency"] = json!(0.88);
         let p = parse(&s, CTX, Some(&m0_overlay()), Some(&ph)).unwrap();
         assert_eq!(p.alpha, (0.88, Source::Sidecar));
-        let ov = overlay("seed = 7\n[kinetic]\nlabel_efficiency = 0.8\nt1_arterial_blood = 1.6\n[signal]\nt2_blood = 0.15\n[m0]\nrepetition_time = 8.0\n[acquisition]\noversample = 4\nwindow = \"fermi:0.45,0.05\"\npf_mode = \"contiguous\"\nnoise_variance = 2.0\n");
+        let ov = overlay("seed = 7\n[kinetic]\nlabeling_efficiency = 0.8\nt1_arterial_blood = 1.6\n[signal]\nt2_blood = 0.15\n[m0]\nrepetition_time = 8.0\n[acquisition]\noversample = 4\nwindow = \"fermi:0.45,0.05\"\npf_mode = \"contiguous\"\nnoise_variance = 2.0\n");
         let p = parse(&s, CTX, Some(&ov), Some(&ph)).unwrap();
         assert_eq!(p.alpha, (0.8, Source::Overlay));
         assert_eq!(p.t1b, (1.6, Source::Overlay));
@@ -3880,13 +3881,13 @@ mod tests {
         let (s, c) = fixture("asl001");
         let e = parse(&s, &c, Some(&m0_overlay()), None).unwrap_err();
         assert!(e.contains("interleaves"), "asl001: {e}");
-        // asl003 as a 2D variant: PASL Q2TIPS with a 20-entry PLD array whose first entries
+        // asl003 as a 2D variant: PASL Q2TIPS with a 20-entry PostLabelingDelay (TI) array whose first entries
         // (0.3 s) precede the 0.7 s bolus cutoff, which the PASL check must refuse...
         let (mut s, c) = fixture("asl003");
         s["MRAcquisitionType"] = json!("2D");
         s["SliceTiming"] = json!([0.0, 0.04, 0.08]);
         s["TotalReadoutTime"] = json!(0.02);
-        // its 3.5 s TR cannot hold the shifted 4.0 s PLD below; the readout-in-TR check would fire
+        // its 3.5 s TR cannot hold the shifted 4.0 s TI below; the readout-in-TR check would fire
         s["RepetitionTimePreparation"] = json!(5.0);
         // its pulses (0.15, 0.2 s) precede the 0.7 s bolus cutoff, which the pulse check refuses
         s["BackgroundSuppression"] = json!(false);
@@ -3894,7 +3895,7 @@ mod tests {
         s["FlipAngle"] = json!(90);
         let e = parse(&s, &c, Some(&m0_overlay()), None).unwrap_err();
         assert!(e.contains("cutoff") && e.contains("row 0"), "{e}");
-        // ...and with every PLD shifted past the cutoff it parses, tau being the first cutoff time.
+        // ...and with every TI shifted past the cutoff it parses, tau being the first cutoff time.
         let shifted: Vec<f64> = s["PostLabelingDelay"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() + 1.0).collect();
         s["PostLabelingDelay"] = json!(shifted);
         let p = parse(&s, &c, Some(&m0_overlay()), None).unwrap();
@@ -4300,14 +4301,14 @@ mod tests {
 
     const M0: &str = "[m0]\nrepetition_time = 8.0\n";
     const TABLES: &str = "[macrovascular]\narterial_blood_volume = { grey_matter = 0.02, white_matter = 0.01, csf = 0.0 }\n\
-                          arterial_transit_time = { grey_matter = 0.5, white_matter = 0.7, csf = 0.0 }\n";
+                          arterial_compartment_att = { grey_matter = 0.5, white_matter = 0.7, csf = 0.0 }\n";
 
     fn p4(s: &Value, ov: &str, ph: Option<PhantomParams>) -> Result<Protocol, String> {
         parse(s, CTX, Some(&overlay(&format!("{M0}{ov}"))), ph.as_ref())
     }
 
-    fn maps(abv: bool, aatt: bool) -> Option<PhantomParams> {
-        Some(PhantomParams { has_abv: abv, has_aatt: aatt, ..Default::default() })
+    fn maps(abv: bool, att_arterial: bool) -> Option<PhantomParams> {
+        Some(PhantomParams { has_abv: abv, has_att_arterial: att_arterial, ..Default::default() })
     }
 
     #[test]
@@ -4335,24 +4336,24 @@ mod tests {
         let s = base();
         // both tables
         let m = p4(&s, TABLES, None).unwrap().macrovascular.unwrap();
-        assert!(matches!(m.abv, QuantitySource::Table(_)) && matches!(m.aatt, QuantitySource::Table(_)));
+        assert!(matches!(m.abv, QuantitySource::Table(_)) && matches!(m.att_arterial, QuantitySource::Table(_)));
         // both maps
         let m = p4(&s, "", maps(true, true)).unwrap().macrovascular.unwrap();
-        assert_eq!((m.abv, m.aatt), (QuantitySource::Map, QuantitySource::Map));
+        assert_eq!((m.abv, m.att_arterial), (QuantitySource::Map, QuantitySource::Map));
         // the two mixed combinations
-        let m = p4(&s, "[macrovascular]\narterial_transit_time = { grey_matter = 0.5 }\n", maps(true, false)).unwrap().macrovascular.unwrap();
-        assert!(m.abv == QuantitySource::Map && matches!(m.aatt, QuantitySource::Table(_)));
+        let m = p4(&s, "[macrovascular]\narterial_compartment_att = { grey_matter = 0.5 }\n", maps(true, false)).unwrap().macrovascular.unwrap();
+        assert!(m.abv == QuantitySource::Map && matches!(m.att_arterial, QuantitySource::Table(_)));
         let m = p4(&s, "[macrovascular]\narterial_blood_volume = { grey_matter = 0.02 }\n", maps(false, true)).unwrap().macrovascular.unwrap();
-        assert!(matches!(m.abv, QuantitySource::Table(_)) && m.aatt == QuantitySource::Map);
+        assert!(matches!(m.abv, QuantitySource::Table(_)) && m.att_arterial == QuantitySource::Map);
         // missing, duplicate, empty, a lone map
-        assert!(p4(&s, "[macrovascular]\narterial_blood_volume = { grey_matter = 0.02 }\n", None).unwrap_err().contains("arterial_transit_time has no source"));
+        assert!(p4(&s, "[macrovascular]\narterial_blood_volume = { grey_matter = 0.02 }\n", None).unwrap_err().contains("arterial_compartment_att has no source"));
         assert!(p4(&s, TABLES, maps(true, false)).unwrap_err().contains("both"));
         assert!(p4(&s, "[macrovascular]\n", None).unwrap_err().contains("no source"));
-        assert!(p4(&s, "", maps(true, false)).unwrap_err().contains("arterial_transit_time has no source"));
+        assert!(p4(&s, "", maps(true, false)).unwrap_err().contains("arterial_compartment_att has no source"));
         // ranges
-        assert!(p4(&s, "[macrovascular]\narterial_blood_volume = { grey_matter = 1.5 }\narterial_transit_time = { grey_matter = 0.5 }\n", None)
+        assert!(p4(&s, "[macrovascular]\narterial_blood_volume = { grey_matter = 1.5 }\narterial_compartment_att = { grey_matter = 0.5 }\n", None)
             .unwrap_err().contains("out of range"));
-        assert!(p4(&s, "[macrovascular]\narterial_blood_volume = { grey_matter = 0.1 }\narterial_transit_time = { grey_matter = -0.5 }\n", None)
+        assert!(p4(&s, "[macrovascular]\narterial_blood_volume = { grey_matter = 0.1 }\narterial_compartment_att = { grey_matter = -0.5 }\n", None)
             .unwrap_err().contains("out of range"));
         // no P4 input, no maps: off
         assert!(p4(&s, "", maps(false, false)).unwrap().macrovascular.is_none());
@@ -5430,7 +5431,7 @@ mod tests {
     }
 
     const MACRO: &str = "[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.01, csf = 0.0 }\n\
-                         arterial_transit_time = { grey_matter = 1.0, white_matter = 1.2, csf = 0.0 }\n";
+                         arterial_compartment_att = { grey_matter = 1.0, white_matter = 1.2, csf = 0.0 }\n";
     const VEL: &str = "[vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n";
 
     /// P7 part A: the P4 parts are read under Look-Locker as they are without it; crushing's VENC

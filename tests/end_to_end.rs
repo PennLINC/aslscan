@@ -208,7 +208,7 @@ fn p4_all(rows: &str, extra: &str) -> Protocol {
          [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n\
          [kinetic]\nexchange_time = 0.4\n\
          [macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }}\n\
-         arterial_transit_time = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n\
+         arterial_compartment_att = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n\
          [vascular_crushing]\narterial_velocity = {{ grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }}\n\
          [physio]\ntissue_cardiac = 0.02\ntissue_respiratory = 0.01\nlabel_cardiac = 0.03\nlabel_drift = 0.01\n{extra}"
     )).unwrap();
@@ -232,7 +232,7 @@ fn p4_one(row: &str, tau_ex: f64) -> Protocol {
          [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n\
          [kinetic]\nexchange_time = {tau_ex}\n\
          [macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }}\n\
-         arterial_transit_time = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n\
+         arterial_compartment_att = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n\
          [vascular_crushing]\narterial_velocity = {{ grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }}\n\
          [physio]\ntissue_cardiac = 0.02\ntissue_respiratory = 0.01\nlabel_cardiac = 0.03\nlabel_drift = 0.01\n"
     )).unwrap();
@@ -248,7 +248,7 @@ fn p4_linearity(tau_ex: f64, ov_c: RowOverride, ov_l: RowOverride) -> f64 {
 
 #[test]
 fn linearity_holds_with_every_p4_part_on() {
-    // the arterial compartment is in its window at the readout (t = 3.6, 3.65; aATT 2.5 / 2.7)
+    // the arterial compartment is in its window at the readout (t = 3.6, 3.65; ATT_arterial 2.5 / 2.7)
     let out = simulate_with(&p4_one("label", 0.4), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
     assert!(out.ground_truth.delta_m_arterial.as_ref().unwrap().iter().any(|v| *v > 0.0));
     let worst = p4_linearity(0.4, RowOverride::None, RowOverride::None);
@@ -306,7 +306,7 @@ fn p4_sidecar_blocks_and_ground_truth_files() {
     assert_eq!(side["VascularCrushing"], json!(true));
     assert_eq!(side["VascularCrushingVENC"], json!([0.0, 4.0, 0.0, 4.0]));
     let gt = dir.join("sub-01/perf/ground-truth");
-    for f in ["deltamIntravascular", "deltamSuppressed", "deltamArterial", "aBV", "aATT"] {
+    for f in ["deltamIntravascular", "deltamSuppressed", "deltamArterial", "aBV", "attArterial"] {
         assert!(gt.join(format!("sub-01_desc-{f}_gt.nii.gz")).exists(), "{f}");
         assert!(gt.join(format!("sub-01_desc-{f}_gt.json")).exists(), "{f}");
     }
@@ -333,7 +333,7 @@ fn p4_sidecar_blocks_and_ground_truth_files() {
         }
         assert!(nonzero > 0, "{f} is all zero");
     }
-    for (f, data) in [("aBV", &g.abv), ("aATT", &g.aatt)] {
+    for (f, data) in [("aBV", &g.abv), ("attArterial", &g.att_arterial)] {
         let data = data.as_ref().unwrap();
         let (vol, grid) = mrsim_acq::io::load_volume(&gt.join(format!("sub-01_desc-{f}_gt.nii.gz"))).unwrap();
         assert_eq!(grid.dims, [nx, ny, nz], "{f}");
@@ -760,7 +760,7 @@ fn grase_all(rows: &str, ov: RowOverride) -> Vec<(f64, f64)> {
          [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n\
          [kinetic]\nexchange_time = 0.4\n\
          [macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-         arterial_transit_time = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n\
+         arterial_compartment_att = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n\
          [vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n\
          [physio]\ntissue_cardiac = 0.05\nlabel_cardiac = 0.05\nlabel_drift = 0.02\n\
          [motion]\nwithin_volume = { dropout_rate = 1.0, severity = 0.3, jump_mm = [0.4, 0.0, 0.0], jump_deg = [0.0, 0.0, 1.0] }\n"
@@ -805,7 +805,7 @@ fn spiral_protocol(rows: &str) -> Protocol {
          [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n\
          [kinetic]\nexchange_time = 0.4\n\
          [macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-         arterial_transit_time = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n\
+         arterial_compartment_att = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n\
          [vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n\
          [physio]\ntissue_cardiac = 0.05\nlabel_cardiac = 0.05\nlabel_drift = 0.02\n\
          [motion]\nwithin_volume = { dropout_rate = 1.0, severity = 0.3, jump_mm = [0.4, 0.0, 0.0], jump_deg = [0.0, 0.0, 1.0] }\n"
@@ -1127,7 +1127,7 @@ fn the_legacy_manifest_keeps_the_identity_schedule() {
     let crush = crop_json(json!({"BackgroundSuppression": false, "VascularCrushing": true, "VascularCrushingVENC": [0.0, 4.0, 0.0, 4.0]}));
     let ctx = "volume_type\ncontrol\nlabel\ncontrol\nlabel\n";
     let motion = "seed = 3\n[motion]\nmode = \"random\"\ntrans_mm = [1.0, 1.0, 0.0]\nrot_deg = [0.0, 0.0, 2.0]\nvolumes = [1, 3]\n";
-    let macro_ov = "seed = 3\n[kinetic]\nexchange_time = 0.5\n[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\narterial_transit_time = { grey_matter = 3.0, white_matter = 3.2, csf = 0.0 }\n[vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n";
+    let macro_ov = "seed = 3\n[kinetic]\nexchange_time = 0.5\n[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\narterial_compartment_att = { grey_matter = 3.0, white_matter = 3.2, csf = 0.0 }\n[vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n";
     for (name, s, ov) in [
         ("crop_bs", crop_json(bs([2.0, 3.2])), "seed = 3\n"),
         ("crop_ir", plain.clone(), "seed = 3\n[signal]\nacq_contrast = \"ir\"\n"),
@@ -1351,7 +1351,7 @@ fn gradient_echo_delta_m_with_the_arterial_term() {
     // or the two parts' decays coincide)
     let macro_ov = "t2_arterial = 0.25\n[kinetic]\nexchange_time = 0.5\n\
                     [macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-                    arterial_transit_time = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n";
+                    arterial_compartment_att = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n";
     let p = multi_te("deltam", tes, macro_ov, true);
     let out = simulate_with(&p, &ph, T2Mode::Class, &phase(), RowOverride::None).unwrap();
     // T2' of the tissue labels: 1/T2' = 1/T2* - 1/T2, which the blood and arterial parts share
@@ -2008,7 +2008,7 @@ fn follow_up_review_fixes() {
 fn look_locker_with_p4_parts_writes_the_parts() {
     let parts = "[kinetic]\nexchange_time = 0.6\n[macrovascular]\n\
                  arterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-                 arterial_transit_time = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n";
+                 arterial_compartment_att = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n";
     let dir = std::env::temp_dir().join(format!("aslscan-e2e-p7a-{}", std::process::id()));
     for (extra, on) in [(parts, true), ("", false)] {
         let p = look_locker(&["control", "label"], 4, 35.0, 4.5, extra);
