@@ -657,6 +657,17 @@ pub struct SpiralResolution {
     pub partial_fourier_recon: KzPartialFourierRecon,
 }
 
+/// The series volume a parallel-imaging calibration reads (the kz kernel of P8, the in-plane GRAPPA
+/// reference scan): a scanner calibrates on what it acquires, the first control or label volume; a
+/// series of differences has none, and its m0scan (the tissue's signal) stands in before a deltam.
+/// `None` for an empty series.
+pub fn calibration_volume(rows: &[Row]) -> Option<usize> {
+    let first = |kinds: &[RowKind]| rows.iter().position(|row| kinds.contains(&row.kind));
+    first(&[RowKind::Control, RowKind::Label])
+        .or_else(|| first(&[RowKind::M0scan]))
+        .or_else(|| first(&[RowKind::Deltam]))
+}
+
 /// The calibration of a kz acceleration (P8): the series volume whose compartment images the
 /// preparation repetitions read, and the length of their train (the series' without the
 /// acceleration).
@@ -3865,13 +3876,7 @@ fn resolve_spiral(p: &Protocol, r: &ReadoutSpec, acq_dims: [usize; 3]) -> Result
         let cal_readout = Readout3d::Spiral { interleaves, readout_ms, dwell_ms, radial_oversampling: radial_oversampling.0,
                                               kz: kz.calibration() };
         let cal_table = spiral_lines(&cal_train, &cal_readout, nx, ny, nz)?;
-        // a scanner calibrates on what it acquires: the first control or label volume; a series of
-        // differences has none, and its m0scan (the tissue's signal) stands in before a deltam
-        let first = |kinds: &[RowKind]| p.rows.iter().position(|row| kinds.contains(&row.kind));
-        let volume = first(&[RowKind::Control, RowKind::Label])
-            .or_else(|| first(&[RowKind::M0scan]))
-            .or_else(|| first(&[RowKind::Deltam]))
-            .ok_or("a kz acceleration needs a volume to calibrate on: the series is empty")?;
+        let volume = calibration_volume(&p.rows).ok_or("a kz acceleration needs a volume to calibrate on: the series is empty")?;
         let row = &p.rows[volume];
         check_spiral_timing(&cal_train, &cal_table, row.t * 1000.0, row.tr * 1000.0)
             .map_err(|e| format!("the kz calibration repetition (the train without the acceleration, {} echoes): {e}",

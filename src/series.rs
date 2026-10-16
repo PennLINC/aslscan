@@ -27,7 +27,10 @@ use std::collections::HashMap;
 
 use mrsim_acq::grid::Grid;
 use mrsim_acq::io::hires_grid;
-use mrsim_acq::kspace::{simulate_acquisition_oversampled, Acquisition, T2Volume};
+use mrsim_acq::kspace::{
+    simulate_acquisition_complex, simulate_acquisition_oversampled, Acquisition, AcquisitionInput, AcquisitionOptions,
+    GrappaCalibration, T2Volume,
+};
 use mrsim_acq::kspace3d::{simulate_acquisition_3d_kz, KzOptions, LineWeights, ShotSet};
 use mrsim_acq::motion::{
     apply_motion, apply_multiband_motion, slice_schedule, DropoutLaw, DroppedShot, MotionEvent, Pose,
@@ -375,6 +378,15 @@ pub fn simulate_with(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &PhaseMode
 
 /// Draw the within-volume shot events: each (volume, shot) has an event with probability
 /// `dropout_rate`, its jumps uniform in `[-amp, amp]` per axis. Deterministic in the draw order.
+/// The 2D acquisition of a series with its GRAPPA reference scan (`None`: mrsim-acq's default, the
+/// first volume): magnitude and phase, by the arithmetic of `simulate_acquisition_oversampled`.
+fn acquire_2d(inp: AcquisitionInput, acq: &Acquisition, grappa_cal: Option<GrappaCalibration>) -> (Vec<f32>, Vec<f32>) {
+    let out = simulate_acquisition_complex(&inp, acq, &AcquisitionOptions { grappa_calibration: grappa_cal, ..Default::default() });
+    let mag = out.re.iter().zip(&out.im).map(|(re, im)| (re * re + im * im).sqrt()).collect();
+    let ph = out.re.iter().zip(&out.im).map(|(re, im)| im.atan2(*re)).collect();
+    (mag, ph)
+}
+
 fn draw_events(w: Option<&WithinVolume>, n_volumes: usize, n_shots: usize, seed: u64) -> Vec<MotionEvent> {
     let Some(w) = w else { return Vec::new() };
     let mut rng = SplitMix64(seed ^ 0x5348_4F54_5321);
@@ -1206,6 +1218,27 @@ fn simulate_legacy(
                  its first deltam) holds no signal, so the kz kernel cannot be fitted to it", cal.volume));
         }
     }
+    // The in-plane GRAPPA kernels are fitted once per series, on a reference scan of the same
+    // volume (its images before any motion, read without physiology or shot events, on a noise
+    // stream of the series seed), and applied to every volume. The separate M0 is its own series
+    // with its own reference scan (mrsim-acq's default: its one volume).
+    let grappa_cal_volume = if acq.accel > 1 {
+        Some(crate::protocol::calibration_volume(&p.rows).ok_or("GRAPPA needs a volume to calibrate on: the series is empty")?)
+    } else {
+        None
+    };
+    let grappa_cal_images: Vec<Vec<f32>> = match grappa_cal_volume {
+        Some(vol) => images.iter().map(|im| (0..nvox_sim).map(|v| im[v * n + vol]).collect()).collect(),
+        None => Vec::new(),
+    };
+    if let Some(vol) = grappa_cal_volume {
+        if grappa_cal_images.iter().all(|im| im.iter().all(|v| *v == 0.0)) {
+            return Err(format!(
+                "the GRAPPA calibration volume (row {vol}, the series' first control or label volume, else its first m0scan, \
+                 else its first deltam) holds no signal, so the GRAPPA kernel cannot be fitted to it"));
+        }
+    }
+    let grappa_cal = grappa_cal_volume.map(|_| GrappaCalibration { images: &grappa_cal_images, seed: p.seed });
 
     // ---- motion: per-volume poses, then multiband shot events ----
     let motion_seed = p.motion.as_ref().map(|_| p.seed ^ MOTION_SEED_SALT);
@@ -1432,14 +1465,18 @@ fn simulate_legacy(
         partial_fourier_recon: sp.partial_fourier_recon,
     });
     let (mag, phase_out) = match &res3d {
-        None => simulate_acquisition_oversampled(
-            sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, &fmap_sim, Some(&ti_vols), &acq,
-            &eddy_drive, &prep_drive, phase, p.seed, None,
+        None => acquire_2d(
+            AcquisitionInput {
+                sim_dims: sim_grid.dims, acq_dims: acq_grid.dims, n_volumes: n, images: &images, t2: &t2_vols,
+                fmap: &fmap_sim, t_inhom: Some(&ti_vols), eddy_drive: &eddy_drive, prep_drive: &prep_drive, phase,
+                seed: p.seed, noise_sigma: None,
+            },
+            &acq, grappa_cal,
         ),
         Some(r3) => simulate_acquisition_3d_kz(
             sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, t1_vols.as_deref(), &fmap_sim, Some(&ti_vols), &acq,
             &r3.train, &r3.readout, line_weights.as_ref(), shot_sets.iter().any(|s| !s.is_empty()).then_some(&shot_sets[..]),
-            phase, p.seed, kz_opts.as_ref(),
+            phase, p.seed, kz_opts.as_ref(), grappa_cal,
         ),
     };
     drop(images);
@@ -1464,7 +1501,7 @@ fn simulate_legacy(
                 // the same readout and train, no labeling, no physiology, no motion (P5 part B)
                 Some(r3) => simulate_acquisition_3d_kz(
                     sim_grid.dims, acq_grid.dims, 1, &imgs, &t2_vols, t1_vols.as_deref(), &fmap_sim, Some(&ti_vols),
-                    &acq, &r3.train, &r3.readout, None, None, phase, seed, kz_opts.as_ref(),
+                    &acq, &r3.train, &r3.readout, None, None, phase, seed, kz_opts.as_ref(), None,
                 ),
             })
         }

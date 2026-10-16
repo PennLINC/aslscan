@@ -235,7 +235,10 @@ noise_variance = 0.0           # default 0: no noise
 signal_scale = 100.0           # overall intensity scale (default 100)
 n_coils = 1                    # receive coils (default 1)
 coil_rows = 1                  # rings of coils along z (default 1); spiral readouts only
-acs_lines = 24                 # parallel-imaging calibration lines (default 24)
+acs_lines = 24                 # GRAPPA reference lines (default 24): the central band of the
+                               # reference scan the kernel is fitted to, once per series, on the
+                               # first control or label volume (else m0scan, else deltam); the
+                               # volumes themselves read every R-th line only
 partial_fourier = 1.0          # fraction of phase-encode lines acquired (default 1.0)
 pf_mode = "fiberfox"           # "fiberfox" or "contiguous"
 window = "none"                # "none", "hann", "tukey:<alpha>", "fermi:<radius>,<width>"
