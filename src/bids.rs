@@ -67,7 +67,7 @@ mod writer {
     use super::{aslcontext_tsv, ground_truth_tail, Names};
     use crate::phantom::T2Mode;
     use crate::bolus::Region;
-    use crate::protocol::{M0Type, Protocol, QuantitySource, SuppressionModel, COMPAT_PINNED};
+    use crate::protocol::{M0Type, Protocol, QuantitySource, SuppressionModel, WithinVolumeSampling, COMPAT_PINNED};
     use crate::resample::GridOrigin;
     use crate::series::{LookLockerSeries, SeriesOutput};
 
@@ -194,22 +194,46 @@ mod writer {
             "InversionFlipAngle": { "Value": s.params.inversion_flip_deg, "Source": s.inversion_flip.as_str() },
             "BloodModel": "sin(FlipAngle) * delta_m; the preparation does not invert the label (simasl)",
         }));
-        let motion = p.motion.as_ref().map_or(Value::Null, |m| json!({
-            "Mode": m.mode_name,
-            "Seed": out.motion_seed,
-            "SeedSalt": format!("{:#x}", crate::series::MOTION_SEED_SALT),
-            "RotationOrder": "Rz Ry Rx, degrees, about the field-of-view centre",
-            "WithinVolume": m.within.as_ref().map(|w| json!({
-                "DropoutRate": w.dropout_rate, "Severity": w.severity,
-                "JumpMm": w.jump_mm, "JumpDeg": w.jump_deg, "Events": out.events.len(),
-            })),
-            "GroundTruth": ["desc-motion_gt.tsv (rotations in radians)", "desc-motionEvents_gt.tsv",
-                            "desc-deltam_gt (moved)", "desc-deltamStatic_gt (unmoved)"],
-            "Approximations": [
-                "finished simulation-grid images are resampled, so slice timing travels with the anatomy",
-                "per-voxel T2/T2' maps (voxel mode) and the fieldmap stay in scanner space",
-            ],
-        }));
+        let motion = p.motion.as_ref().map_or(Value::Null, |m| {
+            let mut block = json!({
+                "Mode": m.mode_name,
+                "Seed": out.motion_seed,
+                "SeedSalt": format!("{:#x}", crate::series::MOTION_SEED_SALT),
+                "RotationOrder": "Rz Ry Rx, degrees, about the field-of-view centre",
+                "WithinVolume": m.within.as_ref().map(|w| json!({
+                    "DropoutRate": w.dropout_rate, "Severity": w.severity,
+                    "JumpMm": w.jump_mm, "JumpDeg": w.jump_deg, "Events": out.events.len(),
+                })),
+                "GroundTruth": ["desc-motion_gt.tsv (rotations in radians)", "desc-motionEvents_gt.tsv",
+                                "desc-deltam_gt (moved)", "desc-deltamStatic_gt (unmoved)"],
+                "Approximations": [
+                    "finished simulation-grid images are resampled, so slice timing travels with the anatomy",
+                    "per-voxel T2/T2' maps (voxel mode) and the fieldmap stay in scanner space",
+                ],
+            });
+            // P9 part A: the per-shot path's keys, written only there (P3's block stays byte-identical)
+            if m.shot_path {
+                let obj = block.as_object_mut().expect("an object");
+                obj.insert("Path".into(), json!("shot"));
+                obj.insert("WithinVolumeSampling".into(), json!(match m.sampling {
+                    WithinVolumeSampling::Volume => "volume",
+                    WithinVolumeSampling::Slice => "slice",
+                }));
+                if let Some(f) = m.within.as_ref().and_then(|w| w.events_file.as_ref()) {
+                    obj.insert("EventsFile".into(), json!(f.path));
+                    obj.insert("WithinVolume".into(), json!({ "EventsFile": f.path, "Events": out.events.len() }));
+                }
+                obj.insert("ShotTransform".into(), json!(
+                    "Q = J . P as world-space matrices about the field-of-view centre: P the volume's pose, or the \
+                     trajectory through the volumes' poses placed at their first shots, linear in the six parameters \
+                     (within_volume_sampling = \"slice\"); J the summed jumps of the volume's events up to the shot. \
+                     Each shot's slices are resampled once."));
+                if let Some(gt) = obj.get_mut("GroundTruth").and_then(Value::as_array_mut) {
+                    gt.insert(2, json!("desc-motionShots_gt.tsv (each shot's composed pose, rotations in radians)"));
+                }
+            }
+            block
+        });
         let mut block = json!({
             "Simulator": { "Name": "aslscan", "Version": env!("CARGO_PKG_VERSION") },
             "Seed": out.seeds.0,
@@ -1165,6 +1189,20 @@ mod writer {
                                      e.jump_deg[0].to_radians(), e.jump_deg[1].to_radians(), e.jump_deg[2].to_radians()));
             }
             std::fs::write(format!("{gt_prefix}_desc-motionEvents_gt.tsv"), ev).map_err(|e| e.to_string())?;
+        }
+        // P9 part A: each shot's composed pose, on the per-shot path only
+        if let Some(plan) = &out.shots {
+            let mut tsv = String::from("volume\tshot\tslices\ttime\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+            for (v, times) in plan.times.iter().enumerate() {
+                for (s, t) in times.iter().enumerate() {
+                    let q = plan.pose(v, s);
+                    let r = q.rot_deg.map(f64::to_radians);
+                    let slices = plan.schedule[s].iter().map(|z| z.to_string()).collect::<Vec<_>>().join(",");
+                    tsv.push_str(&format!("{v}\t{s}\t{slices}\t{t}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                          q.trans_mm[0], q.trans_mm[1], q.trans_mm[2], r[0], r[1], r[2]));
+                }
+            }
+            std::fs::write(format!("{gt_prefix}_desc-motionShots_gt.tsv"), tsv).map_err(|e| e.to_string())?;
         }
         Ok(())
     }

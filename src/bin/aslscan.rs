@@ -99,7 +99,15 @@ fn run() -> Result<(), String> {
             "{} pulse(s) on row 0 at efficiency {}{}", s.per_row[0].len(), s.epsilon.0,
             if s.presaturation.0 { " with presaturation" } else { "" })),
         p.motion.as_ref().map_or("off".to_string(), |m| format!(
-            "{}{}", m.mode_name, if m.within.is_some() { " + within-volume events" } else { "" })),
+            "{}{}{}", m.mode_name,
+            match m.within.as_ref() {
+                Some(w) if w.events_file.is_some() => " + within-volume events from a file",
+                Some(_) => " + within-volume events",
+                None => "",
+            },
+            if !m.shot_path { "" }
+            else if m.sampling == aslscan::protocol::WithinVolumeSampling::Slice { " (per shot, poses sampled per slice)" }
+            else { " (per shot)" })),
     );
 
     let mut p4 = Vec::new();
