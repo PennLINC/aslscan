@@ -1151,6 +1151,10 @@ fn load_events_file(path: &str, n: usize, n_shots: usize) -> Result<EventsFile, 
         .iter()
         .map(|c| header.iter().position(|h| h.trim() == *c).ok_or_else(|| format!("{what}: column {c:?} missing")))
         .collect::<Result<Vec<usize>, String>>()?;
+    // `slices` must be there (the format's columns), though the schedule decides the slices
+    if !header.iter().any(|h| h.trim() == "slices") {
+        return Err(format!("{what}: column \"slices\" missing"));
+    }
     let mut events: Vec<FileEvent> = Vec::new();
     for (i, line) in lines.enumerate() {
         let cells: Vec<&str> = line.split('\t').collect();
@@ -4514,6 +4518,10 @@ mod tests {
         assert!(e.contains("second event") && e.contains("shot 1"), "{e}");
         let e = with("0\t1\t1\t1\t0\t0\t0\t0\t0\t0\n", "dropout_rate = 0.1\n").unwrap_err();
         assert!(e.contains("replaces the random draw"), "{e}");
+        // every column of the format, `slices` included, though its value is not used
+        std::fs::write(&tsv, "volume\tshot\tattenuation\tjump_x\tjump_y\tjump_z\tjump_rx\tjump_ry\tjump_rz\n0\t1\t1\t0\t0\t0\t0\t0\t0\n").unwrap();
+        let e = parse(&base(), CTX, Some(&mo(&format!("[motion.within_volume]\nevents = \"{path}\"\n"))), None).unwrap_err();
+        assert!(e.contains("\"slices\""), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
