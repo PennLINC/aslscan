@@ -406,6 +406,8 @@ pub struct MotionOverlay {
     /// `"volume"` (default: every shot of a volume has the volume's pose) or `"slice"` (each shot
     /// has the trajectory's pose at its own excitation time; P9 part A). 2D readouts only.
     pub within_volume_sampling: Option<String>,
+    /// Spin history of the tissue under through-plane motion (P9 part B); default false.
+    pub spin_history: Option<bool>,
     pub within_volume: Option<WithinVolumeOverlay>,
 }
 
@@ -716,6 +718,8 @@ pub struct MotionSpec {
     pub sampling: WithinVolumeSampling,
     /// The P9 per-shot path (`series::shots`) moves the images; otherwise P3's (P5's in 3D).
     pub shot_path: bool,
+    /// P9 part B: the tissue is corrected for spin history (implies the shot path).
+    pub spin_history: bool,
 }
 
 /// One Hadamard encoding cycle (P6 addendum, part A): its `deltam` rows, in sub-bolus order.
@@ -1263,8 +1267,13 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, sc: &ShotContext) -> Resu
     // P9: the per-shot path, 2D only. Single-band events, slice sampling, an events file, or a
     // multiband schedule the P3 path cannot represent; everything else stays on P3's path.
     let single_band_events = !is_3d && mb <= 1 && m.within_volume.is_some();
+    let spin_history = m.spin_history.unwrap_or(false);
+    if spin_history && is_3d {
+        return Err("overlay: motion.spin_history is for 2D readouts (one slab excitation has no slice history)".to_string());
+    }
     let shot_path = !is_3d
-        && (sampling == WithinVolumeSampling::Slice || events_requested || single_band_events || !sc.mb_schedule_ok);
+        && (sampling == WithinVolumeSampling::Slice || events_requested || single_band_events || !sc.mb_schedule_ok
+            || spin_history);
     if shot_path {
         if sc.look_locker {
             return Err("overlay: per-shot motion (single-band within-volume events, within_volume_sampling = \
@@ -1318,9 +1327,51 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, sc: &ShotContext) -> Resu
         }
     };
     if matches!(mode, MotionMode::Off) && within.is_none() {
+        if spin_history {
+            return Err("overlay: motion.spin_history needs motion to have a history of: a mode other than \"off\" \
+                        or within-volume events".to_string());
+        }
         return Ok(None);
     }
-    Ok(Some(MotionSpec { mode, mode_name, within, sampling, shot_path }))
+    Ok(Some(MotionSpec { mode, mode_name, within, sampling, shot_path, spin_history }))
+}
+
+/// P9 part B: spin history needs a series the closed form describes exactly when nothing moves (a
+/// 2D spin-echo readout, only control and label rows with one preparation, one echo, no
+/// Look-Locker, Hadamard or compat). Each refusal names its condition.
+fn check_spin_history(p: &Protocol) -> Result<(), String> {
+    if !p.motion.as_ref().is_some_and(|m| m.spin_history) {
+        return Ok(());
+    }
+    let refuse = |why: String| Err(format!("overlay: motion.spin_history {why}"));
+    if p.contrast != Contrast::SpinEcho {
+        return refuse(format!("needs spin-echo contrast (a 90 degree excitation), not {:?}", p.contrast));
+    }
+    if let Some((i, r)) = p.rows.iter().enumerate().find(|(_, r)| !matches!(r.kind, RowKind::Control | RowKind::Label)) {
+        return refuse(format!("needs control and label rows only; row {i} is {:?}", r.kind));
+    }
+    let r0 = &p.rows[0];
+    let pulses = |v: usize| p.suppression.as_ref().map(|s| s.per_row[v].iter().map(|x| x.to_bits()).collect::<Vec<u64>>());
+    for (i, r) in p.rows.iter().enumerate() {
+        if r.tr.to_bits() != r0.tr.to_bits() || r.t.to_bits() != r0.t.to_bits() || pulses(i) != pulses(0) {
+            return refuse(format!(
+                "needs every row to share one preparation (repetition time, signal time, suppression pulses); row {i} \
+                 differs from row 0, so the closed form is not exact even without motion"));
+        }
+    }
+    if p.echo_times_s.len() > 1 {
+        return refuse("is not available with several echo times".to_string());
+    }
+    if p.look_locker.is_some() {
+        return refuse("is not available with LookLocker: true".to_string());
+    }
+    if p.hadamard.is_some() {
+        return refuse("is not available with Hadamard encoding".to_string());
+    }
+    if p.compat.is_some() {
+        return refuse("is not available with [compat] asldro = true (simasl has no spin history)".to_string());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- the parse
@@ -3170,14 +3221,16 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
                     \"epi3d\") or of compat's multi-TE echoes; this protocol has neither".to_string());
     }
 
-    Ok(Protocol {
+    let protocol = Protocol {
         echo_times_s, multi_te, hadamard, look_locker,
         compat, grid_origin, exchange_time, macrovascular, crushing, physio, row_start,
         label_type, rows, m0_type, background_suppression, suppression, ir, ge, readout, motion, mb_interleaved,
         slice_offsets, field_strength, voxel_size_mm, reverse_phase, phase_encoding_direction: ped,
         echo_time_s, total_readout_time_s, accel, mb, alpha, lambda, t1b, t2_blood_s, contrast,
         m0_repetition_time_s, seed, acq, input_sidecar: sidecar.clone(),
-    })
+    };
+    check_spin_history(&protocol)?;
+    Ok(protocol)
 }
 
 /// Read the files and [`parse`]. A relative `motion.trajectory` path is taken relative to the
@@ -4386,6 +4439,49 @@ mod tests {
         let e = overlay_motion(ov.motion.as_ref(), 4, &ctx(1, true)).unwrap_err();
         assert!(e.contains("LookLocker"), "{e}");
         assert!(!overlay_motion(ov.motion.as_ref(), 4, &ctx(2, true)).unwrap().unwrap().shot_path);
+    }
+
+    // ------------------------------------------------------------------ P9 part B
+
+    #[test]
+    fn spin_history_inputs_and_refusals() {
+        let sh = |extra: &str| overlay(&format!("[motion]\nmode = \"linear\"\ntrans_mm = [0, 0, 0.5]\nspin_history = true\n{extra}\
+                                                 [m0]\nrepetition_time = 8.0\n"));
+        // accepted: multiband, suppression and presaturation; it takes the shot path
+        let mut s = with_suppression(&[2.0, 3.2]);
+        s["MultibandAccelerationFactor"] = json!(2);
+        s["SliceTiming"] = json!([0.0, 0.05, 0.0, 0.05]);
+        let p = parse(&s, CTX, Some(&sh("[background_suppression]\npresaturation = true\n")), None).unwrap();
+        let m = p.motion.as_ref().unwrap();
+        assert!(m.spin_history && m.shot_path);
+        // nothing to have a history of
+        let e = parse(&base(), CTX, Some(&overlay("[motion]\nspin_history = true\n[m0]\nrepetition_time = 8.0\n")), None)
+            .unwrap_err();
+        assert!(e.contains("needs motion"), "{e}");
+        // rows: an m0scan row, or rows whose preparations differ
+        let mut inc = base();
+        inc["M0Type"] = json!("Included");
+        let e = parse(&inc, "volume_type\nm0scan\ncontrol\nlabel\n",
+                      Some(&overlay("[motion]\nmode = \"linear\"\ntrans_mm = [0, 0, 0.5]\nspin_history = true\n")), None).unwrap_err();
+        assert!(e.contains("control and label rows only") && e.contains("M0scan"), "{e}");
+        let mut multi = base();
+        multi["PostLabelingDelay"] = json!([1.5, 1.5, 2.0, 2.0]);
+        let e = parse(&multi, CTX, Some(&sh("")), None).unwrap_err();
+        assert!(e.contains("one preparation") && e.contains("row 2"), "{e}");
+        // contrast
+        let mut ge = base();
+        ge["FlipAngle"] = json!(60);
+        let e = parse(&ge, CTX, Some(&sh("[signal]\nacq_contrast = \"ge\"\n")), None).unwrap_err();
+        assert!(e.contains("spin-echo"), "{e}");
+        // compat
+        let e = parse(&base(), CTX, Some(&sh("[compat]\nasldro = true\n")), None).unwrap_err();
+        assert!(e.contains("spin_history") || e.contains("simasl"), "{e}");
+        // 3D
+        let ov: Overlay = toml::from_str("[motion]\nmode = \"linear\"\ntrans_mm = [0, 0, 0.5]\nspin_history = true\n").unwrap();
+        let e = overlay_motion(ov.motion.as_ref(), 4, &ShotContext {
+            shots_3d: Some(2), mb: 1, slice_offsets: &[], mb_schedule_ok: true, look_locker: false,
+        }).unwrap_err();
+        assert!(e.contains("2D readouts"), "{e}");
     }
 
     #[test]
