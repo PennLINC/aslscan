@@ -299,7 +299,32 @@ path, whose outputs are unchanged. A run's own `desc-motionEvents_gt.tsv` can be
 `events` to reproduce it.
 
 A slow drift moves each volume a little and leaves it otherwise clean; within-volume motion
-staggers the slices of a volume. Neither models spin history.
+staggers the slices of a volume.
+
+**Spin history** (`[motion] spin_history = true`, 2D): tissue carried through the slice direction
+into a slice not yet excited is excited twice in one repetition and is dark the second time;
+tissue carried out of one is skipped and is bright in the next repetition. With the key set,
+aslscan steps each phantom voxel's longitudinal magnetization through every slice excitation at
+its shot's pose (a box slice profile as thick as the slice spacing) and adds the difference from
+the closed form to the tissue images, so a head that does not move through the slices is
+unchanged. It is written as `desc-spinHistory_gt` and described in `AslscanSimulation.Motion.SpinHistory`.
+It needs a spin-echo series of control and label rows that share one preparation, with one echo,
+no Look-Locker, Hadamard or ASLDRO compatibility; anything else is refused. Labeled blood is
+treated as fresh.
+
+What to expect, for 5 mm slices, TR 4.6 s and grey matter (T1 1.33 s):
+
+| Motion | Tissue signal in the affected slice |
+|---|---|
+| In-plane, any size | unchanged |
+| 0.5 mm through-plane between volumes | about 0.01% |
+| 0.5 mm through-plane jump between two slices 40 ms apart | -9.7% |
+| The same jump, neighbouring slice excited 0.4 s earlier | -7.3% |
+| Tissue skipped for one volume | +3.1% on the skipped part |
+
+Presaturation at labeling start erases what earlier volumes left, not the dip of a jump within a
+volume. A slow drift therefore stays visually clean; the effect is a dip of a few percent in one
+or two slices at an abrupt through-plane movement.
 
 **Vascular and physiological extensions:**
 

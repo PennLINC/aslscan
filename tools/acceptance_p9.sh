@@ -17,11 +17,11 @@ PH=work/phantom-3t-z100
 mkdir -p "$OUT"
 FAILED=0
 
-run() { # name overlay
+run() { # name overlay [sidecar]
   rm -rf "${OUT:?}/$1"
   local s rc=0
   s=$(date +%s.%N)
-  $BIN --asl-json $FX/asl.json --aslcontext $FX/aslcontext.tsv --overlay "$FX/$2" --phantom $PH --out "$OUT/$1" \
+  $BIN --asl-json "$FX/${3:-asl.json}" --aslcontext $FX/aslcontext.tsv --overlay "$FX/$2" --phantom $PH --out "$OUT/$1" \
       > "$OUT/$1.log" 2>&1 || rc=$?
   echo "== $1: exit $rc, $(echo "$(date +%s.%N) - $s" | bc) s"
   grep -E "^(contrast|simulated)" "$OUT/$1.log" || true
@@ -59,4 +59,10 @@ ev = [l.split("\t") for l in open(gt("events-file", "motionEvents")).read().spli
 check(len(ev) == 1 and ev[0][:3] == ["0", "10", "10"], f"events file: {ev}")
 sys.exit(0 if ok else 1)
 EOF
+# part B (Task 10): spin history, criteria 2-4
+run sh-drift overlay-sh-drift.toml
+run sh-event overlay-sh-event.toml
+run sh-presat overlay-sh-presat.toml asl-presat.json
+grep -h "^spin history" "$OUT"/sh-*.log || true
+"$HOME/.local/bin/micromamba" run -n rust-trx python tools/acceptance_p9_check.py "$OUT" || FAILED=1
 [ $FAILED = 0 ] && echo "P9 acceptance: all passed" || { echo "P9 acceptance: FAILED"; exit 1; }
