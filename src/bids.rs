@@ -232,6 +232,30 @@ mod writer {
                     gt.insert(2, json!("desc-motionShots_gt.tsv (each shot's composed pose, rotations in radians)"));
                 }
             }
+            // P9 part B
+            if m.spin_history {
+                let obj = block.as_object_mut().expect("an object");
+                let slab_mm = (0..3).map(|r| out.sim_grid.voxel_to_world[r][2].powi(2)).sum::<f64>().sqrt();
+                obj.insert("SpinHistory".into(), json!({
+                    "Model": "box-slab-piecewise-correction",
+                    "SliceProfile": "box",
+                    "SlabThickness": slab_mm,
+                    "MaxPieces": mrsim_acq::spin_history::MAX_PIECES,
+                    "Merges": out.spin_history_merges,
+                    "Compartments": "tissue",
+                    "Reference": "longitudinal::tissue_mz under background suppression, mrsignal::tissue_se without",
+                    "Description": "each phantom voxel's z extent keeps the longitudinal magnetization and time of its last \
+                                    excitation in exact pieces, stepped through every slice excitation at its shot's pose; \
+                                    the tissue images get the difference from the closed form, so a still head is unchanged",
+                }));
+                if let Some(gt) = obj.get_mut("GroundTruth").and_then(Value::as_array_mut) {
+                    gt.push(json!("desc-spinHistory_gt (the tissue's correction)"));
+                }
+                if let Some(ap) = obj.get_mut("Approximations").and_then(Value::as_array_mut) {
+                    ap.push(json!("spin history: a box slice profile as thick as the slice spacing; a voxel's tilt under \
+                                   rotation is ignored; labeled blood is treated as fresh"));
+                }
+            }
             block
         });
         let mut block = json!({
@@ -1031,6 +1055,19 @@ mod writer {
             write_json(&PathBuf::from(format!("{gt_prefix}_desc-deltamStatic_gt.json")), &json!({
                 "Units": "arbitrary (same as M0map)",
                 "Description": "+delta_m at each label/deltam row's own timing, unmoved, box-averaged; zero for other rows",
+                "Resampling": mean,
+            }))?;
+        }
+        // P9 part B: the spin-history correction of the tissue
+        if let Some(sh) = &gt.spin_history {
+            write_4d(&PathBuf::from(format!("{gt_prefix}_desc-spinHistory_gt.nii.gz")), out.acq_grid.dims, out.n_volumes, sh, &out.acq_grid)
+                .map_err(|e| e.to_string())?;
+            write_json(&PathBuf::from(format!("{gt_prefix}_desc-spinHistory_gt.json")), &json!({
+                "Units": "arbitrary (the tissue signal's, as the M0map before the acquisition's signal scale)",
+                "Description": "the spin-history correction added to the tissue: the tissue's longitudinal magnetization at \
+                                each excitation minus the closed form's, summed over the tissue classes, per volume, \
+                                box-averaged; before the physiological and dropout factors; zero means no effect",
+                "Model": "box-slab-piecewise-correction",
                 "Resampling": mean,
             }))?;
         }

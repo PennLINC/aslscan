@@ -137,6 +137,13 @@ fn run() -> Result<(), String> {
         "simulated: acquisition {:?}, simulation {:?}, T2 mode {}, {} compartments, {:.1?}",
         out.acq_grid.dims, out.sim_grid.dims, out.mode.as_str(), out.n_compartments, t1.elapsed(),
     );
+    if let Some(sh) = &out.ground_truth.spin_history {
+        // relative to the largest M0 on the acquisition grid (the tissue signal's scale)
+        let m0 = out.ground_truth.m0.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let worst = sh.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        println!("spin history: largest correction {:.3e} of the largest M0, {} merges",
+                 if m0 > 0.0 { worst / m0 } else { 0.0 }, out.spin_history_merges.unwrap_or(0));
+    }
     if let (Some(r), Some(sp)) = (&out.readout, out.readout.as_ref().and_then(|r| r.spiral.as_ref())) {
         let segs = out.spiral_segmentation.as_deref().unwrap_or(&[]);
         println!(

@@ -2348,3 +2348,29 @@ fn per_shot_motion_writes_its_table_and_replays_its_events() {
     assert!(!perf3.join("ground-truth/sub-01_desc-motionShots_gt.tsv").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// P9 part B, end to end: spin history writes its ground truth and sidecar block, and a run
+/// without it writes neither.
+#[test]
+fn spin_history_writes_its_truth_and_sidecar_block() {
+    let base = "[motion]\nmode = \"linear\"\ntrans_mm = [0.0, 0.0, 0.6]\nwithin_volume_sampling = \"slice\"\n";
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-spin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (name, extra, want) in [("with", "spin_history = true\n", true), ("without", "", false)] {
+        let p = protocol_with("control,label,control,label", 0.0, false, &format!("{base}{extra}"));
+        let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+        let d = dir.join(name);
+        aslscan::bids::write_dataset(&d, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+        let perf = d.join("sub-01/perf");
+        assert_eq!(perf.join("ground-truth/sub-01_desc-spinHistory_gt.nii.gz").exists(), want, "{name}");
+        let side: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("sub-01_part-mag_asl.json")).unwrap()).unwrap();
+        let m = &side["AslscanSimulation"]["Motion"];
+        assert_eq!(m.get("SpinHistory").is_some(), want, "{name}");
+        if want {
+            assert_eq!(m["SpinHistory"]["Model"], json!("box-slab-piecewise-correction"));
+            assert_eq!(m["SpinHistory"]["SliceProfile"], json!("box"));
+            assert!((m["SpinHistory"]["SlabThickness"].as_f64().unwrap() - 3.0).abs() < 1e-9);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
