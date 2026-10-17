@@ -278,13 +278,28 @@ trans_mm = [2.0, 2.0, 1.0]     # random/linear amplitudes
 rot_deg = [1.0, 1.0, 2.0]
 volumes = [5, 20, 40]          # volumes affected (default all)
 trajectory = "motion.tsv"      # "trajectory" mode: trans_x/y/z (mm), rot_x/y/z (radians), one row per volume
+within_volume_sampling = "volume"  # 2D: "volume" (each shot has its volume's pose) or "slice" (the pose at each shot's time)
 
-[motion.within_volume]         # multiband or segmented-3D shot events
+[motion.within_volume]         # shot events: 2D slice groups (single-band or multiband), or segmented-3D shots
 dropout_rate = 0.1
 severity = 0.5
 jump_mm = [0.5, 0.0, 0.0]
 jump_deg = [0.0, 0.0, 1.0]
+# events = "events.tsv"        # 2D: explicit events in the desc-motionEvents_gt.tsv format, instead of the draw
 ```
+
+On a 2D readout, a shot is the set of slices excited together, taken from `SliceTiming` (any slice
+order). With `within_volume_sampling = "slice"` (`linear` or `trajectory` mode), the volumes' poses
+become a trajectory, placed at each volume's first shot and sampled at every shot's time. A shot's
+transform is the volume's (or trajectory's) pose followed by the jumps of the events up to that
+shot. Single-band events, slice sampling, an events file, or a multiband slice order that the
+older path cannot represent move the images one shot at a time and write
+`desc-motionShots_gt.tsv` (every shot's time and pose). Other motion requests take the per-volume
+path, whose outputs are unchanged. A run's own `desc-motionEvents_gt.tsv` can be passed back as
+`events` to reproduce it.
+
+A slow drift moves each volume a little and leaves it otherwise clean; within-volume motion
+staggers the slices of a volume. Neither models spin history.
 
 **Vascular and physiological extensions:**
 
