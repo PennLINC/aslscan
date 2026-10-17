@@ -1694,13 +1694,14 @@ pub(super) fn simulate_p6(
             }
             _ => None,
         },
+        spin_history: None,
     };
 
     Ok(SeriesOutput {
         acq_grid, sim_grid, n_volumes: n_out, mag, phase: phase_out, m0, mode: mode_used,
         labels: ph.labels.clone(), n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(),
         seeds: (p.seed, m0_seed), acquisition: acq, ground_truth, label_factors, poses, motion_seed,
-        events, dropped, shots: shot_plan, compat: compat_facts,
+        events, dropped, shots: shot_plan, spin_history_merges: None, compat: compat_facts,
         crush_survival: p4.crush.clone(), physio: p4.physio.as_ref().map(|_| physio_lines),
         readout: res3d.clone(),
         echo_amplitudes,

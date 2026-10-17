@@ -109,6 +109,69 @@ pub fn apply(plan: &ShotPlan, images: &mut [Vec<f32>], sim_grid: &Grid, n: usize
     dropped(plan)
 }
 
+/// The tissue's spin-history inputs (P9 part B): the phantom on its own grid and the series'
+/// one preparation (`protocol` refuses spin history when the rows' preparations differ).
+pub struct SpinInputs<'a> {
+    pub grid: &'a Grid,
+    pub t1: &'a [f32],
+    pub m0: &'a [f32],
+    /// The tissue class of each phantom voxel (`spin_history::NO_CLASS` outside the tissue).
+    pub class: &'a [u8],
+    pub n_classes: usize,
+    pub suppression: Option<&'a crate::longitudinal::Suppression>,
+    pub tr: f64,
+    pub signal_t: f64,
+    /// Each volume's start on the series clock.
+    pub starts: &'a [f64],
+}
+
+/// P9 part B: the spin-history correction of the tissue classes on the simulation grid,
+/// `[class][vox * n + v]`, before any factor the tissue carries, and the engine's merge count. The
+/// reference is the closed form the tissue images were made with: `tissue_mz` at the shot's
+/// readout under suppression, `tissue_se` without. The history uses the plan's shot transforms.
+pub fn spin_history_correction(plan: &ShotPlan, inp: &SpinInputs, sim_grid: &Grid, offsets: &[f64]) -> (Vec<Vec<f32>>, u64) {
+    use mrsim_acq::spin_history::{Pulse, Slabs, Source, SpinHistory};
+    let n = plan.times.len();
+    let [snx, sny, snz] = sim_grid.dims;
+    let slab = snx * sny;
+    let mut pulses = Vec::new();
+    if let Some(s) = inp.suppression {
+        for &start in inp.starts {
+            pulses.extend(s.pulse_times.iter().map(|p| Pulse::Inversion { t: start + p, epsilon: s.epsilon }));
+            if s.presaturation {
+                pulses.push(Pulse::Saturation { t: start });
+            }
+        }
+    }
+    let mut h = SpinHistory::new(
+        Source { dims: inp.grid.dims, v2w: inp.grid.voxel_to_world, t1: inp.t1, weight: inp.m0, class: inp.class, n_classes: inp.n_classes },
+        Slabs { dims: sim_grid.dims, v2w: sim_grid.voxel_to_world },
+        pulses,
+    );
+    // the fictitious volume: the first volume's shots one repetition early, at its first shot's pose
+    let prime: Vec<(f64, &[usize])> = plan.schedule.iter().enumerate().map(|(s, sl)| (plan.times[0][s] - inp.tr, sl.as_slice())).collect();
+    h.prime(&prime, plan.transforms[0][0]);
+    let mut out = vec![vec![0.0f32; slab * snz * n]; inp.n_classes];
+    for v in 0..n {
+        for (s, slices) in plan.schedule.iter().enumerate() {
+            let t_read = inp.signal_t + offsets[slices[0]];
+            let (tr, sup) = (inp.tr, inp.suppression);
+            let mz_ref = move |t1: f64| match sup {
+                Some(s) => crate::longitudinal::tissue_mz(1.0, t1, tr, t_read, s),
+                None => crate::mrsignal::tissue_se(1.0, t1, tr),
+            };
+            for term in h.excite(plan.times[v][s], plan.transforms[v][s], slices, &mz_ref, None) {
+                for (c, img) in out.iter_mut().enumerate() {
+                    for (cell, x) in term.num[c].iter().enumerate() {
+                        img[(term.slice * slab + cell) * n + v] += *x;
+                    }
+                }
+            }
+        }
+    }
+    (out, h.merges())
+}
+
 /// The dropped-shot truth of the plan's events.
 pub fn dropped(plan: &ShotPlan) -> Vec<DroppedShot> {
     plan.events.iter().map(|e| DroppedShot {
@@ -141,6 +204,7 @@ mod tests {
             within: Some(WithinVolume { dropout_rate: 0.0, severity: 0.0, jump_mm: [0.0; 3], jump_deg: [0.0; 3], events_file: None }),
             sampling,
             shot_path: true,
+            spin_history: false,
         }
     }
 
@@ -240,6 +304,47 @@ mod tests {
         assert_eq!(gt_old.len(), gt_new.len());
         for (a, b) in gt_old.iter().zip(&gt_new) {
             assert_eq!((a.volume, a.shot, &a.slices, a.attenuation), (b.volume, b.shot, &b.slices, b.attenuation));
+        }
+    }
+
+    /// P9 part B on a uniform phantom (1 mm voxels, 5 mm slices aligned to them, sequential shots
+    /// 40 ms apart, TR 4.6 s): a 0.5 mm through-plane jump at shot 2 of volume 1 corrects slice 2's
+    /// tissue by `-0.1 (e_TR - e_dt)` per cell, and nothing else in that volume but the hair of slice
+    /// 3; with no jump, nothing anywhere.
+    #[test]
+    fn spin_history_correction_meets_the_closed_form() {
+        use crate::protocol::{EventsFile, FileEvent};
+        let (t1, tr, sig, dt) = (1.33f64, 4.6f64, 3.6f64, 0.04f64);
+        let phantom = Grid { dims: [4, 4, 20], voxel_to_world: IDENTITY_MATRIX };
+        let mut s = IDENTITY_MATRIX;
+        s[2][2] = 5.0;
+        s[2][3] = 2.0;
+        let sim = Grid { dims: [4, 4, 4], voxel_to_world: s };
+        let nv = 4 * 4 * 20;
+        let (t1v, m0v, class) = (vec![t1 as f32; nv], vec![1.0f32; nv], vec![0u8; nv]);
+        let offsets = [0.0, dt, 2.0 * dt, 3.0 * dt];
+        let starts = [0.0, tr, 2.0 * tr];
+        let inputs = SpinInputs { grid: &phantom, t1: &t1v, m0: &m0v, class: &class, n_classes: 1, suppression: None, tr, signal_t: sig, starts: &starts };
+        let mut m = spec(WithinVolumeSampling::Volume);
+        let run = |m: &MotionSpec| {
+            let plan = shot_plan(m, &[Pose::IDENTITY; 3], &starts, &[sig; 3], &offsets, &sim, |_| Vec::new());
+            spin_history_correction(&plan, &inputs, &sim, &offsets)
+        };
+        let (still, merges) = run(&m);
+        assert_eq!(merges, 0);
+        assert!(still[0].iter().all(|x| x.abs() < 1e-7), "a still head needs no correction");
+        let fe = FileEvent { volume: 1, shot: 2, severity: 0.0, jump_mm: [0.0, 0.0, 0.5], jump_deg: [0.0; 3] };
+        m.within.as_mut().unwrap().events_file = Some(EventsFile { path: "x".into(), events: vec![fe] });
+        let (corr, _) = run(&m);
+        let (e_tr, e_dt) = (1.0 - (-tr / t1).exp(), 1.0 - (-dt / t1).exp());
+        let at = |x: usize, y: usize, z: usize, v: usize| corr[0][(x + 4 * (y + 4 * z)) * 3 + v] as f64;
+        let want = -0.1 * (e_tr - e_dt);
+        for y in 0..4 {
+            for x in 0..4 {
+                assert!((at(x, y, 2, 1) - want).abs() < 1e-5, "({x},{y}): {} vs {want}", at(x, y, 2, 1));
+                assert!(at(x, y, 0, 1).abs() < 1e-7 && at(x, y, 1, 1).abs() < 1e-7, "the slices before the jump");
+                assert!(at(x, y, 3, 1).abs() < 1e-3, "slice 3: a tenth last excited TR + dt ago");
+            }
         }
     }
 
