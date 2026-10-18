@@ -140,6 +140,9 @@ pub struct SeriesOutput {
     pub dropped: Vec<DroppedShot>,
     /// The per-shot plan, on the P9 shot path only.
     pub shots: Option<shots::ShotPlan>,
+    /// P10 part C: a 3D readout's segments under `within_volume_sampling = "shot"`: each motion
+    /// unit's segment times and absolute poses `J . P(t)` (`desc-motionShots_gt.tsv`).
+    pub segment_shots: Option<shots::SegmentShots>,
     /// P9 part B: how often the spin-history engine merged a full voxel's pieces.
     pub spin_history_merges: Option<u64>,
     /// Under `[compat] asldro = true`: what the SNR resolved to.
@@ -612,8 +615,14 @@ fn simulate_legacy(
     // is simulated (the protocol rows' clock; a 3D readout queries each volume's first segment)
     let row_t: Vec<f64> = p.rows.iter().map(|r| r.t).collect();
     if let Some(m) = p.motion.as_ref() {
-        let per_shot = m.sampling.per_shot() && res3d.is_none();
-        m.check_timed_coverage(&shots::query_times(&p.row_start, &row_t, &slice_offsets, per_shot))?;
+        let q = match &res3d {
+            // P10 part C: every segment of a 3D row, one repetition apart
+            Some(r3) if m.sampling.per_shot() => (0..p.rows.len())
+                .flat_map(|v| (0..r3.n_shots).map(move |s| p.row_start[v] + s as f64 * p.rows[v].tr + p.rows[v].t))
+                .collect(),
+            _ => shots::query_times(&p.row_start, &row_t, &slice_offsets, m.sampling.per_shot() && res3d.is_none()),
+        };
+        m.check_timed_coverage(&q)?;
     }
     let dv = p.voxel_size_mm;
     let sim_vox = [dv[0] / o as f64, dv[1] / o as f64, dv[2]];
@@ -1294,16 +1303,24 @@ fn simulate_legacy(
     // 1 - severity (DropoutLaw::Uniform), a shot gain.
     let mut shot_gain = vec![vec![1.0f64; n_shots]; n];
     let mut shot_sets: Vec<Vec<ShotSet>> = vec![Vec::new(); n];
-    if res3d.is_some() && !events.is_empty() {
+    // P10 part C: under within_volume_sampling = "shot" each segment takes the trajectory's pose at
+    // its own excitation time, relative to the pose the volume's images already carry
+    let seg = res3d.is_some() && p.motion.as_ref().is_some_and(|m| m.sampling.per_shot());
+    let mut segment_shots: Option<shots::SegmentShots> = None;
+    if res3d.is_some() && (!events.is_empty() || seg) {
         let v2w = sim_grid.voxel_to_world;
-        for (g, sets) in shot_sets.iter_mut().enumerate() {
+        let center = mrsim_acq::motion::fov_center(sim_grid.dims, v2w);
+        let ref_times = shots::reference_times(&p.row_start, &row_t);
+        let mut pose_of_all: Vec<Option<Vec<Pose>>> = vec![None; n];
+        let (mut seg_times, mut seg_abs) = (Vec::new(), Vec::new());
+        for (g, slot) in pose_of_all.iter_mut().enumerate() {
             let evs: Vec<&MotionEvent> = events.iter().filter(|e| e.volume == g && e.shot < n_shots).collect();
-            if evs.is_empty() {
+            if evs.is_empty() && !seg {
                 continue;
             }
             let mut cum = Pose::IDENTITY;
-            let mut pose_of = vec![Pose::IDENTITY; n_shots];
-            for (s, pose) in pose_of.iter_mut().enumerate() {
+            let mut cums = vec![Pose::IDENTITY; n_shots];
+            for (s, pose) in cums.iter_mut().enumerate() {
                 for e in evs.iter().filter(|e| e.shot == s) {
                     for i in 0..3 {
                         cum.trans_mm[i] += e.jump_mm[i];
@@ -1312,6 +1329,29 @@ fn simulate_legacy(
                 }
                 *pose = cum;
             }
+            *slot = Some(if seg {
+                let m = p.motion.as_ref().expect("per-segment sampling is motion");
+                let times: Vec<f64> = (0..n_shots).map(|s| p.row_start[g] + s as f64 * p.rows[g].tr + p.rows[g].t).collect();
+                let pose_at = |t: f64| match &m.timed {
+                    Some(tt) => tt.trace.pose_at(t),
+                    None => mrsim_acq::motion::sample_trajectory(&ref_times, &poses, t),
+                };
+                let (rel, abs) = shots::segment_poses(&cums, &times, poses[g], pose_at, center);
+                seg_times.push(times);
+                seg_abs.push(abs);
+                rel
+            } else {
+                cums
+            });
+        }
+        if seg {
+            let sets: usize = pose_of_all.iter().flatten().map(|po| shots::distinct_moved(po)).sum();
+            shots::check_segment_memory(sets, images.len(), nvox_sim, p.segment_images_gib)?;
+            segment_shots = Some(shots::SegmentShots { times: seg_times, poses: seg_abs });
+        }
+        for (g, sets) in shot_sets.iter_mut().enumerate() {
+            let Some(pose_of) = pose_of_all[g].take() else { continue };
+            let evs: Vec<&MotionEvent> = events.iter().filter(|e| e.volume == g && e.shot < n_shots).collect();
             let mut distinct: Vec<Pose> = Vec::new();
             for &q in &pose_of {
                 if q != Pose::IDENTITY && !distinct.contains(&q) {
@@ -1481,7 +1521,7 @@ fn simulate_legacy(
         acq_grid, sim_grid, n_volumes: n, mag, phase: phase_out, m0, mode: mode_used,
         labels: ph.labels.clone(), n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(),
         seeds: (p.seed, m0_seed), acquisition: acq, ground_truth, label_factors, poses, motion_seed,
-        events, dropped, shots: shot_plan, spin_history_merges, compat: compat_facts,
+        events, dropped, shots: shot_plan, segment_shots, spin_history_merges, compat: compat_facts,
         crush_survival: p4.crush.clone(), physio: p4.physio.as_ref().map(|_| physio_lines),
         readout: res3d.clone(),
         echo_amplitudes,
@@ -2017,6 +2057,91 @@ mod tests {
             assert_eq!(oa.ground_truth.spin_history, ob.ground_truth.spin_history);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P10 part C on the spin-echo 3D path (the P5 GRASE fixture, two segments per volume): a timed
+    /// trace that holds still within each volume gives under "shot" the "volume" run bit for bit
+    /// (equal poses reuse the base images); one that moves between the segments of volume 1 changes
+    /// that volume only, and the segment truth holds each segment's time and absolute pose; the
+    /// memory limit is checked first; "slice" is refused in 3D.
+    #[test]
+    fn three_d_segments_take_the_trace_at_their_own_times() {
+        let ph = phantom();
+        let fx = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols/p5_grase/asl.json");
+        let s: Value = serde_json::from_str(&std::fs::read_to_string(fx).unwrap()).unwrap();
+        let rows = "control,label,control,label";
+        let base = "[acquisition]\noversample = 1\n[m0]\nrepetition_time = 6.0\n";
+        let p0 = protocol_from(&s, rows, base);
+        let shots = p0.readout.as_ref().unwrap().number_shots.0;
+        assert_eq!(shots, 2);
+        let seg_t = |v: usize, k: usize| p0.row_start[v] + k as f64 * p0.rows[v].tr + p0.rows[v].t;
+        let pose = |v: usize| [0.0, 0.5 * v as f64, 0.2, 0.0, 0.0, 0.035 * (v + 1) as f64];
+        let dir = std::env::temp_dir().join(format!("aslscan-3dseg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, samples: &[(f64, [f64; 6])]| {
+            let mut text = String::from("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+            for (t, r) in samples {
+                text.push_str(&format!("{t}\t{}\t{}\t{}\t{}\t{}\t{}\n", r[0], r[1], r[2], r[3], r[4], r[5]));
+            }
+            let tsv = dir.join(format!("{name}.tsv"));
+            std::fs::write(&tsv, text).unwrap();
+            tsv.to_string_lossy().replace('\\', "\\\\")
+        };
+        // still within each volume: each volume's pose from its first segment through its last
+        let held: Vec<(f64, [f64; 6])> = (0..4).flat_map(|v| [(seg_t(v, 0), pose(v)), (seg_t(v, shots - 1), pose(v))]).collect();
+        let held = write("held", &held);
+        let ov = |path: &str, extra: &str| format!("{base}[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\n{extra}");
+        let vol = protocol_from(&s, rows, &ov(&held, ""));
+        let seg = protocol_from(&s, rows, &ov(&held, "within_volume_sampling = \"shot\"\n"));
+        let (ov_, os) = (simulate(&vol, &ph, T2Mode::Class, &no_phase()).unwrap(), simulate(&seg, &ph, T2Mode::Class, &no_phase()).unwrap());
+        assert!(ov_.segment_shots.is_none());
+        assert_eq!(ov_.poses, os.poses);
+        assert!(ov_.poses.iter().all(|q| *q != Pose::IDENTITY));
+        assert!(ov_.mag.iter().zip(&os.mag).all(|(a, b)| a.to_bits() == b.to_bits()), "held still: \"shot\" is \"volume\"");
+        let st = os.segment_shots.as_ref().expect("segment truth");
+        for v in 0..4 {
+            for k in 0..shots {
+                assert!((st.times[v][k] - seg_t(v, k)).abs() < 1e-12);
+                assert_eq!(st.poses[v][k], os.poses[v], "volume {v}, segment {k}");
+            }
+        }
+        // moving between the segments of volume 1: only volume 1 changes
+        let mut moved = held_samples(&seg_t, &pose, shots);
+        let step = [0.0, 0.0, 2.0, 0.0, 0.0, 0.035 * 2.0];
+        moved[3] = (seg_t(1, 1), step); // volume 1, segment 1: 2 mm up
+        let moved = write("moved", &moved);
+        let mv = protocol_from(&s, rows, &ov(&moved, "within_volume_sampling = \"shot\"\n"));
+        let om = simulate(&mv, &ph, T2Mode::Class, &no_phase()).unwrap();
+        let n = 4;
+        let peak = max_abs(&os.mag);
+        let vol_diff = |v: usize| os.mag.iter().zip(&om.mag).skip(v).step_by(n).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        for v in [0, 2, 3] {
+            assert_eq!(vol_diff(v), 0.0, "volume {v} is unchanged");
+        }
+        assert!(vol_diff(1) > 1e-3 * peak, "volume 1 changes: {}", vol_diff(1));
+        let sm = om.segment_shots.as_ref().unwrap();
+        assert!((sm.poses[1][1].trans_mm[2] - 2.0).abs() < 1e-9 && sm.poses[1][0] == om.poses[1]);
+        // the dataset writes the segment table, slices n/a
+        let d = dir.join("ds");
+        crate::bids::write_dataset(&d, &crate::bids::Names::new("01", None), &mv, &om).unwrap();
+        let tsv = std::fs::read_to_string(d.join("sub-01/perf/ground-truth/sub-01_desc-motionShots_gt.tsv")).unwrap();
+        assert_eq!(tsv.lines().count(), 1 + 4 * shots);
+        assert!(tsv.lines().skip(1).all(|l| l.split('\t').nth(2) == Some("n/a")));
+        // the limit, accepted only on the per-segment path and checked before the sets are made
+        let tight = protocol_from(&s, rows, &format!("{}[images]\nmax_memory_gib = 1e-9\n", ov(&moved, "within_volume_sampling = \"shot\"\n")));
+        let e = simulate(&tight, &ph, T2Mode::Class, &no_phase()).unwrap_err();
+        assert!(e.contains("max_memory_gib") && e.contains("segment image sets"), "{e}");
+        let ovl: Overlay = toml::from_str(&format!("{}[images]\nmax_memory_gib = 1.0\n", ov(&moved, ""))).unwrap();
+        let ctx = "volume_type\ncontrol\nlabel\ncontrol\nlabel\n";
+        assert!(parse(&s, ctx, Some(&ovl), ph.params.as_ref()).unwrap_err().contains("max_memory_gib"));
+        let ovl: Overlay = toml::from_str(&ov(&moved, "within_volume_sampling = \"slice\"\n")).unwrap();
+        assert!(parse(&s, ctx, Some(&ovl), ph.params.as_ref()).unwrap_err().contains("\"slice\" is for 2D"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The held-still samples of [`three_d_segments_take_the_trace_at_their_own_times`].
+    fn held_samples(seg_t: &dyn Fn(usize, usize) -> f64, pose: &dyn Fn(usize) -> [f64; 6], shots: usize) -> Vec<(f64, [f64; 6])> {
+        (0..4).flat_map(|v| [(seg_t(v, 0), pose(v)), (seg_t(v, shots - 1), pose(v))]).collect()
     }
 
     /// Coverage is over the queried set: a trace ending at the last volume's first shot covers one

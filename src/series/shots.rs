@@ -118,6 +118,77 @@ pub fn query_times(starts: &[f64], signal_t: &[f64], offsets: &[f64], per_shot: 
     starts.iter().zip(signal_t).flat_map(|(s, t)| shot_offset.iter().map(move |o| s + t + o)).collect()
 }
 
+/// P10 part C: a 3D readout's segment truth under per-shot sampling: `[unit][segment]` excitation
+/// times on the series clock and absolute poses `J . P(t)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentShots {
+    pub times: Vec<Vec<f64>>,
+    pub poses: Vec<Vec<Pose>>,
+}
+
+/// P10 part C: the segment poses of one 3D motion unit. `cum[s]` is the summed jumps `J` of the
+/// unit's events up to segment `s`, `times[s]` the segment's excitation time, `p_v` the pose the
+/// unit's images were already moved by (its reference pose), `pose_at` the trajectory. Returns,
+/// per segment, the pose to move those images by further (`J . P(t) . P_v^-1`) and the absolute
+/// pose (`J . P(t)`). Where `P(t)` is `P_v` exactly the first is `J` itself, with no matrix
+/// arithmetic, so a trajectory that holds still within a unit reproduces the per-volume path bit
+/// for bit; the identity is the base images.
+pub fn segment_poses(cum: &[Pose], times: &[f64], p_v: Pose, pose_at: impl Fn(f64) -> Pose, center: [f64; 3])
+    -> (Vec<Pose>, Vec<Pose>)
+{
+    let pv_inv = {
+        let m = matrix_of(p_v, center);
+        rigid_inverse(&m)
+    };
+    let mut rel = Vec::with_capacity(cum.len());
+    let mut abs = Vec::with_capacity(cum.len());
+    for (s, &j) in cum.iter().enumerate() {
+        let pt = pose_at(times[s]);
+        let a = matmul4(&matrix_of(j, center), &matrix_of(pt, center));
+        abs.push(if j == Pose::IDENTITY { pt } else if pt == Pose::IDENTITY { j } else { Pose::from_matrix(a, center) });
+        rel.push(if pt == p_v { j } else { Pose::from_matrix(matmul4(&a, &pv_inv), center) });
+    }
+    (rel, abs)
+}
+
+/// The number of distinct poses other than the identity among one unit's segments: the image sets
+/// it holds beside its base images.
+pub fn distinct_moved(poses: &[Pose]) -> usize {
+    let mut distinct: Vec<Pose> = Vec::new();
+    for &q in poses {
+        if q != Pose::IDENTITY && !distinct.contains(&q) {
+            distinct.push(q);
+        }
+    }
+    distinct.len()
+}
+
+/// P10 part C: `sets` image sets of `n_images` compartment images of `nvox` voxels, all held at once
+/// until the acquisition, within `limit_gib` (`[images] max_memory_gib`), checked before any is
+/// made.
+pub fn check_segment_memory(sets: usize, n_images: usize, nvox: usize, limit_gib: f64) -> Result<(), String> {
+    let gib = sets as f64 * n_images as f64 * nvox as f64 * 4.0 / (1u64 << 30) as f64;
+    if gib > limit_gib {
+        return Err(format!(
+            "within_volume_sampling = \"shot\" on this 3D readout makes {sets} segment image sets of {n_images} \
+             compartment images ({gib:.2} GiB), over [images] max_memory_gib = {limit_gib}; raise it, sample fewer \
+             distinct poses, or simulate fewer volumes"));
+    }
+    Ok(())
+}
+
+/// The inverse of a rigid world-space transform: `[R^T | -R^T t]`.
+fn rigid_inverse(m: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
+    let mut out = IDENTITY_MATRIX;
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = m[j][i];
+        }
+        out[i][3] = -(0..3).map(|k| m[k][i] * m[k][3]).sum::<f64>();
+    }
+    out
+}
+
 /// P10, for the sidecar: the smallest interval between two shots of a volume (s): between a 2D
 /// readout's distinct slice times, or a segmented 3D readout's repetitions; `None` with one shot.
 pub fn min_shot_spacing(p: &crate::protocol::Protocol) -> Option<f64> {

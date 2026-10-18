@@ -319,6 +319,14 @@ over a 4.6 s repetition. Each simulator reads it the same way (TRXScan's `--moti
 - **Coverage:** the trace must cover every time it is sampled at, or the run is refused before
   anything is simulated. It is never extrapolated.
 - **Composition:** within-volume events compose with it as with an untimed trajectory.
+- **3D readouts:** a segmented 3D readout (GRASE, stack of spirals, the gradient-echo EPI train)
+  reads each segment at its own pose under `"shot"` (`"slice"` is refused there): the trace's pose
+  at the segment's first excitation, relative to the volume's. Segments at different poses give
+  inconsistent k-space lines, which the reconstruction turns into ghosting and blurring through the
+  slab. A segment's echo train is still read at one pose. Each distinct segment pose holds a copy of
+  the volume's images until the acquisition, bounded by `[images] max_memory_gib` (default 4). The
+  `desc-motionShots_gt.tsv` table lists each segment's time and absolute pose, with `slices` `n/a`.
+  An untimed trajectory under `"shot"` is sampled the same way between the volumes' poses.
 - **Making one:** `tools/motion_trace.py` writes timed traces from nods, steps and drifts, and
   rewrites a sidecar-timed trace with a `time` column:
 

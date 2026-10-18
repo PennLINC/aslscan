@@ -876,6 +876,9 @@ pub struct Protocol {
     /// With `mb > 1`: whether the slice timing is the interleaved (even groups then odd) shot
     /// order of `mrsim_acq::motion::slice_schedule`, as opposed to sequential.
     pub mb_interleaved: bool,
+    /// P10 part C: the memory limit (GiB) on a 3D readout's segment image sets under
+    /// `within_volume_sampling = "shot"` (`[images] max_memory_gib`, default 4).
+    pub segment_images_gib: f64,
     /// Per acquired slice in data z order (after `SliceEncodingDirection`), minus the minimum (s).
     pub slice_offsets: Vec<f64>,
     pub field_strength: f64,
@@ -1327,10 +1330,6 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, sc: &ShotContext) -> Resu
         if is_3d && sampling == WithinVolumeSampling::Slice {
             return Err("overlay: motion.within_volume_sampling = \"slice\" is for 2D readouts (a 3D readout has no \
                         slice timing); \"shot\" names a pose per readout segment".to_string());
-        }
-        if is_3d {
-            return Err("overlay: motion.within_volume_sampling = \"shot\" on a 3D readout (a pose per readout \
-                        segment) is not supported yet".to_string());
         }
         if mode_name == "random" {
             return Err(format!(
@@ -3249,6 +3248,9 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     // P7 part C: the 3D EPI train's own inputs; its slab entry from [readout] or bolus-position's
     let images_gib = overlay.and_then(|o| o.images.as_ref()).and_then(|i| i.max_memory_gib)
         .map(|v| require_finite_positive(v, "overlay images.max_memory_gib")).transpose()?;
+    // P10 part C: a 3D readout sampling the trajectory per segment holds an image set per segment pose
+    let segment_shots = readout.is_some() && motion.as_ref().is_some_and(|m| m.sampling.per_shot());
+    let segment_images_gib = images_gib.unwrap_or(4.0);
     let mut readout = readout;
     if let Some(r) = readout.as_mut().filter(|r| r.kind.0 == ReadoutKind::Epi3d) {
         let empty = ReadoutOverlay::default();
@@ -3319,15 +3321,16 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
         };
         r.ge3d = Some(Ge3dSpec { excitation_spacing_ms, excitation_time_ms, slab_entry, max_t1_groups, node_tolerance,
                                  max_memory_gib });
-    } else if images_gib.is_some() && !(multi_te.is_some() && compat.is_some()) {
+    } else if images_gib.is_some() && !(multi_te.is_some() && compat.is_some()) && !segment_shots {
         return Err("overlay: [images] max_memory_gib bounds the images of a 3D gradient-echo series ([readout] type \
-                    \"epi3d\") or of compat's multi-TE echoes; this protocol has neither".to_string());
+                    \"epi3d\"), of compat's multi-TE echoes, or of a 3D readout's segment poses (within_volume_sampling \
+                    = \"shot\"); this protocol has none of them".to_string());
     }
 
     let protocol = Protocol {
         echo_times_s, multi_te, hadamard, look_locker,
         compat, grid_origin, exchange_time, macrovascular, crushing, physio, row_start,
-        label_type, rows, m0_type, background_suppression, suppression, ir, ge, readout, motion, mb_interleaved,
+        label_type, rows, m0_type, background_suppression, suppression, ir, ge, readout, motion, mb_interleaved, segment_images_gib,
         slice_offsets, field_strength, voxel_size_mm, reverse_phase, phase_encoding_direction: ped,
         echo_time_s, total_readout_time_s, accel, mb, alpha, lambda, t1b, t2_blood_s, contrast,
         m0_repetition_time_s, seed, acq, input_sidecar: sidecar.clone(),
