@@ -88,6 +88,11 @@ class Synthesize(unittest.TestCase):
             mt.parse_component("step", "start=1,rise=0,colour=red")
         with self.assertRaises(ValueError):
             mt.synthesize(0, 1, 0.0, [])
+        # implementation review: one sample, a start that is not a number
+        with self.assertRaises(ValueError):
+            mt.synthesize(100, 0.001, 0.0, [])
+        with self.assertRaises(ValueError):
+            mt.synthesize(100, 1, float("nan"), [])
 
 
 class Files(unittest.TestCase):

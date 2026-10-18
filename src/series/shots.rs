@@ -132,23 +132,36 @@ pub struct SegmentShots {
 /// per segment, the pose to move those images by further (`J . P(t) . P_v^-1`) and the absolute
 /// pose (`J . P(t)`). Where `P(t)` is `P_v` exactly the first is `J` itself, with no matrix
 /// arithmetic, so a trajectory that holds still within a unit reproduces the per-volume path bit
-/// for bit; the identity is the base images.
+/// for bit; the identity is the base images. A composed rotation the `Rz Ry Rx` decomposition
+/// cannot represent (pitch at 90 degrees) is refused rather than resampled wrong.
 pub fn segment_poses(cum: &[Pose], times: &[f64], p_v: Pose, pose_at: impl Fn(f64) -> Pose, center: [f64; 3])
-    -> (Vec<Pose>, Vec<Pose>)
+    -> Result<(Vec<Pose>, Vec<Pose>), String>
 {
     let pv_inv = {
         let m = matrix_of(p_v, center);
         rigid_inverse(&m)
+    };
+    // the decomposition reproduces the matrix, or the segment pose is refused
+    let decompose = |m: [[f64; 4]; 4], s: usize| -> Result<Pose, String> {
+        let p = Pose::from_matrix(m, center);
+        let back = p.to_matrix(center);
+        let err = back.iter().flatten().zip(m.iter().flatten()).fold(0.0f64, |e, (a, b)| e.max((a - b).abs()));
+        if err > 1e-9 {
+            return Err(format!(
+                "segment {s} at {} s: its pose composes to a rotation at 90 degrees of pitch, which the Rz Ry Rx angles \
+                 cannot represent (reconstruction error {err:.2e})", times[s]));
+        }
+        Ok(p)
     };
     let mut rel = Vec::with_capacity(cum.len());
     let mut abs = Vec::with_capacity(cum.len());
     for (s, &j) in cum.iter().enumerate() {
         let pt = pose_at(times[s]);
         let a = matmul4(&matrix_of(j, center), &matrix_of(pt, center));
-        abs.push(if j == Pose::IDENTITY { pt } else if pt == Pose::IDENTITY { j } else { Pose::from_matrix(a, center) });
-        rel.push(if pt == p_v { j } else { Pose::from_matrix(matmul4(&a, &pv_inv), center) });
+        abs.push(if j == Pose::IDENTITY { pt } else if pt == Pose::IDENTITY { j } else { decompose(a, s)? });
+        rel.push(if pt == p_v { j } else { decompose(matmul4(&a, &pv_inv), s)? });
     }
-    (rel, abs)
+    Ok((rel, abs))
 }
 
 /// The number of distinct poses other than the identity among one unit's segments: the image sets
@@ -386,6 +399,25 @@ mod tests {
             }
         }
         assert_ne!(timed.transforms[0][3], IDENTITY_MATRIX);
+    }
+
+    /// Implementation review: a relative rotation at 90 degrees of pitch (reference (10, -45, 5)
+    /// degrees, shot about (17.05, 44.78, 14.98)) cannot be decomposed into the angles the
+    /// resampler takes; it is refused, while an ordinary one round-trips.
+    #[test]
+    fn segment_poses_refuse_what_the_angles_cannot_represent() {
+        let c = [1.0, -2.0, 3.0];
+        let pv = Pose { rot_deg: [10.0, -45.0, 5.0], trans_mm: [0.0; 3] };
+        let lock = Pose { rot_deg: [17.0532267, 44.7823850, 14.9810694], trans_mm: [0.0; 3] };
+        let e = segment_poses(&[Pose::IDENTITY], &[2.0], pv, |_| lock, c).unwrap_err();
+        assert!(e.contains("90 degrees") && e.contains("2 s"), "{e}");
+        let ok = Pose { rot_deg: [12.0, -40.0, 7.0], trans_mm: [0.5, 0.0, 1.0] };
+        let (rel, abs) = segment_poses(&[Pose::IDENTITY], &[2.0], pv, |_| ok, c).unwrap();
+        assert_eq!(abs[0], ok);
+        let back = matmul4(&rel[0].to_matrix(c), &pv.to_matrix(c));
+        for (a, b) in back.iter().flatten().zip(ok.to_matrix(c).iter().flatten()) {
+            assert!((a - b).abs() < 1e-12);
+        }
     }
 
     #[test]

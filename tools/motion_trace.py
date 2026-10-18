@@ -114,8 +114,14 @@ def synthesize(rate, duration, start, components):
         raise ValueError(f"--rate {rate}: not a positive number")
     if not (math.isfinite(duration) and duration > 0):
         raise ValueError(f"--duration {duration}: not a positive number")
+    if not math.isfinite(start):
+        raise ValueError(f"--start {start}: not a finite number")
     n = int(round(duration * rate)) + 1
+    if n < 2:
+        raise ValueError(f"--rate {rate} over --duration {duration} gives {n} sample; a timed trace needs at least two")
     times = [start + i / rate for i in range(n)]
+    if not all(math.isfinite(t) for t in times) or any(b <= a for a, b in zip(times, times[1:])):
+        raise ValueError("the sample times are not finite and strictly increasing at this --start and --rate")
     t0, t1 = times[0], times[-1]
     rows = []
     for t in times:
@@ -142,6 +148,8 @@ def from_sidecar(path):
     t0 = float(meta.get("StartTime", 0.0))
     if not (math.isfinite(hz) and hz > 0):
         raise ValueError(f"{side}: SamplingFrequency {hz} is not positive")
+    if not math.isfinite(t0):
+        raise ValueError(f"{side}: StartTime {t0} is not finite")
     with open(path, newline="") as f:
         r = csv.reader(f, delimiter="\t")
         header = [h.strip() for h in next(r)]
@@ -161,6 +169,8 @@ def from_sidecar(path):
                     raise ValueError(f"{path} row {i}: {cell!r} is not finite")
                 vals.append(v)
             rows.append([t0 + i / hz] + vals)
+    if len(rows) < 2:
+        raise ValueError(f"{path}: {len(rows)} sample(s); a timed trace needs at least two")
     return rows
 
 

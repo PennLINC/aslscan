@@ -672,7 +672,7 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
                 Some(tt) => tt.trace.pose_at(t),
                 None => mrsim_acq::motion::sample_trajectory(&ref_times, &poses, t),
             };
-            let (rel, abs) = super::shots::segment_poses(sp, &times, poses[g], pose_at, center);
+            let (rel, abs) = super::shots::segment_poses(sp, &times, poses[g], pose_at, center)?;
             *sp = rel;
             seg_times.push(times);
             seg_abs.push(abs);

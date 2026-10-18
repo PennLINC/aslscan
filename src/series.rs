@@ -1336,7 +1336,7 @@ fn simulate_legacy(
                     Some(tt) => tt.trace.pose_at(t),
                     None => mrsim_acq::motion::sample_trajectory(&ref_times, &poses, t),
                 };
-                let (rel, abs) = shots::segment_poses(&cums, &times, poses[g], pose_at, center);
+                let (rel, abs) = shots::segment_poses(&cums, &times, poses[g], pose_at, center)?;
                 seg_times.push(times);
                 seg_abs.push(abs);
                 rel

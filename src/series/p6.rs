@@ -1292,7 +1292,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                     Some(tt) => tt.trace.pose_at(t),
                     None => mrsim_acq::motion::sample_trajectory(&ref_times, &poses, t),
                 };
-                let (rel, abs) = super::shots::segment_poses(&cums, &times, poses[g], pose_at, center);
+                let (rel, abs) = super::shots::segment_poses(&cums, &times, poses[g], pose_at, center)?;
                 seg_times.push(times);
                 seg_abs.push(abs);
                 rel
