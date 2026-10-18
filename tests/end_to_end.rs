@@ -2349,6 +2349,63 @@ fn per_shot_motion_writes_its_table_and_replays_its_events() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// P10, end to end: a timed trajectory writes its `Trajectory` block, under "shot" on the shot path
+/// and under "volume" on P3's path (with `VolumePose`); the shots table's times are on the clock
+/// the trace is sampled on; an untimed run's block has no `Trajectory`.
+#[test]
+fn a_timed_trajectory_writes_its_block() {
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-timed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let tsv = dir.join("trace.tsv");
+    // 0 to 2 mm in z over 0 to 40 s, sampled at 1 Hz
+    let mut text = String::from("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+    for i in 0..=40 {
+        text.push_str(&format!("{i}\t0\t0\t{}\t0\t0\t0\n", i as f64 / 20.0));
+    }
+    std::fs::write(&tsv, text).unwrap();
+    let path = tsv.to_string_lossy().replace('\\', "\\\\");
+    let rows = "control,label,control,label";
+    for (name, sampling) in [("shot", "shot"), ("volume", "volume")] {
+        let ov = format!("[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\nwithin_volume_sampling = \"{sampling}\"\n");
+        let p = protocol_with(rows, 0.0, false, &ov);
+        let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+        let d = dir.join(name);
+        aslscan::bids::write_dataset(&d, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+        let perf = d.join("sub-01/perf");
+        let side: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("sub-01_part-mag_asl.json")).unwrap()).unwrap();
+        let m = &side["AslscanSimulation"]["Motion"];
+        let t = &m["Trajectory"];
+        assert_eq!((t["Timed"].clone(), t["Samples"].clone(), t["Span"].clone()), (json!(true), json!(41), json!([0.0, 40.0])), "{name}");
+        assert_eq!(t["MaxSampleInterval"], json!(1.0));
+        assert!(t["Clock"].as_str().unwrap().starts_with("time column"), "{name}");
+        assert_eq!(m["Mode"], json!("trajectory"));
+        if sampling == "shot" {
+            assert_eq!((m["Path"].clone(), m["WithinVolumeSampling"].clone()), (json!("shot"), json!("shot")));
+            assert!(m["ShotTransform"].as_str().unwrap().contains("timed trajectory"));
+            let shots = std::fs::read_to_string(perf.join("ground-truth/sub-01_desc-motionShots_gt.tsv")).unwrap();
+            for l in shots.lines().skip(1) {
+                let c: Vec<f64> = l.split('\t').enumerate().filter(|(i, _)| *i != 2).map(|(_, x)| x.parse().unwrap()).collect();
+                assert!((c[5] - c[2] / 20.0).abs() < 1e-9, "the shot's z is the trace at its time: {l}");
+            }
+        } else {
+            assert!(m.get("Path").is_none() && m["VolumePose"].is_string());
+            for (v, q) in out.poses.iter().enumerate() {
+                let first = p.row_start[v] + p.rows[v].t;
+                assert!((q.trans_mm[2] - first / 20.0).abs() < 1e-9, "volume {v}");
+            }
+        }
+    }
+    // an untimed run: no Trajectory block
+    let p3 = protocol_with(rows, 0.0, false, "[motion]\nmode = \"random\"\ntrans_mm = [1.0, 0.0, 0.0]\n");
+    let out3 = simulate_with(&p3, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let d3 = dir.join("untimed");
+    aslscan::bids::write_dataset(&d3, &aslscan::bids::Names::new("01", None), &p3, &out3).unwrap();
+    let side3: Value = serde_json::from_str(&std::fs::read_to_string(d3.join("sub-01/perf/sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    assert!(side3["AslscanSimulation"]["Motion"].get("Trajectory").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// P9 part B, end to end: spin history writes its ground truth and sidecar block, and a run
 /// without it writes neither.
 #[test]

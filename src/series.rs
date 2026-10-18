@@ -30,7 +30,7 @@ use mrsim_acq::io::hires_grid;
 use mrsim_acq::kspace::{simulate_acquisition_oversampled, Acquisition, T2Volume};
 use mrsim_acq::kspace3d::{simulate_acquisition_3d_kz, KzOptions, LineWeights, ShotSet};
 use mrsim_acq::motion::{
-    apply_motion, apply_multiband_motion, resolve_poses, slice_schedule, DropoutLaw, DroppedShot, MotionEvent, Pose,
+    apply_motion, apply_multiband_motion, slice_schedule, DropoutLaw, DroppedShot, MotionEvent, Pose,
 };
 use mrsim_acq::phase::PhaseModel;
 
@@ -608,6 +608,13 @@ fn simulate_legacy(
              {} mm slices)", p.slice_offsets.len(), ph.grid.dims[2] as f64 * pv[2], p.voxel_size_mm[2]));
     }
     let slice_offsets: Vec<f64> = if res3d.is_some() { vec![0.0; nz] } else { p.slice_offsets.clone() };
+    // P10: a timed trajectory covers every time this series queries it at, checked before anything
+    // is simulated (the protocol rows' clock; a 3D readout queries each volume's first segment)
+    let row_t: Vec<f64> = p.rows.iter().map(|r| r.t).collect();
+    if let Some(m) = p.motion.as_ref() {
+        let per_shot = m.sampling.per_shot() && res3d.is_none();
+        m.check_timed_coverage(&shots::query_times(&p.row_start, &row_t, &slice_offsets, per_shot))?;
+    }
     let dv = p.voxel_size_mm;
     let sim_vox = [dv[0] / o as f64, dv[1] / o as f64, dv[2]];
     let off = corner_offset(&ph.grid, &acq_grid)?;
@@ -1202,10 +1209,10 @@ fn simulate_legacy(
     let mut spin_history_merges: Option<u64> = None;
     if let (Some(m), Some(seed)) = (&p.motion, motion_seed) {
         let v2w = sim_grid.voxel_to_world;
-        poses = resolve_poses(&m.mode, n, seed);
+        // a timed trajectory's pose at each volume's first shot (P10), else the mode's poses
+        poses = m.volume_poses(&shots::reference_times(&p.row_start, &row_t), seed);
         if m.shot_path {
             // P9 part A: one resampling per shot, by the pose at its own time and its jumps
-            let row_t: Vec<f64> = p.rows.iter().map(|r| r.t).collect();
             let plan = shots::shot_plan(m, &poses, &p.row_start, &row_t, &slice_offsets, &sim_grid,
                                         |n_shots| draw_events(m.within.as_ref(), n, n_shots, seed));
             dropped = shots::apply(&plan, &mut images, &sim_grid, n);
@@ -1964,6 +1971,79 @@ mod tests {
         }
         assert!(moved, "the jump must move something");
         let _ = (slab, std::fs::remove_dir_all(&dir));
+    }
+
+    // ------------------------------------------------------------------ P10
+
+    /// A timed trajectory whose samples are the untimed rows at each volume's first shot, plus one
+    /// at the last shot holding the last pose (coverage), is P9's run bit for bit: the same nodes,
+    /// the same cells read with the same arithmetic. Under "volume", "slice"/"shot", and with spin
+    /// history.
+    #[test]
+    fn a_timed_trajectory_on_the_untimed_nodes_is_the_untimed_run() {
+        let ph = phantom();
+        let s = sidecar([1.0, 1.0, 1.0], 6);
+        let rows = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.3, 0.0, 1.5, 0.0, 0.0, 0.02],
+                    [0.0, -0.4, 2.5, 0.03, 0.0, 0.0], [0.1, 0.0, 0.5, 0.0, -0.01, 0.0]];
+        let (dir, untimed) = write_trajectory(&rows);
+        let cells = |r: &[f64; 6]| r.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("\t");
+        let p0 = protocol_from(&s, "control,label,control,label", "[acquisition]\noversample = 1\n");
+        let refs: Vec<f64> = p0.row_start.iter().zip(&p0.rows).map(|(a, r)| a + r.t).collect();
+        let last_shot = refs[3] + p0.slice_offsets.iter().cloned().fold(0.0, f64::max);
+        let mut text = String::from("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+        for (t, r) in refs.iter().zip(&rows) {
+            text.push_str(&format!("{t}\t{}\n", cells(r)));
+        }
+        text.push_str(&format!("{last_shot}\t{}\n", cells(&rows[3])));
+        let timed_tsv = dir.join("timed.tsv");
+        std::fs::write(&timed_tsv, text).unwrap();
+        let timed = timed_tsv.to_string_lossy().replace('\\', "\\\\");
+        for (untimed_extra, timed_extra) in [("", ""),
+                                             ("within_volume_sampling = \"slice\"\n", "within_volume_sampling = \"shot\"\n"),
+                                             ("within_volume_sampling = \"slice\"\nspin_history = true\n",
+                                              "within_volume_sampling = \"shot\"\nspin_history = true\n")] {
+            let ov = |path: &str, extra: &str| format!(
+                "[acquisition]\noversample = 1\n[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\n{extra}");
+            let a = protocol_from(&s, "control,label,control,label", &ov(&untimed, untimed_extra));
+            let b = protocol_from(&s, "control,label,control,label", &ov(&timed, timed_extra));
+            assert!(a.motion.as_ref().unwrap().timed.is_none() && b.motion.as_ref().unwrap().timed.is_some());
+            let (oa, ob) = (simulate(&a, &ph, T2Mode::Class, &no_phase()).unwrap(), simulate(&b, &ph, T2Mode::Class, &no_phase()).unwrap());
+            assert_eq!(oa.poses, ob.poses, "{timed_extra:?}: the volume poses");
+            if let (Some(pa), Some(pb)) = (&oa.shots, &ob.shots) {
+                assert_eq!(pa.transforms, pb.transforms, "{timed_extra:?}: the shot transforms");
+            }
+            assert_eq!(oa.shots.is_some(), ob.shots.is_some());
+            assert!(oa.mag.iter().zip(&ob.mag).all(|(x, y)| x.to_bits() == y.to_bits()), "{timed_extra:?}: magnitude");
+            assert_eq!(oa.ground_truth.spin_history, ob.ground_truth.spin_history);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Coverage is over the queried set: a trace ending at the last volume's first shot covers one
+    /// pose per volume and not one per shot, and the refusal names both spans; it comes from the
+    /// series, before the signal stage.
+    #[test]
+    fn timed_coverage_is_over_the_sampling_query_set() {
+        let ph = phantom();
+        let s = sidecar([1.0, 1.0, 1.0], 6);
+        let p0 = protocol_from(&s, "control,label", "[acquisition]\noversample = 1\n");
+        let refs: Vec<f64> = p0.row_start.iter().zip(&p0.rows).map(|(a, r)| a + r.t).collect();
+        let dir = std::env::temp_dir().join(format!("aslscan-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tsv = dir.join("trace.tsv");
+        std::fs::write(&tsv, format!("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n{}\t0\t0\t0\t0\t0\t0\n{}\t0\t0\t1\t0\t0\t0\n",
+                                     refs[0], refs[1])).unwrap();
+        let path = tsv.to_string_lossy().replace('\\', "\\\\");
+        let ov = |extra: &str| format!("[acquisition]\noversample = 1\n[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\n{extra}");
+        let vol = protocol_from(&s, "control,label", &ov(""));
+        let out = simulate(&vol, &ph, T2Mode::Class, &no_phase()).unwrap();
+        assert_eq!(out.poses[1].trans_mm, [0.0, 0.0, 1.0]);
+        let shot = protocol_from(&s, "control,label", &ov("within_volume_sampling = \"shot\"\n"));
+        let t0 = std::time::Instant::now();
+        let e = simulate(&shot, &ph, T2Mode::Class, &no_phase()).unwrap_err();
+        assert!(e.contains("never extrapolated") && e.contains(&format!("spans {} s to {} s", refs[0], refs[1])), "{e}");
+        assert!(t0.elapsed().as_secs_f64() < 0.5, "refused before the signal stage ({:?})", t0.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ------------------------------------------------------------------ P9 part B

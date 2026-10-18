@@ -67,7 +67,7 @@ mod writer {
     use super::{aslcontext_tsv, ground_truth_tail, Names};
     use crate::phantom::T2Mode;
     use crate::bolus::Region;
-    use crate::protocol::{M0Type, Protocol, QuantitySource, SuppressionModel, WithinVolumeSampling, COMPAT_PINNED};
+    use crate::protocol::{M0Type, Protocol, QuantitySource, SuppressionModel, COMPAT_PINNED};
     use crate::resample::GridOrigin;
     use crate::series::{LookLockerSeries, SeriesOutput};
 
@@ -215,21 +215,44 @@ mod writer {
             if m.shot_path {
                 let obj = block.as_object_mut().expect("an object");
                 obj.insert("Path".into(), json!("shot"));
-                obj.insert("WithinVolumeSampling".into(), json!(match m.sampling {
-                    WithinVolumeSampling::Volume => "volume",
-                    WithinVolumeSampling::Slice => "slice",
-                }));
+                obj.insert("WithinVolumeSampling".into(), json!(m.sampling.as_str()));
                 if let Some(f) = m.within.as_ref().and_then(|w| w.events_file.as_ref()) {
                     obj.insert("EventsFile".into(), json!(f.path));
                     obj.insert("WithinVolume".into(), json!({ "EventsFile": f.path, "Events": out.events.len() }));
                 }
-                obj.insert("ShotTransform".into(), json!(
+                obj.insert("ShotTransform".into(), json!(if m.timed.is_some() {
+                    "Q = J . P as world-space matrices about the field-of-view centre: P the timed trajectory's pose at \
+                     the shot's time (within_volume_sampling \"shot\" or \"slice\"), or at the volume's first shot \
+                     (\"volume\"), linear in the six parameters between its samples; J the summed jumps of the volume's \
+                     events up to the shot. Each shot's slices are resampled once."
+                } else {
                     "Q = J . P as world-space matrices about the field-of-view centre: P the volume's pose, or the \
                      trajectory through the volumes' poses placed at their first shots, linear in the six parameters \
                      (within_volume_sampling = \"slice\"); J the summed jumps of the volume's events up to the shot. \
-                     Each shot's slices are resampled once."));
+                     Each shot's slices are resampled once."
+                }));
                 if let Some(gt) = obj.get_mut("GroundTruth").and_then(Value::as_array_mut) {
                     gt.insert(2, json!("desc-motionShots_gt.tsv (each shot's composed pose, rotations in radians)"));
+                }
+            }
+            // P10: a timed trajectory's block, written only for one (an untimed run's block is unchanged)
+            if let Some(t) = &m.timed {
+                let obj = block.as_object_mut().expect("an object");
+                let tr = &t.trace;
+                obj.insert("Trajectory".into(), json!({
+                    "File": t.path,
+                    "Timed": true,
+                    "Clock": format!("{}; seconds on the acquisition clock, 0 = the start of the first acquisition", t.clock),
+                    "Samples": tr.times.len(),
+                    "Span": [tr.times[0], tr.times[tr.times.len() - 1]],
+                    "MaxSampleInterval": tr.max_interval(),
+                    "MinShotSpacing": crate::series::shots::min_shot_spacing(p),
+                    "Sampling": if m.sampling.per_shot() { "the trace's pose at each shot's time" }
+                                else { "the trace's pose at each volume's first shot" },
+                    "Interpolation": "linear in the six parameters between samples; never extrapolated",
+                }));
+                if !m.shot_path {
+                    obj.insert("VolumePose".into(), json!("each volume's pose is the timed trajectory's at its first shot"));
                 }
             }
             // P9 part B

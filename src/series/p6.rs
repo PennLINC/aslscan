@@ -290,6 +290,15 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
              {} mm slices)", p.slice_offsets.len(), ph.grid.dims[2] as f64 * pv[2], p.voxel_size_mm[2]));
     }
     let slice_offsets: Vec<f64> = if res3d.is_some() { vec![0.0; nz] } else { p.slice_offsets.clone() };
+    // P10: the raw volumes' clock (under Hadamard, H raw volumes per cycle, not the rows): each raw
+    // volume's first preparation and signal time; a timed trajectory must cover every time it is
+    // queried at, checked before anything is simulated
+    let raw_starts: Vec<f64> = sched.raws.iter().map(|r| sched.preps[r.prep].start_s).collect();
+    let raw_t: Vec<f64> = sched.raw_rows.iter().map(|r| r.t).collect();
+    if let Some(m) = p.motion.as_ref() {
+        let per_shot = m.sampling.per_shot() && res3d.is_none();
+        m.check_timed_coverage(&super::shots::query_times(&raw_starts, &raw_t, &slice_offsets, per_shot))?;
+    }
     let dv = p.voxel_size_mm;
     let sim_vox = [dv[0] / o as f64, dv[1] / o as f64, dv[2]];
     let off = corner_offset(&ph.grid, &acq_grid)?;
@@ -1184,12 +1193,11 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
     let mut gt_moved: Option<Vec<f32>> = None;
     if let (Some(m), Some(seed)) = (&p.motion, motion_seed) {
         let v2w = sim_grid.voxel_to_world;
-        poses = resolve_poses(&m.mode, n, seed);
+        // a timed trajectory's pose at each raw volume's first shot (P10), else the mode's poses
+        poses = m.volume_poses(&super::shots::reference_times(&raw_starts, &raw_t), seed);
         if m.shot_path {
             // P9 part A, on the raw volumes and their own clock
-            let starts: Vec<f64> = (0..n).map(|v| first_prep(v).start_s).collect();
-            let row_t: Vec<f64> = rows.iter().map(|r| r.t).collect();
-            let plan = super::shots::shot_plan(m, &poses, &starts, &row_t, &slice_offsets, &sim_grid,
+            let plan = super::shots::shot_plan(m, &poses, &raw_starts, &raw_t, &slice_offsets, &sim_grid,
                                                |n_shots| draw_events(m.within.as_ref(), n, n_shots, seed));
             dropped = super::shots::apply(&plan, &mut images, &sim_grid, n);
             if let Some(to) = tissue_only.as_mut() {
@@ -2314,6 +2322,61 @@ mod tests {
         }
         assert_eq!(out.dropped.len(), 2 * n);
         assert!(out.dropped.iter().all(|d| d.slices.len() == 1 && d.volume < n));
+    }
+
+    /// P10: a timed trajectory under Hadamard, two cycles after an included m0scan, is queried on
+    /// the raw volumes' clock (H raw volumes per cycle, not the H - 1 decoded rows): each raw
+    /// volume's pose is the trace at its first shot, each shot's at its own time, and a trace that
+    /// ends before the last raw acquisition is refused.
+    #[test]
+    fn hadamard_timed_trajectory_uses_the_raw_volumes_clock() {
+        let ph = crop();
+        let order = 4;
+        let n_sub = order - 1;
+        let (mut ld, mut pld, mut tr) = (vec![0.0], vec![0.0], vec![6.0]);
+        for _cycle in 0..2 {
+            for j in 0..n_sub {
+                ld.push(TAU);
+                pld.push(PLD + TAU * (n_sub - 1 - j) as f64);
+                tr.push(4.0);
+            }
+        }
+        let mut s = sidecar(ld, pld, tr, "Included", true);
+        s["SliceTiming"] = json!([0.0, 0.05]);
+        let ctx = format!("volume_type\nm0scan\n{}", "deltam\n".repeat(2 * n_sub));
+        let dir = std::env::temp_dir().join(format!("aslscan-p6-timed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |end: f64, sampling: &str| {
+            let tsv = dir.join(format!("trace-{end}.tsv"));
+            // a ramp in z, 0 to 4 mm over [0, end]
+            std::fs::write(&tsv, format!("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n0\t0\t0\t0\t0\t0\t0\n{end}\t0\t0\t4\t0\t0\t0\n")).unwrap();
+            let path = tsv.to_string_lossy().replace('\\', "\\\\");
+            let ov = overlay(&format!("[hadamard]\norder = {order}\n[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\n\
+                                       within_volume_sampling = \"{sampling}\"\n"), true);
+            let p = parse_echoes(&[s.clone()], &ctx, Some(&ov), None).unwrap();
+            simulate_p6(&p, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).map(|o| (p, o))
+        };
+        let (p, out) = run(200.0, "shot").unwrap();
+        let sched = Schedule::new(&p);
+        let n = sched.raw_rows.len();
+        assert_eq!(n, 1 + 2 * order, "an m0scan and two encoding cycles of raw volumes");
+        let z = |t: f64| 4.0 * t / 200.0;
+        let plan = out.shots.as_ref().unwrap();
+        for v in 0..n {
+            let first = sched.preps[sched.raws[v].prep].start_s + sched.raw_rows[v].t;
+            assert!((out.poses[v].trans_mm[2] - z(first)).abs() < 1e-12, "raw volume {v}");
+            for s in 0..2 {
+                let q = plan.pose(v, s);
+                assert!((plan.times[v][s] - first - 0.05 * s as f64).abs() < 1e-12);
+                assert!((q.trans_mm[2] - z(plan.times[v][s])).abs() < 1e-9, "raw volume {v}, shot {s}: {q:?}");
+            }
+        }
+        // a trace ending before the last raw volume's second shot: fine for one pose per volume, not per shot
+        let last = sched.preps[sched.raws[n - 1].prep].start_s + sched.raw_rows[n - 1].t;
+        assert!(run(last + 0.01, "volume").is_ok());
+        let e = run(last + 0.01, "shot").map(|_| ()).unwrap_err();
+        assert!(e.contains("never extrapolated"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Review fixes: a 3D Hadamard raw volume's kinetic truth is static under volume motion (its

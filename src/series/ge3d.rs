@@ -536,6 +536,15 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
     // ---- the schedule, its suppression, its trains and the tissue timeline ----
     let sched = Schedule::new(p);
     let n = sched.raw_rows.len();
+    // P10: each raw volume's reference time, its first segment's first excitation (the train starts
+    // at the row's signal time after its preparation); a timed trajectory must cover them, checked
+    // before anything is simulated
+    let raw_starts: Vec<f64> = sched.raws.iter().map(|r| sched.preps[r.prep].start_s).collect();
+    let raw_t: Vec<f64> = sched.raw_rows.iter().map(|r| r.t).collect();
+    let ref_times = super::shots::reference_times(&raw_starts, &raw_t);
+    if let Some(m) = p.motion.as_ref() {
+        m.check_timed_coverage(&ref_times)?;
+    }
     let ge = p.ge.as_ref().expect("epi3d is gradient echo");
     // the separate M0's excitation: Look-Locker's [m0] flip_angle, else the series'
     let flip_deg = p.look_locker.as_ref().and_then(|l| l.m0_flip_deg).map_or(ge.flip_deg, |f| f.0);
@@ -625,7 +634,7 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
     let mut poses = vec![Pose::IDENTITY; n];
     let mut events = Vec::new();
     if let (Some(m), Some(seed)) = (&p.motion, motion_seed) {
-        poses = resolve_poses(&m.mode, n, seed);
+        poses = m.volume_poses(&ref_times, seed);
         events = draw_events(m.within.as_ref(), n, n_shots, seed);
     }
     let mut shot_pose = vec![vec![Pose::IDENTITY; n_shots]; n];

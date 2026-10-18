@@ -15,7 +15,7 @@ use std::path::Path;
 
 use mrsim_acq::kspace::{Acquisition, EchoFormation, KspaceWindow, PartialFourierMode};
 use mrsim_acq::kspace3d::KzPartialFourierRecon;
-use mrsim_acq::motion::{load_motion_tsv, MotionMode};
+use mrsim_acq::motion::{has_time_column, load_motion_trace, load_motion_tsv, resolve_poses, MotionMode, Pose, Sampling, Trace};
 use mrsim_acq::readout::{
     centre_echo, check_ge3d_timing, check_grase_timing, check_spiral_timing, esp_from_echo_time, ge3d_lines, grase_block,
     grase_lines, spiral_centre_echo, spiral_esp_from_echo_time, spiral_lines, EchoTrain, ExcitationTrain, Ge3dReadout, KzOrder,
@@ -395,7 +395,10 @@ pub struct MotionOverlay {
     /// `off` (default) | `trajectory` | `random` | `linear`.
     pub mode: Option<String>,
     /// TSV path (confounds format: `trans_x/y/z` mm, `rot_x/y/z` **radians**), one row per
-    /// volume; relative to the overlay file when read through [`load`].
+    /// volume; relative to the overlay file when read through [`load`]. Timed (P10) when it has a
+    /// `time` column (s) or a sidecar at the same path with `.json` holding `SamplingFrequency`
+    /// (and optionally `StartTime`): then its rows are samples on the acquisition clock, not
+    /// volumes.
     pub trajectory: Option<String>,
     /// Per-axis amplitudes (mm) for `random` and `linear`.
     pub trans_mm: Option<[f64; 3]>,
@@ -403,8 +406,9 @@ pub struct MotionOverlay {
     pub rot_deg: Option<[f64; 3]>,
     /// The volumes `random`/`linear` affect; default all.
     pub volumes: Option<Vec<usize>>,
-    /// `"volume"` (default: every shot of a volume has the volume's pose) or `"slice"` (each shot
-    /// has the trajectory's pose at its own excitation time; P9 part A). 2D readouts only.
+    /// `"volume"` (default: every shot of a volume has the volume's pose), `"shot"` (each shot has
+    /// the trajectory's pose at its own excitation time; P10) or `"slice"`, its 2D synonym (P9
+    /// part A).
     pub within_volume_sampling: Option<String>,
     /// Spin history of the tissue under through-plane motion (P9 part B); default false.
     pub spin_history: Option<bool>,
@@ -699,18 +703,46 @@ pub struct FileEvent {
     pub jump_deg: [f64; 3],
 }
 
-/// How a volume's shots get their poses (P9 part A).
+/// How a volume's shots get their poses (P9 part A, P10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WithinVolumeSampling {
     /// Every shot has the volume's pose (P3).
     Volume,
-    /// Each shot has the trajectory's pose at its own excitation time.
+    /// Each shot has the trajectory's pose at its own excitation time (P9's spelling, 2D).
     Slice,
+    /// The same as `Slice` in 2D, kept apart so the sidecar records the spelling given (P10).
+    Shot,
+}
+
+impl WithinVolumeSampling {
+    /// Whether each shot has its own pose (`"slice"` or `"shot"`).
+    pub fn per_shot(self) -> bool {
+        self != WithinVolumeSampling::Volume
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WithinVolumeSampling::Volume => "volume",
+            WithinVolumeSampling::Slice => "slice",
+            WithinVolumeSampling::Shot => "shot",
+        }
+    }
+}
+
+/// A timed trajectory (P10): the trace, its file, and where its clock came from.
+#[derive(Debug, Clone)]
+pub struct TimedTrajectory {
+    pub path: String,
+    pub trace: Trace,
+    /// `"time column"` or `"sidecar SamplingFrequency"`.
+    pub clock: &'static str,
 }
 
 /// The resolved motion request.
 #[derive(Debug, Clone)]
 pub struct MotionSpec {
+    /// `MotionMode::Off` for a timed trajectory, whose poses come from [`MotionSpec::timed`]: read
+    /// the per-volume poses through [`MotionSpec::volume_poses`], never `resolve_poses` directly.
     pub mode: MotionMode,
     /// The overlay's mode name, for the sidecar.
     pub mode_name: String,
@@ -720,6 +752,28 @@ pub struct MotionSpec {
     pub shot_path: bool,
     /// P9 part B: the tissue is corrected for spin history (implies the shot path).
     pub spin_history: bool,
+    /// P10: a trajectory with its own clock.
+    pub timed: Option<TimedTrajectory>,
+}
+
+impl MotionSpec {
+    /// Each motion unit's pose: a timed trajectory's pose at the unit's reference time (its first
+    /// shot), otherwise the mode's poses (`resolve_poses`, one per entry of `reference_times`).
+    pub fn volume_poses(&self, reference_times: &[f64], seed: u64) -> Vec<Pose> {
+        match &self.timed {
+            Some(t) => reference_times.iter().map(|&x| t.trace.pose_at(x)).collect(),
+            None => resolve_poses(&self.mode, reference_times.len(), seed),
+        }
+    }
+
+    /// A timed trajectory covers every time the run queries it at (`times`, the series' own
+    /// clock); untimed motion has nothing to check.
+    pub fn check_timed_coverage(&self, times: &[f64]) -> Result<(), String> {
+        match &self.timed {
+            Some(t) => t.trace.check_covers(times, &format!("overlay motion.trajectory {}", t.path)),
+            None => Ok(()),
+        }
+    }
 }
 
 /// One Hadamard encoding cycle (P6 addendum, part A): its `deltam` rows, in sub-bolus order.
@@ -1217,6 +1271,7 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, sc: &ShotContext) -> Resu
     if mode_name != "trajectory" && m.trajectory.is_some() {
         return Err(format!("overlay: motion.trajectory is only read with mode = \"trajectory\" (mode is {mode_name:?})"));
     }
+    let mut timed: Option<TimedTrajectory> = None;
     let mode = match mode_name.as_str() {
         "off" => MotionMode::Off,
         "random" | "linear" => {
@@ -1234,13 +1289,27 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, sc: &ShotContext) -> Resu
         "trajectory" => {
             let path = m.trajectory.as_ref()
                 .ok_or("overlay: motion.mode \"trajectory\" needs motion.trajectory, a TSV path")?;
-            check_motion_tsv(path)?;
-            let poses = load_motion_tsv(Path::new(path)).map_err(|e| format!("overlay motion.trajectory {path}: {e}"))?;
-            if poses.len() != n {
-                return Err(format!(
-                    "overlay motion.trajectory {path} has {} rows but the series has {n} volumes", poses.len()));
+            // P10: timed (a time column or a sidecar sampling rate) or untimed, decided before reading
+            let sampling = trace_sidecar_sampling(path)?;
+            let column = has_time_column(Path::new(path)).map_err(|e| format!("overlay motion.trajectory {path}: {e}"))?;
+            if sampling.is_some() || column {
+                let trace = load_motion_trace(Path::new(path), sampling)
+                    .map_err(|e| format!("overlay motion.trajectory {e}"))?;
+                timed = Some(TimedTrajectory {
+                    path: path.clone(),
+                    trace,
+                    clock: if column { "time column" } else { "sidecar SamplingFrequency" },
+                });
+                MotionMode::Off
+            } else {
+                check_motion_tsv(path)?;
+                let poses = load_motion_tsv(Path::new(path)).map_err(|e| format!("overlay motion.trajectory {path}: {e}"))?;
+                if poses.len() != n {
+                    return Err(format!(
+                        "overlay motion.trajectory {path} has {} rows but the series has {n} volumes", poses.len()));
+                }
+                MotionMode::Trajectory { poses }
             }
-            MotionMode::Trajectory { poses }
         }
         other => return Err(format!("overlay: motion.mode {other:?}: expected off | trajectory | random | linear")),
     };
@@ -1248,19 +1317,25 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, sc: &ShotContext) -> Resu
     let sampling = match m.within_volume_sampling.as_deref().map(str::to_ascii_lowercase).as_deref() {
         None | Some("volume") => WithinVolumeSampling::Volume,
         Some("slice") => WithinVolumeSampling::Slice,
+        Some("shot") => WithinVolumeSampling::Shot,
         Some(other) => {
-            return Err(format!("overlay: motion.within_volume_sampling {other:?}: expected \"volume\" or \"slice\""))
+            return Err(format!(
+                "overlay: motion.within_volume_sampling {other:?}: expected \"volume\", \"shot\" or \"slice\""))
         }
     };
-    if sampling == WithinVolumeSampling::Slice {
-        if is_3d {
+    if sampling.per_shot() {
+        if is_3d && sampling == WithinVolumeSampling::Slice {
             return Err("overlay: motion.within_volume_sampling = \"slice\" is for 2D readouts (a 3D readout has no \
-                        slice timing)".to_string());
+                        slice timing); \"shot\" names a pose per readout segment".to_string());
+        }
+        if is_3d {
+            return Err("overlay: motion.within_volume_sampling = \"shot\" on a 3D readout (a pose per readout \
+                        segment) is not supported yet".to_string());
         }
         if mode_name == "random" {
-            return Err("overlay: motion.within_volume_sampling = \"slice\" with mode = \"random\": random poses are \
-                        impulses that return to baseline, and interpolating between them would invent ramps"
-                .to_string());
+            return Err(format!(
+                "overlay: motion.within_volume_sampling = {:?} with mode = \"random\": random poses are impulses that \
+                 return to baseline, and interpolating between them would invent ramps", sampling.as_str()));
         }
     }
     let events_requested = m.within_volume.as_ref().is_some_and(|w| w.events.is_some());
@@ -1276,7 +1351,7 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, sc: &ShotContext) -> Resu
         return Err("overlay: motion.spin_history is for 2D readouts (one slab excitation has no slice history)".to_string());
     }
     let shot_path = !is_3d
-        && (sampling == WithinVolumeSampling::Slice || events_requested || single_band_events || !sc.mb_schedule_ok
+        && (sampling.per_shot() || events_requested || single_band_events || !sc.mb_schedule_ok
             || spin_history);
     if shot_path {
         if sc.look_locker {
@@ -1330,14 +1405,38 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, sc: &ShotContext) -> Resu
             }
         }
     };
-    if matches!(mode, MotionMode::Off) && within.is_none() {
+    // a timed trajectory holds MotionMode::Off as a placeholder: it is motion all the same
+    if matches!(mode, MotionMode::Off) && within.is_none() && timed.is_none() {
         if spin_history {
             return Err("overlay: motion.spin_history needs motion to have a history of: a mode other than \"off\" \
                         or within-volume events".to_string());
         }
         return Ok(None);
     }
-    Ok(Some(MotionSpec { mode, mode_name, within, sampling, shot_path, spin_history }))
+    Ok(Some(MotionSpec { mode, mode_name, within, sampling, shot_path, spin_history, timed }))
+}
+
+/// P10: the sampling clock in a trajectory's sidecar (the same path with `.json`): its
+/// `SamplingFrequency` (Hz) and `StartTime` (s, default 0), the BIDS physio convention. `None`
+/// without a sidecar or without `SamplingFrequency` (fMRIPrep's confounds JSON describes columns,
+/// not a clock), so an untimed trajectory reads as it always has.
+fn trace_sidecar_sampling(path: &str) -> Result<Option<Sampling>, String> {
+    let side = Path::new(path).with_extension("json");
+    if !side.is_file() {
+        return Ok(None);
+    }
+    let what = format!("overlay motion.trajectory sidecar {}", side.display());
+    let text = std::fs::read_to_string(&side).map_err(|e| format!("{what}: {e}"))?;
+    let v: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("{what}: {e} (it decides whether the trajectory is timed, so it must be valid JSON)"))?;
+    let Some(f) = v.get("SamplingFrequency") else { return Ok(None) };
+    let num = |key: &str, x: &Value| x.as_f64().ok_or_else(|| format!("{what}: {key} {x} is not a number"));
+    let frequency_hz = num("SamplingFrequency", f)?;
+    let start_s = match v.get("StartTime") {
+        Some(s) => num("StartTime", s)?,
+        None => 0.0,
+    };
+    Ok(Some(Sampling { frequency_hz, start_s }))
 }
 
 /// P9 part B: spin history needs a series the closed form describes exactly when nothing moves (a
@@ -4415,8 +4514,8 @@ mod tests {
         let p = parse(&base(), CTX, Some(&mo(&format!("{drift}within_volume_sampling = \"slice\"\n"))), None).unwrap();
         let m = p.motion.as_ref().unwrap();
         assert!(m.shot_path && m.sampling == WithinVolumeSampling::Slice);
-        let e = parse(&base(), CTX, Some(&mo(&format!("{drift}within_volume_sampling = \"shot\"\n"))), None).unwrap_err();
-        assert!(e.contains("\"shot\""), "{e}");
+        let e = parse(&base(), CTX, Some(&mo(&format!("{drift}within_volume_sampling = \"segment\"\n"))), None).unwrap_err();
+        assert!(e.contains("\"segment\"") && e.contains("\"shot\""), "{e}");
         let e = parse(&base(), CTX, Some(&mo("mode = \"random\"\ntrans_mm = [1, 0, 0]\nwithin_volume_sampling = \"slice\"\n")), None)
             .unwrap_err();
         assert!(e.contains("random") && e.contains("impulses"), "{e}");
@@ -4443,6 +4542,73 @@ mod tests {
         let e = overlay_motion(ov.motion.as_ref(), 4, &ctx(1, true)).unwrap_err();
         assert!(e.contains("LookLocker"), "{e}");
         assert!(!overlay_motion(ov.motion.as_ref(), 4, &ctx(2, true)).unwrap().unwrap().shot_path);
+    }
+
+    // ------------------------------------------------------------------ P10
+
+    #[test]
+    fn timed_trajectories_are_told_from_untimed_ones() {
+        let mo = |extra: &str| overlay(&format!("[motion]\n{extra}[m0]\nrepetition_time = 8.0\n"));
+        let dir = std::env::temp_dir().join(format!("aslscan-timed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = "trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z";
+        let traj = |name: &str, body: &str, sidecar: Option<&str>, extra: &str| {
+            let tsv = dir.join(format!("{name}.tsv"));
+            std::fs::write(&tsv, body).unwrap();
+            let side = dir.join(format!("{name}.json"));
+            match sidecar {
+                Some(s) => std::fs::write(&side, s).unwrap(),
+                None => { let _ = std::fs::remove_file(&side); }
+            }
+            let path = tsv.to_string_lossy().replace('\\', "\\\\");
+            parse(&base(), CTX, Some(&mo(&format!("mode = \"trajectory\"\ntrajectory = \"{path}\"\n{extra}"))), None)
+        };
+        // a time column: timed, any number of rows, mode held as Off, the sidecar names the mode
+        let body = format!("time\t{h}\n0\t0\t0\t0\t0\t0\t0\n5\t0\t0\t1\t0\t0\t0\n10\t0\t0\t2\t0\t0\t0\n");
+        let p = traj("col", &body, None, "").unwrap();
+        let m = p.motion.as_ref().unwrap();
+        let t = m.timed.as_ref().expect("timed");
+        assert_eq!((t.trace.times.clone(), t.clock), (vec![0.0, 5.0, 10.0], "time column"));
+        assert!(matches!(m.mode, MotionMode::Off) && m.mode_name == "trajectory" && !m.shot_path);
+        // the volume poses are the trace at the reference times; untimed ones come from the mode
+        let poses = m.volume_poses(&[0.0, 2.5, 5.0, 7.5], 1);
+        assert_eq!(poses.iter().map(|q| q.trans_mm[2]).collect::<Vec<_>>(), vec![0.0, 0.5, 1.0, 1.5]);
+        assert!(m.check_timed_coverage(&[0.0, 10.0]).is_ok());
+        let e = m.check_timed_coverage(&[0.0, 10.5]).unwrap_err();
+        assert!(e.contains("col.tsv") && e.contains("10.5 s") && e.contains("spans 0 s to 10 s"), "{e}");
+        // a sidecar SamplingFrequency (and StartTime, and an escaped key): timed
+        let rows = format!("{h}\n0\t0\t0\t0\t0\t0\n0\t0\t1\t0\t0\t0\n0\t0\t2\t0\t0\t0\n");
+        let p = traj("side", &rows, Some(r#"{"SamplingFrequency": 2, "StartTime": -0.5}"#), "").unwrap();
+        let t = p.motion.as_ref().unwrap().timed.clone().expect("timed");
+        assert_eq!((t.trace.times, t.clock), (vec![-0.5, 0.0, 0.5], "sidecar SamplingFrequency"));
+        // a sidecar without SamplingFrequency (fMRIPrep's confounds JSON): untimed, rows are volumes
+        let four = format!("{h}\n0\t0\t0\t0\t0\t0\n0\t0\t1\t0\t0\t0\n0\t0\t2\t0\t0\t0\n0\t0\t3\t0\t0\t0\n");
+        let p = traj("conf", &four, Some(r#"{"trans_x": {"Units": "mm"}}"#), "").unwrap();
+        let m = p.motion.as_ref().unwrap();
+        assert!(m.timed.is_none() && matches!(&m.mode, MotionMode::Trajectory { poses } if poses.len() == 4));
+        let e = traj("conf3", &rows, Some(r#"{"trans_x": {}}"#), "").unwrap_err();
+        assert!(e.contains("3 rows") && e.contains("4 volumes"), "{e}");
+        // untimed cells stay as lenient as before (n/a); timed ones are strict
+        assert!(traj("na", &four.replace("0\t0\t3", "n/a\tn/a\t3"), None, "").is_ok());
+        let e = traj("strict", &format!("time\t{h}\n0\t0\t0\t0\t0\t0\t0\n1\tabc\t0\t0\t0\t0\t0\n"), None, "").unwrap_err();
+        assert!(e.contains("trans_x") && e.contains("abc"), "{e}");
+        // two clocks; a broken sidecar; a non-numeric rate
+        let e = traj("both", &body, Some(r#"{"SamplingFrequency": 10}"#), "").unwrap_err();
+        assert!(e.contains("two clocks"), "{e}");
+        let e = traj("broken", &four, Some("{not json"), "").unwrap_err();
+        assert!(e.contains("valid JSON"), "{e}");
+        let e = traj("word", &rows, Some(r#"{"SamplingFrequency": "fast"}"#), "").unwrap_err();
+        assert!(e.contains("not a number"), "{e}");
+        // "shot" is the 2D synonym of "slice" and takes the shot path; refused with random
+        let p = traj("col", &body, None, "within_volume_sampling = \"shot\"\n").unwrap();
+        let m = p.motion.as_ref().unwrap();
+        assert!(m.shot_path && m.sampling == WithinVolumeSampling::Shot && m.sampling.per_shot());
+        let e = parse(&base(), CTX, Some(&mo("mode = \"random\"\ntrans_mm = [1, 0, 0]\nwithin_volume_sampling = \"shot\"\n")), None)
+            .unwrap_err();
+        assert!(e.contains("\"shot\"") && e.contains("impulses"), "{e}");
+        // spin history accepts a timed trajectory as motion with a history
+        assert!(traj("col", &body, None, "within_volume_sampling = \"shot\"\nspin_history = true\n").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ------------------------------------------------------------------ P9 part B
