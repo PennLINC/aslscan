@@ -71,4 +71,22 @@ check(gap >= 0.1, f"criterion 3: \"shot\" sampling, even slices above odd ones b
 rv = ratios(vol, 12)
 print("      volume 12 slice ratios (timed cosine, volume):", " ".join(f"{x:.2f}" for x in rv))
 
+# criterion 4: 3D GRASE (asl005, four segments, 30 partitions), a step between segments 1 and 2 of
+# volume 1
+import json, os
+if os.path.isdir(f"{out}/grase-step"):
+    gs, gm = load("grase-still"), load("grase-step")
+    diff = np.abs(gm - gs)
+    per_vol = [diff[..., v].max() for v in range(gs.shape[3])]
+    gpeak = np.abs(gs).max()
+    print("      per-volume largest difference / peak:", " ".join(f"{x / gpeak:.2e}" for x in per_vol))
+    check(all(per_vol[v] == 0.0 for v in range(gs.shape[3]) if v != 1), "criterion 4: only volume 1 changes")
+    check(per_vol[1] > 1e-3 * gpeak, f"criterion 4: volume 1 changes ({per_vol[1] / gpeak:.3f} of the peak)")
+    e = (diff[..., 1] ** 2).sum(axis=(0, 1))
+    frac = e.max() / e.sum()
+    print("      volume 1 difference energy per partition:", " ".join(f"{x / e.sum():.2f}" for x in e))
+    check(frac <= 0.5, f"criterion 4: spread over the slab, the largest partition holds {frac:.2f} of the energy (<= 0.5)")
+    m = json.load(open(f"{out}/grase-step/sub-01/perf/sub-01_part-mag_asl.json"))["AslscanSimulation"]["Motion"]
+    check(any("one pose per readout segment" in a for a in m["Approximations"]), "criterion 4: the sidecar names the one-pose-per-segment approximation")
+
 sys.exit(0 if ok else 1)

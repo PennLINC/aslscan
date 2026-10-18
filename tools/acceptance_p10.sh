@@ -52,5 +52,44 @@ run timed-linear "$(overlay timed-linear '[motion]\nmode = "trajectory"\ntraject
 run timed-volume "$(overlay timed-volume '[motion]\nmode = "trajectory"\ntrajectory = "nod-cosine.tsv"\nspin_history = true\n')"
 run timed-shot "$(overlay timed-shot '[motion]\nmode = "trajectory"\ntrajectory = "nod-cosine.tsv"\nwithin_volume_sampling = "shot"\nspin_history = true\n')"
 
+# criterion 4 (Task 7): 3D GRASE, the real asl005 sidecar with its P5 acceptance overlay (four
+# segments per volume, 30 partitions, on work/phantom-3t-z120): a 2 mm through-plane step between
+# segments 1 and 2 of volume 1, back to baseline before volume 2's first segment. A probe run under
+# "shot" with a still trace reads the segment times.
+G=tests/fixtures/protocols/asl005
+GOV=tests/fixtures/protocols/asl005_p5/overlay.toml
+Z120=work/phantom-3t-z120
+run3d() { # name overlay
+  rm -rf "${OUT:?}/$1"
+  local rc=0
+  $BIN --asl-json $G/asl.json --aslcontext $G/aslcontext.tsv --overlay "$2" --phantom $Z120 --out "$OUT/$1" \
+      > "$OUT/$1.log" 2>&1 || rc=$?
+  echo "== $1: exit $rc"
+  if [ $rc -ne 0 ]; then echo "FAIL: $1 exited $rc"; tail -3 "$OUT/$1.log"; FAILED=1; return; fi
+  if ! deno run -A jsr:@bids/validator "$OUT/$1" > "$OUT/$1.validator.txt" 2>&1; then
+    echo "FAIL: $1 does not validate"; grep -iE "error" "$OUT/$1.validator.txt" | head -5; FAILED=1
+  fi
+}
+overlay3d() { # name motion-lines
+  { cat $GOV; printf '\n%b' "$2"; } > "$OUT/$1.toml"
+  echo "$OUT/$1.toml"
+}
+python3 tools/motion_trace.py --rate 10 --duration 400 --out "$OUT/still-trace.tsv" > /dev/null
+run3d grase-still "$(overlay3d grase-still '')"
+run3d grase-probe "$(overlay3d grase-probe '[motion]\nmode = "trajectory"\ntrajectory = "still-trace.tsv"\nwithin_volume_sampling = "shot"\n')"
+python3 - "$OUT" <<'EOF'
+import sys
+out = sys.argv[1]
+rows = [l.split("\t") for l in open(f"{out}/grase-probe/sub-01/perf/ground-truth/sub-01_desc-motionShots_gt.tsv").read().splitlines()[1:]]
+t = {(int(r[0]), int(r[1])): float(r[3]) for r in rows}
+samples = [(0.0, 0.0), (t[1, 1], 0.0), (t[1, 2], 2.0), (t[1, 3], 2.0), (t[2, 0], 0.0), (400.0, 0.0)]
+with open(f"{out}/step-trace.tsv", "w") as f:
+    f.write("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n")
+    for s, z in samples:
+        f.write(f"{s!r}\t0\t0\t{z!r}\t0\t0\t0\n")
+print(f"step: volume 1 segments 2-3 from {t[1, 2]} s, 2 mm through-plane; volume 2 starts at {t[2, 0]} s")
+EOF
+run3d grase-step "$(overlay3d grase-step '[motion]\nmode = "trajectory"\ntrajectory = "step-trace.tsv"\nwithin_volume_sampling = "shot"\n')"
+
 "$HOME/.local/bin/micromamba" run -n rust-trx python tools/acceptance_p10_check.py "$OUT" || FAILED=1
 [ $FAILED = 0 ] && echo "P10 acceptance: all passed" || { echo "P10 acceptance: FAILED"; exit 1; }
