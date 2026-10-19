@@ -2038,7 +2038,7 @@ mod tests {
         let timed_tsv = dir.join("timed.tsv");
         std::fs::write(&timed_tsv, text).unwrap();
         let timed = timed_tsv.to_string_lossy().replace('\\', "\\\\");
-        for (untimed_extra, timed_extra) in [("", ""),
+        for (untimed_extra, timed_extra) in [("", "within_volume_sampling = \"volume\"\n"),
                                              ("within_volume_sampling = \"slice\"\n", "within_volume_sampling = \"shot\"\n"),
                                              ("within_volume_sampling = \"slice\"\nspin_history = true\n",
                                               "within_volume_sampling = \"shot\"\nspin_history = true\n")] {
@@ -2091,7 +2091,7 @@ mod tests {
         let held: Vec<(f64, [f64; 6])> = (0..4).flat_map(|v| [(seg_t(v, 0), pose(v)), (seg_t(v, shots - 1), pose(v))]).collect();
         let held = write("held", &held);
         let ov = |path: &str, extra: &str| format!("{base}[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\n{extra}");
-        let vol = protocol_from(&s, rows, &ov(&held, ""));
+        let vol = protocol_from(&s, rows, &ov(&held, "within_volume_sampling = \"volume\"\n"));
         let seg = protocol_from(&s, rows, &ov(&held, "within_volume_sampling = \"shot\"\n"));
         let (ov_, os) = (simulate(&vol, &ph, T2Mode::Class, &no_phase()).unwrap(), simulate(&seg, &ph, T2Mode::Class, &no_phase()).unwrap());
         assert!(ov_.segment_shots.is_none());
@@ -2131,7 +2131,8 @@ mod tests {
         let tight = protocol_from(&s, rows, &format!("{}[images]\nmax_memory_gib = 1e-9\n", ov(&moved, "within_volume_sampling = \"shot\"\n")));
         let e = simulate(&tight, &ph, T2Mode::Class, &no_phase()).unwrap_err();
         assert!(e.contains("max_memory_gib") && e.contains("segment image sets"), "{e}");
-        let ovl: Overlay = toml::from_str(&format!("{}[images]\nmax_memory_gib = 1.0\n", ov(&moved, ""))).unwrap();
+        let ovl: Overlay = toml::from_str(&format!("{}[images]\nmax_memory_gib = 1.0\n",
+                                                   ov(&moved, "within_volume_sampling = \"volume\"\n"))).unwrap();
         let ctx = "volume_type\ncontrol\nlabel\ncontrol\nlabel\n";
         assert!(parse(&s, ctx, Some(&ovl), ph.params.as_ref()).unwrap_err().contains("max_memory_gib"));
         let ovl: Overlay = toml::from_str(&ov(&moved, "within_volume_sampling = \"slice\"\n")).unwrap();
@@ -2160,7 +2161,7 @@ mod tests {
                                      refs[0], refs[1])).unwrap();
         let path = tsv.to_string_lossy().replace('\\', "\\\\");
         let ov = |extra: &str| format!("[acquisition]\noversample = 1\n[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\n{extra}");
-        let vol = protocol_from(&s, "control,label", &ov(""));
+        let vol = protocol_from(&s, "control,label", &ov("within_volume_sampling = \"volume\"\n"));
         let out = simulate(&vol, &ph, T2Mode::Class, &no_phase()).unwrap();
         assert_eq!(out.poses[1].trans_mm, [0.0, 0.0, 1.0]);
         let shot = protocol_from(&s, "control,label", &ov("within_volume_sampling = \"shot\"\n"));

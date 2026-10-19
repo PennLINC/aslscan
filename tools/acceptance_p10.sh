@@ -49,7 +49,7 @@ run still "$(overlay still '')"
 run events "$(overlay events '[motion]\nspin_history = true\n[motion.within_volume]\nevents = "nod_events.tsv"\n')"
 run timed-linear "$(overlay timed-linear '[motion]\nmode = "trajectory"\ntrajectory = "nod-linear.tsv"\nwithin_volume_sampling = "shot"\nspin_history = true\n')"
 # criterion 3: the cosine nod, one pose per volume against one per shot, spin history on
-run timed-volume "$(overlay timed-volume '[motion]\nmode = "trajectory"\ntrajectory = "nod-cosine.tsv"\nspin_history = true\n')"
+run timed-volume "$(overlay timed-volume '[motion]\nmode = "trajectory"\ntrajectory = "nod-cosine.tsv"\nwithin_volume_sampling = "volume"\nspin_history = true\n')"
 run timed-shot "$(overlay timed-shot '[motion]\nmode = "trajectory"\ntrajectory = "nod-cosine.tsv"\nwithin_volume_sampling = "shot"\nspin_history = true\n')"
 
 # criterion 4 (Task 7): 3D GRASE, the real asl005 sidecar with its P5 acceptance overlay (four

@@ -406,9 +406,9 @@ pub struct MotionOverlay {
     pub rot_deg: Option<[f64; 3]>,
     /// The volumes `random`/`linear` affect; default all.
     pub volumes: Option<Vec<usize>>,
-    /// `"volume"` (default: every shot of a volume has the volume's pose), `"shot"` (each shot has
-    /// the trajectory's pose at its own excitation time; P10) or `"slice"`, its 2D synonym (P9
-    /// part A).
+    /// `"volume"` (every shot of a volume has the volume's pose), `"shot"` (each shot has the
+    /// trajectory's pose at its own excitation time; P10) or `"slice"`, its 2D synonym (P9 part A).
+    /// The default is `"shot"` for a timed trajectory and `"volume"` otherwise.
     pub within_volume_sampling: Option<String>,
     /// Spin history of the tissue under through-plane motion (P9 part B); default false.
     pub spin_history: Option<bool>,
@@ -1318,6 +1318,9 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, sc: &ShotContext) -> Resu
     };
     let is_3d = shots_3d.is_some();
     let sampling = match m.within_volume_sampling.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        // a timed trajectory is sampled at each shot by default: its samples are there to place
+        // motion inside the volumes; "volume" asks for one pose per volume
+        None if timed.is_some() => WithinVolumeSampling::Shot,
         None | Some("volume") => WithinVolumeSampling::Volume,
         Some("slice") => WithinVolumeSampling::Slice,
         Some("shot") => WithinVolumeSampling::Shot,
@@ -4572,7 +4575,12 @@ mod tests {
         let m = p.motion.as_ref().unwrap();
         let t = m.timed.as_ref().expect("timed");
         assert_eq!((t.trace.times.clone(), t.clock), (vec![0.0, 5.0, 10.0], "time column"));
-        assert!(matches!(m.mode, MotionMode::Off) && m.mode_name == "trajectory" && !m.shot_path);
+        assert!(matches!(m.mode, MotionMode::Off) && m.mode_name == "trajectory");
+        // a timed trajectory is sampled per shot unless "volume" is asked for
+        assert!(m.shot_path && m.sampling == WithinVolumeSampling::Shot);
+        let pv = traj("col", &body, None, "within_volume_sampling = \"volume\"\n").unwrap();
+        let mv = pv.motion.as_ref().unwrap();
+        assert!(!mv.shot_path && mv.sampling == WithinVolumeSampling::Volume);
         // the volume poses are the trace at the reference times; untimed ones come from the mode
         let poses = m.volume_poses(&[0.0, 2.5, 5.0, 7.5], 1);
         assert_eq!(poses.iter().map(|q| q.trans_mm[2]).collect::<Vec<_>>(), vec![0.0, 0.5, 1.0, 1.5]);

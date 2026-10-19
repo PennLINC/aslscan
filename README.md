@@ -279,8 +279,9 @@ rot_deg = [1.0, 1.0, 2.0]
 volumes = [5, 20, 40]          # volumes affected (default all)
 trajectory = "motion.tsv"      # "trajectory" mode: trans_x/y/z (mm), rot_x/y/z (radians), one row per volume,
                                # or a timed trace (a time column, or a sidecar SamplingFrequency): see below
-within_volume_sampling = "volume"  # 2D: "volume" (each shot has its volume's pose) or "shot" (the pose at
-                                   # each shot's time; "slice" is the same)
+within_volume_sampling = "shot"    # "volume" (each shot has its volume's pose) or "shot" (the pose at each
+                                   # shot's time; "slice" is its 2D synonym). Default: "shot" for a timed
+                                   # trace, "volume" otherwise
 
 [motion.within_volume]         # shot events: 2D slice groups (single-band or multiband), or segmented-3D shots
 dropout_rate = 0.1
@@ -313,14 +314,16 @@ over a 4.6 s repetition. Each simulator reads it the same way (TRXScan's `--moti
 - **The origin:** times are seconds from the start of the series' first acquisition (the first
   labeling, for a single-delay series). Under Hadamard the clock is the raw acquisitions'. The
   `time` column of `desc-motionShots_gt.tsv` is on the same clock, for checking an alignment.
-- **Sampling:** with `within_volume_sampling = "volume"` each volume takes the trace's pose at its
-  first shot, the view a per-volume tool has of the same motion. With `"shot"`, each shot takes the
-  pose at its own time. The pose between two samples is linear in the six parameters.
+- **Sampling:** by default each shot takes the trace's pose at its own time (`"shot"`); that is
+  what a timed trace is for. With `within_volume_sampling = "volume"` each volume takes the trace's
+  pose at its first shot instead, the view a per-volume tool has of the same motion. The pose
+  between two samples is linear in the six parameters.
 - **Coverage:** the trace must cover every time it is sampled at, or the run is refused before
   anything is simulated. It is never extrapolated.
 - **Composition:** within-volume events compose with it as with an untimed trajectory.
 - **3D readouts:** a segmented 3D readout (GRASE, stack of spirals, the gradient-echo EPI train)
-  reads each segment at its own pose under `"shot"` (`"slice"` is refused there): the trace's pose
+  reads each segment at its own pose under `"shot"`, the default for a timed trace (`"slice"` is
+  refused there): the trace's pose
   at the segment's first excitation, relative to the volume's. Segments at different poses give
   inconsistent k-space lines, which the reconstruction turns into ghosting and blurring through the
   slab. A segment's echo train is still read at one pose. Each distinct segment pose holds a copy of
