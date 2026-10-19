@@ -77,6 +77,8 @@ pub fn shot_plan(m: &MotionSpec, volume_poses: &[Pose], starts: &[f64], signal_t
         None => draw(n_shots),
     };
     let center = fov_center(sim_grid.dims, sim_grid.voxel_to_world);
+    // the trajectory sampled per shot: a timed trace (P10, `Trace::pose_at`), else the volumes' poses
+    // placed at their first shots (P9)
     let node_times: Vec<f64> = times.iter().map(|t| t[0]).collect();
     let mut transforms = vec![vec![IDENTITY_MATRIX; n_shots]; n];
     let mut attenuation = vec![vec![Vec::new(); n_shots]; n];
@@ -92,13 +94,129 @@ pub fn shot_plan(m: &MotionSpec, volume_poses: &[Pose], starts: &[f64], signal_t
             }
             let p = match m.sampling {
                 WithinVolumeSampling::Volume => volume_poses[v],
-                WithinVolumeSampling::Slice => sample_trajectory(&node_times, volume_poses, times[v][s]),
+                WithinVolumeSampling::Slice | WithinVolumeSampling::Shot => match &m.timed {
+                    Some(t) => t.trace.pose_at(times[v][s]),
+                    None => sample_trajectory(&node_times, volume_poses, times[v][s]),
+                },
             };
             let (pm, jm) = (matrix_of(p, center), matrix_of(cum, center));
             transforms[v][s] = if jm == IDENTITY_MATRIX { pm } else if pm == IDENTITY_MATRIX { jm } else { matmul4(&jm, &pm) };
         }
     }
     ShotPlan { schedule, times, transforms, attenuation, events, center }
+}
+
+/// P10: the times a run queries a timed trace at, on the caller's clock (`starts` and `signal_t`
+/// per volume, `offsets` per slice, normalized so the first shot is at 0): each volume's reference
+/// time (its first shot) under one pose per volume, every shot's time under one pose per shot.
+pub fn query_times(starts: &[f64], signal_t: &[f64], offsets: &[f64], per_shot: bool) -> Vec<f64> {
+    let shot_offset: Vec<f64> = if per_shot {
+        slice_schedule_from_times(offsets).iter().map(|s| offsets[s[0]]).collect()
+    } else {
+        vec![0.0]
+    };
+    starts.iter().zip(signal_t).flat_map(|(s, t)| shot_offset.iter().map(move |o| s + t + o)).collect()
+}
+
+/// P10 part C: a 3D readout's segment truth under per-shot sampling: `[unit][segment]` excitation
+/// times on the series clock and absolute poses `J . P(t)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentShots {
+    pub times: Vec<Vec<f64>>,
+    pub poses: Vec<Vec<Pose>>,
+}
+
+/// P10 part C: the segment poses of one 3D motion unit. `cum[s]` is the summed jumps `J` of the
+/// unit's events up to segment `s`, `times[s]` the segment's excitation time, `p_v` the pose the
+/// unit's images were already moved by (its reference pose), `pose_at` the trajectory. Returns,
+/// per segment, the pose to move those images by further (`J . P(t) . P_v^-1`) and the absolute
+/// pose (`J . P(t)`). Where `P(t)` is `P_v` exactly the first is `J` itself, with no matrix
+/// arithmetic, so a trajectory that holds still within a unit reproduces the per-volume path bit
+/// for bit; the identity is the base images. A composed rotation the `Rz Ry Rx` decomposition
+/// cannot represent (pitch at 90 degrees) is refused rather than resampled wrong.
+pub fn segment_poses(cum: &[Pose], times: &[f64], p_v: Pose, pose_at: impl Fn(f64) -> Pose, center: [f64; 3])
+    -> Result<(Vec<Pose>, Vec<Pose>), String>
+{
+    let pv_inv = {
+        let m = matrix_of(p_v, center);
+        rigid_inverse(&m)
+    };
+    // the decomposition reproduces the matrix, or the segment pose is refused
+    let decompose = |m: [[f64; 4]; 4], s: usize| -> Result<Pose, String> {
+        let p = Pose::from_matrix(m, center);
+        let back = p.to_matrix(center);
+        let err = back.iter().flatten().zip(m.iter().flatten()).fold(0.0f64, |e, (a, b)| e.max((a - b).abs()));
+        if err > 1e-9 {
+            return Err(format!(
+                "segment {s} at {} s: its pose composes to a rotation at 90 degrees of pitch, which the Rz Ry Rx angles \
+                 cannot represent (reconstruction error {err:.2e})", times[s]));
+        }
+        Ok(p)
+    };
+    let mut rel = Vec::with_capacity(cum.len());
+    let mut abs = Vec::with_capacity(cum.len());
+    for (s, &j) in cum.iter().enumerate() {
+        let pt = pose_at(times[s]);
+        let a = matmul4(&matrix_of(j, center), &matrix_of(pt, center));
+        abs.push(if j == Pose::IDENTITY { pt } else if pt == Pose::IDENTITY { j } else { decompose(a, s)? });
+        rel.push(if pt == p_v { j } else { decompose(matmul4(&a, &pv_inv), s)? });
+    }
+    Ok((rel, abs))
+}
+
+/// The number of distinct poses other than the identity among one unit's segments: the image sets
+/// it holds beside its base images.
+pub fn distinct_moved(poses: &[Pose]) -> usize {
+    let mut distinct: Vec<Pose> = Vec::new();
+    for &q in poses {
+        if q != Pose::IDENTITY && !distinct.contains(&q) {
+            distinct.push(q);
+        }
+    }
+    distinct.len()
+}
+
+/// P10 part C: `sets` image sets of `n_images` compartment images of `nvox` voxels, all held at once
+/// until the acquisition, within `limit_gib` (`[images] max_memory_gib`), checked before any is
+/// made.
+pub fn check_segment_memory(sets: usize, n_images: usize, nvox: usize, limit_gib: f64) -> Result<(), String> {
+    let gib = sets as f64 * n_images as f64 * nvox as f64 * 4.0 / (1u64 << 30) as f64;
+    if gib > limit_gib {
+        return Err(format!(
+            "within_volume_sampling = \"shot\" on this 3D readout makes {sets} segment image sets of {n_images} \
+             compartment images ({gib:.2} GiB), over [images] max_memory_gib = {limit_gib}; raise it, sample fewer \
+             distinct poses, or simulate fewer volumes"));
+    }
+    Ok(())
+}
+
+/// The inverse of a rigid world-space transform: `[R^T | -R^T t]`.
+fn rigid_inverse(m: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
+    let mut out = IDENTITY_MATRIX;
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = m[j][i];
+        }
+        out[i][3] = -(0..3).map(|k| m[k][i] * m[k][3]).sum::<f64>();
+    }
+    out
+}
+
+/// P10, for the sidecar: the smallest interval between two shots of a volume (s): between a 2D
+/// readout's distinct slice times, or a segmented 3D readout's repetitions; `None` with one shot.
+pub fn min_shot_spacing(p: &crate::protocol::Protocol) -> Option<f64> {
+    match &p.readout {
+        Some(r) => (r.number_shots.0 > 1).then(|| p.rows.iter().map(|row| row.tr).fold(f64::INFINITY, f64::min)),
+        None => {
+            let shots: Vec<f64> = slice_schedule_from_times(&p.slice_offsets).iter().map(|s| p.slice_offsets[s[0]]).collect();
+            shots.windows(2).map(|w| w[1] - w[0]).reduce(f64::min)
+        }
+    }
+}
+
+/// Each volume's reference time (its first shot): `starts[v] + signal_t[v]`.
+pub fn reference_times(starts: &[f64], signal_t: &[f64]) -> Vec<f64> {
+    starts.iter().zip(signal_t).map(|(s, t)| s + t).collect()
 }
 
 /// Move `images` (voxel-major interleaved, `n` volumes on the simulation grid) by the plan, and
@@ -205,6 +323,7 @@ mod tests {
             sampling,
             shot_path: true,
             spin_history: false,
+            timed: None,
         }
     }
 
@@ -252,6 +371,64 @@ mod tests {
         // volume sampling: every shot the volume's pose
         let plan = shot_plan(&spec(WithinVolumeSampling::Volume), &poses, &starts, &t, &offsets, &g, |_| Vec::new());
         assert!((plan.pose(1, 3).trans_mm[2] - 1.0).abs() < 1e-9);
+    }
+
+    /// P10: a timed trace linear between shot times gives, at the shots, the transform of the
+    /// cumulative jumps that reach the same poses (the hand-written events of the P9 figures).
+    #[test]
+    fn a_linear_timed_trace_is_the_cumulative_jumps() {
+        let g = grid([6, 5, 4]);
+        let step = Pose { trans_mm: [0.0, 0.5, 0.75], rot_deg: [0.8, 0.0, -0.3] };
+        let offsets = [0.0, 0.1, 0.2, 0.3];
+        let mut m = spec(WithinVolumeSampling::Shot);
+        let k = |s: f64| Pose { trans_mm: step.trans_mm.map(|x| x * s), rot_deg: step.rot_deg.map(|x| x * s) };
+        m.timed = Some(crate::protocol::TimedTrajectory {
+            path: "trace.tsv".into(),
+            trace: mrsim_acq::motion::Trace { times: vec![0.5, 0.8, 2.0], poses: vec![Pose::IDENTITY, k(3.0), k(3.0)] },
+            clock: "time column",
+        });
+        // shots at 0.5, 0.6, 0.7, 0.8: the trace is k(0), k(1), k(2), k(3) there
+        let timed = shot_plan(&m, &[Pose::IDENTITY], &[0.0], &[0.5], &offsets, &g, |_| Vec::new());
+        let jumps: Vec<MotionEvent> = (1..4).map(|s| MotionEvent {
+            volume: 0, shot: s, severity: 0.0, jump_mm: step.trans_mm, jump_deg: step.rot_deg }).collect();
+        let events = shot_plan(&spec(WithinVolumeSampling::Volume), &[Pose::IDENTITY], &[0.0], &[0.5], &offsets, &g,
+                               move |_| jumps.clone());
+        for s in 0..4 {
+            for (a, b) in timed.transforms[0][s].iter().flatten().zip(events.transforms[0][s].iter().flatten()) {
+                assert!((a - b).abs() < 1e-12, "shot {s}: {a} vs {b}");
+            }
+        }
+        assert_ne!(timed.transforms[0][3], IDENTITY_MATRIX);
+    }
+
+    /// Implementation review: a relative rotation at 90 degrees of pitch (reference (10, -45, 5)
+    /// degrees, shot about (17.05, 44.78, 14.98)) cannot be decomposed into the angles the
+    /// resampler takes; it is refused, while an ordinary one round-trips.
+    #[test]
+    fn segment_poses_refuse_what_the_angles_cannot_represent() {
+        let c = [1.0, -2.0, 3.0];
+        let pv = Pose { rot_deg: [10.0, -45.0, 5.0], trans_mm: [0.0; 3] };
+        let lock = Pose { rot_deg: [17.0532267, 44.7823850, 14.9810694], trans_mm: [0.0; 3] };
+        let e = segment_poses(&[Pose::IDENTITY], &[2.0], pv, |_| lock, c).unwrap_err();
+        assert!(e.contains("90 degrees") && e.contains("2 s"), "{e}");
+        let ok = Pose { rot_deg: [12.0, -40.0, 7.0], trans_mm: [0.5, 0.0, 1.0] };
+        let (rel, abs) = segment_poses(&[Pose::IDENTITY], &[2.0], pv, |_| ok, c).unwrap();
+        assert_eq!(abs[0], ok);
+        let back = matmul4(&rel[0].to_matrix(c), &pv.to_matrix(c));
+        for (a, b) in back.iter().flatten().zip(ok.to_matrix(c).iter().flatten()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn query_times_are_the_reference_times_or_every_shot() {
+        // interleaved single band: shots at 0, 0.04, 0.08 (slices 0, 2, 1)
+        let offsets = [0.0, 0.08, 0.04];
+        assert_eq!(query_times(&[0.0, 4.0], &[1.0, 1.5], &offsets, false), vec![1.0, 5.5]);
+        let q = query_times(&[0.0, 4.0], &[1.0, 1.5], &offsets, true);
+        let want = [1.0, 1.04, 1.08, 5.5, 5.54, 5.58];
+        assert!(q.len() == 6 && q.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-12), "{q:?}");
+        assert_eq!(reference_times(&[0.0, 4.0], &[1.0, 1.5]), vec![1.0, 5.5]);
     }
 
     #[test]

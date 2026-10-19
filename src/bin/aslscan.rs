@@ -99,7 +99,10 @@ fn run() -> Result<(), String> {
             "{} pulse(s) on row 0 at efficiency {}{}", s.per_row[0].len(), s.epsilon.0,
             if s.presaturation.0 { " with presaturation" } else { "" })),
         p.motion.as_ref().map_or("off".to_string(), |m| format!(
-            "{}{}{}", m.mode_name,
+            "{}{}{}{}", m.mode_name,
+            m.timed.as_ref().map_or(String::new(), |t| format!(
+                " (timed, {}: {} samples, {} to {} s)", t.clock, t.trace.times.len(), t.trace.times[0],
+                t.trace.times[t.trace.times.len() - 1])),
             match m.within.as_ref() {
                 Some(w) if w.events_file.is_some() => " + within-volume events from a file",
                 Some(_) => " + within-volume events",
@@ -107,8 +110,16 @@ fn run() -> Result<(), String> {
             },
             if !m.shot_path { "" }
             else if m.sampling == aslscan::protocol::WithinVolumeSampling::Slice { " (per shot, poses sampled per slice)" }
+            else if m.sampling == aslscan::protocol::WithinVolumeSampling::Shot { " (per shot, poses sampled per shot)" }
             else { " (per shot)" })),
     );
+    // P10: a trace sampled more slowly than the shots is interpolated linearly between its samples
+    if let Some(t) = p.motion.as_ref().and_then(|m| m.timed.as_ref().filter(|_| m.sampling.per_shot())) {
+        if let Some(sp) = aslscan::series::shots::min_shot_spacing(&p).filter(|sp| t.trace.max_interval() > *sp) {
+            println!("note: the timed trajectory's samples are up to {} s apart, more than the {sp} s between shots; it is \
+                      interpolated linearly between samples", t.trace.max_interval());
+        }
+    }
 
     let mut p4 = Vec::new();
     if let Some(te) = p.exchange_time {

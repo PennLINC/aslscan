@@ -67,7 +67,7 @@ mod writer {
     use super::{aslcontext_tsv, ground_truth_tail, Names};
     use crate::phantom::T2Mode;
     use crate::bolus::Region;
-    use crate::protocol::{M0Type, Protocol, QuantitySource, SuppressionModel, WithinVolumeSampling, COMPAT_PINNED};
+    use crate::protocol::{M0Type, Protocol, QuantitySource, SuppressionModel, COMPAT_PINNED};
     use crate::resample::GridOrigin;
     use crate::series::{LookLockerSeries, SeriesOutput};
 
@@ -215,21 +215,60 @@ mod writer {
             if m.shot_path {
                 let obj = block.as_object_mut().expect("an object");
                 obj.insert("Path".into(), json!("shot"));
-                obj.insert("WithinVolumeSampling".into(), json!(match m.sampling {
-                    WithinVolumeSampling::Volume => "volume",
-                    WithinVolumeSampling::Slice => "slice",
-                }));
+                obj.insert("WithinVolumeSampling".into(), json!(m.sampling.as_str()));
                 if let Some(f) = m.within.as_ref().and_then(|w| w.events_file.as_ref()) {
                     obj.insert("EventsFile".into(), json!(f.path));
                     obj.insert("WithinVolume".into(), json!({ "EventsFile": f.path, "Events": out.events.len() }));
                 }
-                obj.insert("ShotTransform".into(), json!(
+                obj.insert("ShotTransform".into(), json!(if m.timed.is_some() {
+                    "Q = J . P as world-space matrices about the field-of-view centre: P the timed trajectory's pose at \
+                     the shot's time (within_volume_sampling \"shot\" or \"slice\"), or at the volume's first shot \
+                     (\"volume\"), linear in the six parameters between its samples; J the summed jumps of the volume's \
+                     events up to the shot. Each shot's slices are resampled once."
+                } else {
                     "Q = J . P as world-space matrices about the field-of-view centre: P the volume's pose, or the \
                      trajectory through the volumes' poses placed at their first shots, linear in the six parameters \
                      (within_volume_sampling = \"slice\"); J the summed jumps of the volume's events up to the shot. \
-                     Each shot's slices are resampled once."));
+                     Each shot's slices are resampled once."
+                }));
                 if let Some(gt) = obj.get_mut("GroundTruth").and_then(Value::as_array_mut) {
                     gt.insert(2, json!("desc-motionShots_gt.tsv (each shot's composed pose, rotations in radians)"));
+                }
+            }
+            // P10 part C: a 3D readout's segments, each at its own pose
+            if out.segment_shots.is_some() {
+                let obj = block.as_object_mut().expect("an object");
+                obj.insert("WithinVolumeSampling".into(), json!(m.sampling.as_str()));
+                obj.insert("SegmentTransform".into(), json!(
+                    "each readout segment's lines are read from the volume's images moved further by J . P(t) . P_v^-1: \
+                     P(t) the trajectory's pose at the segment's first excitation, P_v the volume's pose (at its first \
+                     segment), J the summed jumps of the volume's events up to the segment"));
+                if let Some(a) = obj.get_mut("Approximations").and_then(Value::as_array_mut) {
+                    a.push(json!("one pose per readout segment: a segment's echo train is read at one pose"));
+                    a.push(json!("segment images are resampled from the volume's moved images (two interpolations)"));
+                }
+                if let Some(gt) = obj.get_mut("GroundTruth").and_then(Value::as_array_mut) {
+                    gt.insert(2, json!("desc-motionShots_gt.tsv (each segment's absolute pose J . P(t), rotations in radians; slices n/a)"));
+                }
+            }
+            // P10: a timed trajectory's block, written only for one (an untimed run's block is unchanged)
+            if let Some(t) = &m.timed {
+                let obj = block.as_object_mut().expect("an object");
+                let tr = &t.trace;
+                obj.insert("Trajectory".into(), json!({
+                    "File": t.path,
+                    "Timed": true,
+                    "Clock": format!("{}; seconds on the acquisition clock, 0 = the start of the first acquisition", t.clock),
+                    "Samples": tr.times.len(),
+                    "Span": [tr.times[0], tr.times[tr.times.len() - 1]],
+                    "MaxSampleInterval": tr.max_interval(),
+                    "MinShotSpacing": crate::series::shots::min_shot_spacing(p),
+                    "Sampling": if m.sampling.per_shot() { "the trace's pose at each shot's time" }
+                                else { "the trace's pose at each volume's first shot" },
+                    "Interpolation": "linear in the six parameters between samples; never extrapolated",
+                }));
+                if !m.shot_path {
+                    obj.insert("VolumePose".into(), json!("each volume's pose is the timed trajectory's at its first shot"));
                 }
             }
             // P9 part B
@@ -1236,6 +1275,18 @@ mod writer {
                     let r = q.rot_deg.map(f64::to_radians);
                     let slices = plan.schedule[s].iter().map(|z| z.to_string()).collect::<Vec<_>>().join(",");
                     tsv.push_str(&format!("{v}\t{s}\t{slices}\t{t}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                          q.trans_mm[0], q.trans_mm[1], q.trans_mm[2], r[0], r[1], r[2]));
+                }
+            }
+            std::fs::write(format!("{gt_prefix}_desc-motionShots_gt.tsv"), tsv).map_err(|e| e.to_string())?;
+        }
+        // P10 part C: a 3D readout's segments under per-segment sampling (no slices: n/a)
+        if let (None, Some(seg)) = (&out.shots, &out.segment_shots) {
+            let mut tsv = String::from("volume\tshot\tslices\ttime\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+            for (v, (times, poses)) in seg.times.iter().zip(&seg.poses).enumerate() {
+                for (s, (t, q)) in times.iter().zip(poses).enumerate() {
+                    let r = q.rot_deg.map(f64::to_radians);
+                    tsv.push_str(&format!("{v}\t{s}\tn/a\t{t}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                                           q.trans_mm[0], q.trans_mm[1], q.trans_mm[2], r[0], r[1], r[2]));
                 }
             }

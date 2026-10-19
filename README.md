@@ -277,8 +277,11 @@ mode = "random"                # "off", "random", "linear", or "trajectory"
 trans_mm = [2.0, 2.0, 1.0]     # random/linear amplitudes
 rot_deg = [1.0, 1.0, 2.0]
 volumes = [5, 20, 40]          # volumes affected (default all)
-trajectory = "motion.tsv"      # "trajectory" mode: trans_x/y/z (mm), rot_x/y/z (radians), one row per volume
-within_volume_sampling = "volume"  # 2D: "volume" (each shot has its volume's pose) or "slice" (the pose at each shot's time)
+trajectory = "motion.tsv"      # "trajectory" mode: trans_x/y/z (mm), rot_x/y/z (radians), one row per volume,
+                               # or a timed trace (a time column, or a sidecar SamplingFrequency): see below
+within_volume_sampling = "shot"    # "volume" (each shot has its volume's pose) or "shot" (the pose at each
+                                   # shot's time; "slice" is its 2D synonym). Default: "shot" for a timed
+                                   # trace, "volume" otherwise
 
 [motion.within_volume]         # shot events: 2D slice groups (single-band or multiband), or segmented-3D shots
 dropout_rate = 0.1
@@ -300,6 +303,40 @@ path, whose outputs are unchanged. A run's own `desc-motionEvents_gt.tsv` can be
 
 A slow drift moves each volume a little and leaves it otherwise clean; within-volume motion
 staggers the slices of a volume.
+
+**A timed trajectory** is a motion trace sampled at its own times, usually faster than the
+repetition, so that a movement lands where it happened: inside a 0.4 s readout instead of spread
+over a 4.6 s repetition. Each simulator reads it the same way (TRXScan's `--motion` too).
+- **The clock:** a `time` column in seconds, or a JSON sidecar at the same path with `.json`
+  holding `SamplingFrequency` (Hz) and optionally `StartTime` (s), the BIDS physio convention.
+  Not both. A sidecar without `SamplingFrequency` (fMRIPrep's confounds JSON) leaves the trace
+  read as one row per volume, as before.
+- **The origin:** times are seconds from the start of the series' first acquisition (the first
+  labeling, for a single-delay series). Under Hadamard the clock is the raw acquisitions'. The
+  `time` column of `desc-motionShots_gt.tsv` is on the same clock, for checking an alignment.
+- **Sampling:** by default each shot takes the trace's pose at its own time (`"shot"`); that is
+  what a timed trace is for. With `within_volume_sampling = "volume"` each volume takes the trace's
+  pose at its first shot instead, the view a per-volume tool has of the same motion. The pose
+  between two samples is linear in the six parameters.
+- **Coverage:** the trace must cover every time it is sampled at, or the run is refused before
+  anything is simulated. It is never extrapolated.
+- **Composition:** within-volume events compose with it as with an untimed trajectory.
+- **3D readouts:** a segmented 3D readout (GRASE, stack of spirals, the gradient-echo EPI train)
+  reads each segment at its own pose under `"shot"`, the default for a timed trace (`"slice"` is
+  refused there): the trace's pose
+  at the segment's first excitation, relative to the volume's. Segments at different poses give
+  inconsistent k-space lines, which the reconstruction turns into ghosting and blurring through the
+  slab. A segment's echo train is still read at one pose. Each distinct segment pose holds a copy of
+  the volume's images until the acquisition, bounded by `[images] max_memory_gib` (default 4). The
+  `desc-motionShots_gt.tsv` table lists each segment's time and absolute pose, with `slices` `n/a`.
+  An untimed trajectory under `"shot"` is sampled the same way between the volumes' poses.
+- **Making one:** `tools/motion_trace.py` writes timed traces from nods, steps and drifts, and
+  rewrites a sidecar-timed trace with a `time` column:
+
+```bash
+python tools/motion_trace.py --rate 100 --duration 190 --out nod.tsv \
+    --nod start=58.8,rise=0.4,hold=4.2,fall=0.4,trans=0:2:3,rot=0.06:0:0
+```
 
 **Spin history** (`[motion] spin_history = true`, 2D): tissue carried through the slice direction
 into a slice not yet excited is excited twice in one repetition and is dark the second time;

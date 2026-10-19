@@ -218,9 +218,13 @@ cases=(
   "p6_ll|$P/p6_ll/asl.json|$P/p6_ll/aslcontext.tsv|$P/p6_ll/overlay.toml|$CROP"
   "p6_ll_legacy|$A/p6-ll-legacy.json|$A/p6-ll-legacy.tsv|$A/p6-ll-legacy.toml|$CROP"
   "p6_ll_m0|$A/p6-ll-m0.json|$A/p6-ll-m0.tsv|$A/p6-ll-m0.toml|$CROP"
+  # P9's shot path (P10 plan, Task 0): an events file with spin history, and the per-slice sampling
+  # of a drift with spin history, the paths a timed trace extends
+  "p9_shot_spin|$P/p9_single_band/asl.json|$P/p9_single_band/aslcontext.tsv|$P/p9_single_band/overlay-sh-event.toml|$Z100"
+  "p9_slice_drift|$P/p9_single_band/asl.json|$P/p9_single_band/aslcontext.tsv|$P/p9_single_band/overlay-sh-drift.toml|$Z100"
 )
 # executed cases per build (the rest are skipped for a missing feature)
-declare -A expect=([cli-kspace-par]=35 [cli]=33)
+declare -A expect=([cli-kspace-par]=37 [cli]=35)
 
 fail=0; undetected=0
 for feats in cli,kspace,par cli; do
