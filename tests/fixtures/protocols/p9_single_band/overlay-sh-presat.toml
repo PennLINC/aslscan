@@ -1,0 +1,14 @@
+# P9 acceptance, criterion 4: criterion 3 with presaturation at labeling start (asl-presat.json):
+# the same within-volume dip against the presaturated reference, and none in the next volume.
+seed = 20260923
+[acquisition]
+oversample = 2
+matrix = [64, 68]
+[m0]
+repetition_time = 8.0
+[background_suppression]
+presaturation = true
+[motion]
+spin_history = true
+[motion.within_volume]
+events = "events-sh.tsv"

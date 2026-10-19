@@ -190,9 +190,9 @@ fn decoded_truth(
                         .sum()
                 });
             }
-            if let (Some(out), Some(abv), Some(aatt)) = (art.as_mut(), &p4.abv, &p4.aatt) {
+            if let (Some(out), Some(abv), Some(att_arterial)) = (art.as_mut(), &p4.abv, &p4.att_arterial) {
                 put(out, &|i| {
-                    let (va, a) = arterial_dm(&kin, abv[i], aatt[i], ph.m0[i] as f64, t);
+                    let (va, a) = arterial_dm(&kin, abv[i], att_arterial[i], ph.m0[i] as f64, t);
                     if a.is_some_and(|a| aj <= a && a < bj) { va } else { 0.0 }
                 });
             }
@@ -221,6 +221,9 @@ struct Built {
     n_shots: usize,
     events: Vec<MotionEvent>,
     dropped: Vec<DroppedShot>,
+    shot_plan: Option<super::shots::ShotPlan>,
+    /// P10 part C: the 3D segments' times and absolute poses under per-segment sampling.
+    segment_shots: Option<super::shots::SegmentShots>,
     poses: Vec<Pose>,
     motion_seed: Option<u64>,
     res3d: Option<ReadoutResolution>,
@@ -289,6 +292,22 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
              {} mm slices)", p.slice_offsets.len(), ph.grid.dims[2] as f64 * pv[2], p.voxel_size_mm[2]));
     }
     let slice_offsets: Vec<f64> = if res3d.is_some() { vec![0.0; nz] } else { p.slice_offsets.clone() };
+    // P10: the raw volumes' clock (under Hadamard, H raw volumes per cycle, not the rows): each raw
+    // volume's first preparation and signal time; a timed trajectory must cover every time it is
+    // queried at, checked before anything is simulated
+    let raw_starts: Vec<f64> = sched.raws.iter().map(|r| sched.preps[r.prep].start_s).collect();
+    let raw_t: Vec<f64> = sched.raw_rows.iter().map(|r| r.t).collect();
+    if let Some(m) = p.motion.as_ref() {
+        let q = match &res3d {
+            // P10 part C: every segment of a 3D raw volume, at its own preparation
+            Some(r3) if m.sampling.per_shot() => (0..sched.raw_rows.len())
+                .flat_map(|v| (0..r3.n_shots).map(move |s| (v, s)))
+                .map(|(v, s)| sched.preps_of(v)[s].start_s + raw_t[v])
+                .collect(),
+            _ => super::shots::query_times(&raw_starts, &raw_t, &slice_offsets, m.sampling.per_shot() && res3d.is_none()),
+        };
+        m.check_timed_coverage(&q)?;
+    }
     let dv = p.voxel_size_mm;
     let sim_vox = [dv[0] / o as f64, dv[1] / o as f64, dv[2]];
     let off = corner_offset(&ph.grid, &acq_grid)?;
@@ -873,18 +892,18 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                 }
                 // P7 part A: the arterial read, fresh (2D), with its crushing survival and parcel
                 // factor, sin(a_n) as the image takes it
-                if let (Some(ga), Some(abv), Some(aatt)) = (gt_read_art.as_mut(), &p4.abv, &p4.aatt) {
+                if let (Some(ga), Some(abv), Some(att_arterial)) = (gt_read_art.as_mut(), &p4.abv, &p4.att_arterial) {
                     let t = row.t + slice_offsets[z];
                     let bolus = bolus_of(v);
                     let sl = r_acq.mean_slice(z, |i| {
                         if ph.dseg[i] <= 0 {
                             return 0.0;
                         }
-                        let (va, a) = arterial_dm(&kin, abv[i], aatt[i], ph.m0[i] as f64, t);
+                        let (va, a) = arterial_dm(&kin, abv[i], att_arterial[i], ph.m0[i] as f64, t);
                         let Some(a) = a else { return 0.0 };
                         let g = match &bolus {
                             Some((region, pulses, eps)) => {
-                                arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, aatt[i]))
+                                arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, att_arterial[i]))
                             }
                             None => 1.0,
                         };
@@ -969,7 +988,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                     if ph.dseg[i] <= 0 {
                         continue;
                     }
-                    let (f_ml, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
+                    let (f_ml_100g_min, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
                     // the tissue label: (scale, total, intravascular), the single-sub-bolus factor
                     // folded into the scale as P3 folds its factor into the sign
                     let (scale, dm, iv) = match (&enc_w[v], &bolus) {
@@ -988,9 +1007,9 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                                 for &(a, b, f) in &parcels {
                                     let (lo, hi) = (a.max(aj), b.min(bj));
                                     if hi > lo {
-                                        dm += f * delta_m_sub(&kin, f_ml, att, t1t, m0, t, lo, hi);
+                                        dm += f * delta_m_sub(&kin, f_ml_100g_min, att, t1t, m0, t, lo, hi);
                                         if let Some(te) = p.exchange_time {
-                                            iv += f * delta_m_iv_sub(&kin, f_ml, att, t1t, m0, t, lo, hi, te);
+                                            iv += f * delta_m_iv_sub(&kin, f_ml_100g_min, att, t1t, m0, t, lo, hi, te);
                                         }
                                     }
                                 }
@@ -1002,21 +1021,21 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                             let key = delta.map_or(u64::MAX, f64::to_bits);
                             let sb = partitions.entry(key).or_insert_with(|| subbolus_factors(pulses, *eps, kin.tau, delta));
                             if sb.len() == 1 {
-                                let iv = p.exchange_time.map(|te| delta_m_iv(&kin, f_ml, att, t1t, m0, t, te));
-                                (sb[0].2, delta_m(&kin, f_ml, att, t1t, m0, t), iv)
+                                let iv = p.exchange_time.map(|te| delta_m_iv(&kin, f_ml_100g_min, att, t1t, m0, t, te));
+                                (sb[0].2, delta_m(&kin, f_ml_100g_min, att, t1t, m0, t), iv)
                             } else {
-                                let dm: f64 = sb.iter().map(|&(a, b, f)| f * delta_m_sub(&kin, f_ml, att, t1t, m0, t, a, b)).sum();
+                                let dm: f64 = sb.iter().map(|&(a, b, f)| f * delta_m_sub(&kin, f_ml_100g_min, att, t1t, m0, t, a, b)).sum();
                                 let iv = p.exchange_time.map(|te| {
-                                    sb.iter().map(|&(a, b, f)| f * delta_m_iv_sub(&kin, f_ml, att, t1t, m0, t, a, b, te)).sum::<f64>()
+                                    sb.iter().map(|&(a, b, f)| f * delta_m_iv_sub(&kin, f_ml_100g_min, att, t1t, m0, t, a, b, te)).sum::<f64>()
                                 });
                                 (1.0, dm, iv)
                             }
                         }
                         (None, None) => (1.0, match &read {
                             // P6 part B: the depleted read (exchange is refused with Look-Locker)
-                            Some((e, fl)) => delta_m_read(&kin, f_ml, att, t1t, m0, e, fl),
-                            None => delta_m(&kin, f_ml, att, t1t, m0, t),
-                        }, p.exchange_time.map(|te| delta_m_iv(&kin, f_ml, att, t1t, m0, t, te))),
+                            Some((e, fl)) => delta_m_read(&kin, f_ml_100g_min, att, t1t, m0, e, fl),
+                            None => delta_m(&kin, f_ml_100g_min, att, t1t, m0, t),
+                        }, p.exchange_time.map(|te| delta_m_iv(&kin, f_ml_100g_min, att, t1t, m0, t, te))),
                     };
                     // P7 part A: under Look-Locker the images read the depleted parts, each with its
                     // parcel factor; the P4 truths below keep their P4 meaning (at t, undepleted)
@@ -1038,20 +1057,20 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                         // the unsuppressed intravascular part: kinetics and the split only
                         let te = p.exchange_time.unwrap();
                         giv[j] = match &enc_w[v] {
-                            None => delta_m_iv(&kin, f_ml, att, t1t, m0, t, te),
+                            None => delta_m_iv(&kin, f_ml_100g_min, att, t1t, m0, t, te),
                             Some(w) => spans.iter().zip(w).filter(|(_, &w)| w == 1)
-                                .map(|(&(a, b), _)| delta_m_iv_sub(&kin, f_ml, att, t1t, m0, t, a, b, te)).sum(),
+                                .map(|(&(a, b), _)| delta_m_iv_sub(&kin, f_ml_100g_min, att, t1t, m0, t, a, b, te)).sum(),
                         };
                     }
                     if !gsup.is_empty() {
                         gsup[j] = scale * dm;
                     }
-                    if let (Some(abv), Some(aatt)) = (&p4.abv, &p4.aatt) {
-                        let (va, a) = arterial_dm(&kin, abv[i], aatt[i], m0, t);
+                    if let (Some(abv), Some(att_arterial)) = (&p4.abv, &p4.att_arterial) {
+                        let (va, a) = arterial_dm(&kin, abv[i], att_arterial[i], m0, t);
                         if let Some(a) = a {
                             let g = match &bolus {
                                 Some((region, pulses, eps)) => {
-                                    arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, aatt[i]))
+                                    arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, att_arterial[i]))
                                 }
                                 None => 1.0,
                             };
@@ -1142,7 +1161,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                 if let Some(g) = d_ev.as_mut() {
                     put(g, &|i| fa * parts[i - base].ev);
                 }
-                if let (Some(g), Some(abv), Some(aatt)) = (d_art.as_mut(), &p4.abv, &p4.aatt) {
+                if let (Some(g), Some(abv), Some(att_arterial)) = (d_art.as_mut(), &p4.abv, &p4.att_arterial) {
                     let t = row.t + slice_offsets[z];
                     let bolus = bolus_of(r);
                     let (aj, bj) = h.spans[subbolus];
@@ -1150,12 +1169,12 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                         if ph.dseg[i] <= 0 {
                             return 0.0;
                         }
-                        let (va, a) = arterial_dm(&kin, abv[i], aatt[i], ph.m0[i] as f64, t);
+                        let (va, a) = arterial_dm(&kin, abv[i], att_arterial[i], ph.m0[i] as f64, t);
                         match a {
                             Some(a) if aj <= a && a < bj => {
                                 let g = match &bolus {
                                     Some((region, pulses, eps)) => {
-                                        arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, aatt[i]))
+                                        arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, att_arterial[i]))
                                     }
                                     None => 1.0,
                                 };
@@ -1179,13 +1198,27 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
     let mut poses = vec![Pose::IDENTITY; n];
     let mut events = Vec::new();
     let mut dropped = Vec::new();
+    let mut shot_plan: Option<super::shots::ShotPlan> = None;
     let mut gt_moved: Option<Vec<f32>> = None;
     if let (Some(m), Some(seed)) = (&p.motion, motion_seed) {
         let v2w = sim_grid.voxel_to_world;
-        poses = resolve_poses(&m.mode, n, seed);
-        apply_motion(&mut images, sim_grid.dims, n, v2w, &poses);
-        if let Some(to) = tissue_only.as_mut() {
-            apply_motion(to, sim_grid.dims, n, v2w, &poses);
+        // a timed trajectory's pose at each raw volume's first shot (P10), else the mode's poses
+        poses = m.volume_poses(&super::shots::reference_times(&raw_starts, &raw_t), seed);
+        if m.shot_path {
+            // P9 part A, on the raw volumes and their own clock
+            let plan = super::shots::shot_plan(m, &poses, &raw_starts, &raw_t, &slice_offsets, &sim_grid,
+                                               |n_shots| draw_events(m.within.as_ref(), n, n_shots, seed));
+            dropped = super::shots::apply(&plan, &mut images, &sim_grid, n);
+            if let Some(to) = tissue_only.as_mut() {
+                super::shots::apply(&plan, to, &sim_grid, n);
+            }
+            events = plan.events.clone();
+            shot_plan = Some(plan);
+        } else {
+            apply_motion(&mut images, sim_grid.dims, n, v2w, &poses);
+            if let Some(to) = tissue_only.as_mut() {
+                apply_motion(to, sim_grid.dims, n, v2w, &poses);
+            }
         }
         let mut gt_arr = [std::mem::take(&mut gt_sim)];
         apply_motion(&mut gt_arr, sim_grid.dims, n, v2w, &poses);
@@ -1204,7 +1237,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
             // P5 part D: a shot is a readout segment; the events are drawn per shot as in 2D, but
             // act through per-shot images and shot gains below, not on slice groups
             events = draw_events(m.within.as_ref(), n, n_shots, seed);
-        } else {
+        } else if !m.shot_path {
             let n_shots = slice_schedule(nz, p.mb, p.mb_interleaved).len();
             events = draw_events(m.within.as_ref(), n, n_shots, seed);
             if !events.is_empty() {
@@ -1225,16 +1258,25 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
     let mut shot_sets: Vec<Vec<ShotSet>> = vec![Vec::new(); n];
     // the tissue-only images' own shot sets (the motion shot sets are copies of the images)
     let mut tissue_shot_sets: Vec<Vec<ShotSet>> = vec![Vec::new(); n];
-    if res3d.is_some() && !events.is_empty() {
+    // P10 part C: under within_volume_sampling = "shot" each segment takes the trajectory's pose at
+    // its own excitation time on the raw volumes' clock, relative to the pose the raw volume's
+    // images already carry; the tissue-only images get the same sets
+    let seg = res3d.is_some() && p.motion.as_ref().is_some_and(|m| m.sampling.per_shot());
+    let mut segment_shots: Option<super::shots::SegmentShots> = None;
+    if res3d.is_some() && (!events.is_empty() || seg) {
         let v2w = sim_grid.voxel_to_world;
-        for (g, sets) in shot_sets.iter_mut().enumerate() {
+        let center = mrsim_acq::motion::fov_center(sim_grid.dims, v2w);
+        let ref_times = super::shots::reference_times(&raw_starts, &raw_t);
+        let mut pose_of_all: Vec<Option<Vec<Pose>>> = vec![None; n];
+        let (mut seg_times, mut seg_abs) = (Vec::new(), Vec::new());
+        for (g, slot) in pose_of_all.iter_mut().enumerate() {
             let evs: Vec<&MotionEvent> = events.iter().filter(|e| e.volume == g && e.shot < n_shots).collect();
-            if evs.is_empty() {
+            if evs.is_empty() && !seg {
                 continue;
             }
             let mut cum = Pose::IDENTITY;
-            let mut pose_of = vec![Pose::IDENTITY; n_shots];
-            for (s, pose) in pose_of.iter_mut().enumerate() {
+            let mut cums = vec![Pose::IDENTITY; n_shots];
+            for (s, pose) in cums.iter_mut().enumerate() {
                 for e in evs.iter().filter(|e| e.shot == s) {
                     for i in 0..3 {
                         cum.trans_mm[i] += e.jump_mm[i];
@@ -1243,6 +1285,31 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
                 }
                 *pose = cum;
             }
+            *slot = Some(if seg {
+                let m = p.motion.as_ref().expect("per-segment sampling is motion");
+                let times: Vec<f64> = (0..n_shots).map(|s| sched.preps_of(g)[s].start_s + raw_t[g]).collect();
+                let pose_at = |t: f64| match &m.timed {
+                    Some(tt) => tt.trace.pose_at(t),
+                    None => mrsim_acq::motion::sample_trajectory(&ref_times, &poses, t),
+                };
+                let (rel, abs) = super::shots::segment_poses(&cums, &times, poses[g], pose_at, center)?;
+                seg_times.push(times);
+                seg_abs.push(abs);
+                rel
+            } else {
+                cums
+            });
+        }
+        if seg {
+            let sets: usize = pose_of_all.iter().flatten().map(|po| super::shots::distinct_moved(po)).sum();
+            // the tissue-only images hold a twin of every set
+            let per_set = images.len() + tissue_only.as_ref().map_or(0, |t| t.len());
+            super::shots::check_segment_memory(sets, per_set, nvox_sim, p.segment_images_gib)?;
+            segment_shots = Some(super::shots::SegmentShots { times: seg_times, poses: seg_abs });
+        }
+        for (g, sets) in shot_sets.iter_mut().enumerate() {
+            let Some(pose_of) = pose_of_all[g].take() else { continue };
+            let evs: Vec<&MotionEvent> = events.iter().filter(|e| e.volume == g && e.shot < n_shots).collect();
             let mut distinct: Vec<Pose> = Vec::new();
             for &q in &pose_of {
                 if q != Pose::IDENTITY && !distinct.contains(&q) {
@@ -1317,7 +1384,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
     };
     let ge_propagated_some = ge_propagated.is_some();
     Ok(Built {
-        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art,
+        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, shot_plan, segment_shots, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art,
     })
 }
 
@@ -1352,7 +1419,7 @@ pub(super) fn simulate_p6(
         }
     }
     let Built {
-        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art,
+        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, shot_plan, segment_shots, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art,
     } = build(p, ph, mode, ov, tes[0], &sched)?;
     // P6 part C: every echo's readout block on explicit intervals, on the acquired grid
     if tes.len() > 1 || p.look_locker.is_some() {
@@ -1671,20 +1738,21 @@ pub(super) fn simulate_p6(
         delta_m_suppressed: gt_sup,
         delta_m_arterial: gt_art,
         abv: p4.abv.as_ref().map(|a| r_acq.mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>())),
-        aatt: match (&p4.abv, &p4.aatt) {
+        att_arterial: match (&p4.abv, &p4.att_arterial) {
             (Some(b), Some(a)) => {
                 let has: Vec<bool> = b.iter().map(|x| *x > 0.0).collect();
                 Some(r_acq.masked_mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>(), &has))
             }
             _ => None,
         },
+        spin_history: None,
     };
 
     Ok(SeriesOutput {
         acq_grid, sim_grid, n_volumes: n_out, mag, phase: phase_out, m0, mode: mode_used,
         labels: ph.labels.clone(), n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(),
         seeds: (p.seed, m0_seed), acquisition: acq, ground_truth, label_factors, poses, motion_seed,
-        events, dropped, compat: compat_facts,
+        events, dropped, shots: shot_plan, segment_shots, spin_history_merges: None, compat: compat_facts,
         crush_survival: p4.crush.clone(), physio: p4.physio.as_ref().map(|_| physio_lines),
         readout: res3d.clone(),
         echo_amplitudes,
@@ -2266,6 +2334,154 @@ mod tests {
         }
     }
 
+    /// P9 part A on a Hadamard series: single-band shot events take the per-shot path on the raw
+    /// volumes, each shot timed on the raw volume's own clock, one slice per dropped shot.
+    #[test]
+    fn hadamard_shot_events_use_the_raw_volumes_and_their_clock() {
+        let ph = crop();
+        let order = 4;
+        let n_sub = order - 1;
+        let (mut ld, mut pld, mut tr) = (vec![0.0], vec![0.0], vec![6.0]);
+        for j in 0..n_sub {
+            ld.push(TAU);
+            pld.push(PLD + TAU * (n_sub - 1 - j) as f64);
+            tr.push(4.0);
+        }
+        let mut s = sidecar(ld, pld, tr, "Included", true);
+        s["SliceTiming"] = json!([0.0, 0.05]);
+        let ctx = format!("volume_type\nm0scan\n{}", "deltam\n".repeat(n_sub));
+        let ov = overlay(&format!("[hadamard]\norder = {order}\n[motion]\nwithin_volume = {{ dropout_rate = 1.0, severity = 0.4 }}\n"), true);
+        let p = parse_echoes(&[s], &ctx, Some(&ov), None).unwrap();
+        assert!(p.motion.as_ref().unwrap().shot_path);
+        let out = simulate_p6(&p, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).unwrap();
+        let sched = Schedule::new(&p);
+        let n = sched.raw_rows.len();
+        assert_eq!(n, 1 + order, "an m0scan and one encoding cycle of raw volumes");
+        let plan = out.shots.as_ref().unwrap();
+        assert_eq!((plan.times.len(), plan.schedule.len()), (n, 2));
+        for v in 0..n {
+            let want = sched.preps[sched.raws[v].prep].start_s + sched.raw_rows[v].t;
+            assert!((plan.times[v][0] - want).abs() < 1e-12 && (plan.times[v][1] - want - 0.05).abs() < 1e-12, "raw volume {v}");
+        }
+        assert_eq!(out.dropped.len(), 2 * n);
+        assert!(out.dropped.iter().all(|d| d.slices.len() == 1 && d.volume < n));
+    }
+
+    /// P10 part C on the P6 3D builder (Hadamard GRASE, two segments per raw volume, leakage on so
+    /// the tissue-only images have their own sets): held still within each raw volume, "shot" is the
+    /// "volume" run bit for bit; moving between the segments of raw volume 1 gives that raw volume
+    /// one moved set, and its tissue-only twin, and no other raw volume any.
+    #[test]
+    fn three_d_hadamard_segments_take_the_trace_and_twin_the_tissue_sets() {
+        let ph = crop();
+        let order = 4;
+        let n_sub = order - 1;
+        let (ld, pld): (Vec<f64>, Vec<f64>) = (0..n_sub).map(|j| (TAU, PLD + TAU * (n_sub - 1 - j) as f64)).unzip();
+        let ctx = format!("volume_type\n{}", "deltam\n".repeat(n_sub));
+        let s = sidecar3d(ld, pld, vec![4.0; n_sub]);
+        let p0 = parse_echoes(&[s.clone()], &ctx, Some(&overlay(&format!("[hadamard]\norder = {order}\n"), false)), None).unwrap();
+        let sched = Schedule::new(&p0);
+        let n = sched.raw_rows.len();
+        assert_eq!(n, order);
+        let seg_t = |v: usize, k: usize| sched.preps_of(v)[k].start_s + sched.raw_rows[v].t;
+        let pose = |v: usize| [0.0, 0.4 * v as f64, 0.0, 0.0, 0.0, 0.03 * (v + 1) as f64];
+        let dir = std::env::temp_dir().join(format!("aslscan-p6-3dseg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, samples: &[(f64, [f64; 6])]| {
+            let mut text = String::from("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+            for (t, r) in samples {
+                text.push_str(&format!("{t}\t{}\t{}\t{}\t{}\t{}\t{}\n", r[0], r[1], r[2], r[3], r[4], r[5]));
+            }
+            let tsv = dir.join(format!("{name}.tsv"));
+            std::fs::write(&tsv, text).unwrap();
+            tsv.to_string_lossy().replace('\\', "\\\\")
+        };
+        let mut samples: Vec<(f64, [f64; 6])> = (0..n).flat_map(|v| [(seg_t(v, 0), pose(v)), (seg_t(v, 1), pose(v))]).collect();
+        let held = write("held", &samples);
+        samples[3] = (seg_t(1, 1), [0.0, 0.0, 2.0, 0.0, 0.0, 0.06]);
+        let moved = write("moved", &samples);
+        let run = |path: &str, sampling: &str| {
+            let ov = overlay(&format!("[hadamard]\norder = {order}\nreport_leakage = true\n[motion]\nmode = \"trajectory\"\n\
+                                       trajectory = \"{path}\"\nwithin_volume_sampling = \"{sampling}\"\n"), false);
+            parse_echoes(&[s.clone()], &ctx, Some(&ov), None).unwrap()
+        };
+        let (pv, ps) = (run(&held, "volume"), run(&held, "shot"));
+        let ov_ = simulate_p6(&pv, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).unwrap();
+        let os = simulate_p6(&ps, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).unwrap();
+        assert!(ov_.poses.iter().all(|q| *q != Pose::IDENTITY) && ov_.poses == os.poses);
+        assert!(ov_.mag.iter().zip(&os.mag).all(|(a, b)| a.to_bits() == b.to_bits()), "held still: \"shot\" is \"volume\"");
+        let st = os.segment_shots.as_ref().expect("segment truth");
+        assert!((0..n).all(|v| (0..2).all(|k| (st.times[v][k] - seg_t(v, k)).abs() < 1e-12)));
+        let pm = run(&moved, "shot");
+        let b = build(&pm, &ph, T2Mode::Class, RowOverride::None, pm.echo_times_s[0], &Schedule::new(&pm)).unwrap();
+        assert!(b.tissue_only.is_some());
+        for v in 0..n {
+            let (sets, twins) = (&b.shot_sets[v], &b.tissue_shot_sets[v]);
+            assert_eq!(sets.len(), if v == 1 { 1 } else { 0 }, "raw volume {v}");
+            assert_eq!(sets.len(), twins.len(), "raw volume {v}: tissue-only twins");
+            for (a, t) in sets.iter().zip(twins) {
+                assert_eq!(a.shots, vec![1]);
+                assert_eq!(a.shots, t.shots);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P10: a timed trajectory under Hadamard, two cycles after an included m0scan, is queried on
+    /// the raw volumes' clock (H raw volumes per cycle, not the H - 1 decoded rows): each raw
+    /// volume's pose is the trace at its first shot, each shot's at its own time, and a trace that
+    /// ends before the last raw acquisition is refused.
+    #[test]
+    fn hadamard_timed_trajectory_uses_the_raw_volumes_clock() {
+        let ph = crop();
+        let order = 4;
+        let n_sub = order - 1;
+        let (mut ld, mut pld, mut tr) = (vec![0.0], vec![0.0], vec![6.0]);
+        for _cycle in 0..2 {
+            for j in 0..n_sub {
+                ld.push(TAU);
+                pld.push(PLD + TAU * (n_sub - 1 - j) as f64);
+                tr.push(4.0);
+            }
+        }
+        let mut s = sidecar(ld, pld, tr, "Included", true);
+        s["SliceTiming"] = json!([0.0, 0.05]);
+        let ctx = format!("volume_type\nm0scan\n{}", "deltam\n".repeat(2 * n_sub));
+        let dir = std::env::temp_dir().join(format!("aslscan-p6-timed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |end: f64, sampling: &str| {
+            let tsv = dir.join(format!("trace-{end}.tsv"));
+            // a ramp in z, 0 to 4 mm over [0, end]
+            std::fs::write(&tsv, format!("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n0\t0\t0\t0\t0\t0\t0\n{end}\t0\t0\t4\t0\t0\t0\n")).unwrap();
+            let path = tsv.to_string_lossy().replace('\\', "\\\\");
+            let ov = overlay(&format!("[hadamard]\norder = {order}\n[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\n\
+                                       within_volume_sampling = \"{sampling}\"\n"), true);
+            let p = parse_echoes(&[s.clone()], &ctx, Some(&ov), None).unwrap();
+            simulate_p6(&p, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).map(|o| (p, o))
+        };
+        let (p, out) = run(200.0, "shot").unwrap();
+        let sched = Schedule::new(&p);
+        let n = sched.raw_rows.len();
+        assert_eq!(n, 1 + 2 * order, "an m0scan and two encoding cycles of raw volumes");
+        let z = |t: f64| 4.0 * t / 200.0;
+        let plan = out.shots.as_ref().unwrap();
+        for v in 0..n {
+            let first = sched.preps[sched.raws[v].prep].start_s + sched.raw_rows[v].t;
+            assert!((out.poses[v].trans_mm[2] - z(first)).abs() < 1e-12, "raw volume {v}");
+            for s in 0..2 {
+                let q = plan.pose(v, s);
+                assert!((plan.times[v][s] - first - 0.05 * s as f64).abs() < 1e-12);
+                assert!((q.trans_mm[2] - z(plan.times[v][s])).abs() < 1e-9, "raw volume {v}, shot {s}: {q:?}");
+            }
+        }
+        // a trace ending before the last raw volume's second shot: fine for one pose per volume, not per shot
+        let last = sched.preps[sched.raws[n - 1].prep].start_s + sched.raw_rows[n - 1].t;
+        assert!(run(last + 0.01, "volume").is_ok());
+        let e = run(last + 0.01, "shot").map(|_| ()).unwrap_err();
+        assert!(e.contains("never extrapolated"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Review fixes: a 3D Hadamard raw volume's kinetic truth is static under volume motion (its
     /// shots have their own poses), so it equals the motionless series' raw truth; and each echo's
     /// leakage is acquired at its own TE, equal to the one-echo series' at that TE.
@@ -2383,7 +2599,7 @@ mod tests {
 
     const QUASAR_PARTS: &str = "[kinetic]\nexchange_time = 0.6\n\
         [macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-        arterial_transit_time = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n\
+        arterial_compartment_att = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n\
         [vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n\
         [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n";
 
@@ -2405,7 +2621,7 @@ mod tests {
         let eps = p.suppression.as_ref().unwrap().for_row(0).epsilon;
         let vel = [0.0, 10.0, 6.0, 3.0];
         let abv = [0.0, 0.03, 0.015, 0.0];
-        let aatt = [0.0, 1.2, 1.8, 0.0];
+        let att_arterial = [0.0, 1.2, 1.8, 0.0];
         let fl = p.look_locker.as_ref().unwrap().flip_deg.clone();
         let [nx, ny, nz] = b.acq_grid.dims;
         let r_sim = Resampler::with_offset(ph.grid.dims, crate::resample::axis_aligned_voxels(&ph.grid).unwrap(), b.sim_grid.dims,
@@ -2428,13 +2644,13 @@ mod tests {
                         return (0.0, 0.0, 0.0);
                     }
                     let c = Case {
-                        k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64, t,
+                        k: kin, f_ml_100g_min: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64, t,
                         excitations: excitations.clone(), entry_lead: 0.0, pulses: vec![1.2], epsilon: eps,
                         region: PRegion::Slab(0.3), tau_ex: Some(0.6), span: (0.0, kin.tau),
                     };
                     let (iv, total) = c.read(4);
                     let l = l as usize;
-                    let art = c.arterial(abv[l], aatt[l], 0.0) * survival(vel[l], venc);
+                    let art = c.arterial(abv[l], att_arterial[l], 0.0) * survival(vel[l], venc);
                     (iv, total - iv, art)
                 };
                 // the truths, on the acquired grid
@@ -2483,7 +2699,7 @@ mod tests {
         let b = build(&p, &ph, T2Mode::Class, RowOverride::None, p.echo_times_s[0], &Schedule::new(&p)).unwrap();
         assert!(b.gt_read.is_some() && b.gt_read_iv.is_none() && b.gt_read_ev.is_none() && b.gt_read_art.is_none());
         let macro_only = "[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-            arterial_transit_time = { grey_matter = 0.5, white_matter = 0.7, csf = 0.0 }\n";
+            arterial_compartment_att = { grey_matter = 0.5, white_matter = 0.7, csf = 0.0 }\n";
         let pm = parse_echoes(&[s], &ctx, Some(&overlay(macro_only, true)), None).unwrap();
         let bm = build(&pm, &ph, T2Mode::Class, RowOverride::None, pm.echo_times_s[0], &Schedule::new(&pm)).unwrap();
         assert!(bm.gt_read_art.is_some() && bm.gt_read_iv.is_none());
@@ -2568,7 +2784,7 @@ mod tests {
                         return 0.0;
                     }
                     let c = Case {
-                        k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64,
+                        k: kin, f_ml_100g_min: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64,
                         t: e(readout), excitations: (0..readout).map(|m| (e(m), 60.0)).collect(), entry_lead: 0.0, pulses: vec![],
                         epsilon: 0.0, region: PRegion::Global, tau_ex: Some(0.6), span: h.spans[subbolus],
                     };
@@ -2622,7 +2838,7 @@ mod tests {
                         return 0.0;
                     }
                     let c = Case {
-                        k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64,
+                        k: kin, f_ml_100g_min: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64, m0: ph.m0[i] as f64,
                         t: e(readout), excitations: (0..readout).map(|m| (e(m), 60.0)).collect(), entry_lead: 0.0, pulses: vec![],
                         epsilon: 0.0, region: PRegion::Global, tau_ex: Some(0.6), span: h.spans[subbolus],
                     };

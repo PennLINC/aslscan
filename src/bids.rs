@@ -194,22 +194,109 @@ mod writer {
             "InversionFlipAngle": { "Value": s.params.inversion_flip_deg, "Source": s.inversion_flip.as_str() },
             "BloodModel": "sin(FlipAngle) * delta_m; the preparation does not invert the label (simasl)",
         }));
-        let motion = p.motion.as_ref().map_or(Value::Null, |m| json!({
-            "Mode": m.mode_name,
-            "Seed": out.motion_seed,
-            "SeedSalt": format!("{:#x}", crate::series::MOTION_SEED_SALT),
-            "RotationOrder": "Rz Ry Rx, degrees, about the field-of-view centre",
-            "WithinVolume": m.within.as_ref().map(|w| json!({
-                "DropoutRate": w.dropout_rate, "Severity": w.severity,
-                "JumpMm": w.jump_mm, "JumpDeg": w.jump_deg, "Events": out.events.len(),
-            })),
-            "GroundTruth": ["desc-motion_gt.tsv (rotations in radians)", "desc-motionEvents_gt.tsv",
-                            "desc-deltam_gt (moved)", "desc-deltamStatic_gt (unmoved)"],
-            "Approximations": [
-                "finished simulation-grid images are resampled, so slice timing travels with the anatomy",
-                "per-voxel T2/T2' maps (voxel mode) and the fieldmap stay in scanner space",
-            ],
-        }));
+        let motion = p.motion.as_ref().map_or(Value::Null, |m| {
+            let mut block = json!({
+                "Mode": m.mode_name,
+                "Seed": out.motion_seed,
+                "SeedSalt": format!("{:#x}", crate::series::MOTION_SEED_SALT),
+                "RotationOrder": "Rz Ry Rx, degrees, about the field-of-view centre",
+                "WithinVolume": m.within.as_ref().map(|w| json!({
+                    "DropoutRate": w.dropout_rate, "Severity": w.severity,
+                    "JumpMm": w.jump_mm, "JumpDeg": w.jump_deg, "Events": out.events.len(),
+                })),
+                "GroundTruth": ["desc-motion_gt.tsv (rotations in radians)", "desc-motionEvents_gt.tsv",
+                                "desc-deltam_gt (moved)", "desc-deltamStatic_gt (unmoved)"],
+                "Approximations": [
+                    "finished simulation-grid images are resampled, so slice timing travels with the anatomy",
+                    "per-voxel T2/T2' maps (voxel mode) and the fieldmap stay in scanner space",
+                ],
+            });
+            // P9 part A: the per-shot path's keys, written only there (P3's block stays byte-identical)
+            if m.shot_path {
+                let obj = block.as_object_mut().expect("an object");
+                obj.insert("Path".into(), json!("shot"));
+                obj.insert("WithinVolumeSampling".into(), json!(m.sampling.as_str()));
+                if let Some(f) = m.within.as_ref().and_then(|w| w.events_file.as_ref()) {
+                    obj.insert("EventsFile".into(), json!(f.path));
+                    obj.insert("WithinVolume".into(), json!({ "EventsFile": f.path, "Events": out.events.len() }));
+                }
+                obj.insert("ShotTransform".into(), json!(if m.timed.is_some() {
+                    "Q = J . P as world-space matrices about the field-of-view centre: P the timed trajectory's pose at \
+                     the shot's time (within_volume_sampling \"shot\" or \"slice\"), or at the volume's first shot \
+                     (\"volume\"), linear in the six parameters between its samples; J the summed jumps of the volume's \
+                     events up to the shot. Each shot's slices are resampled once."
+                } else {
+                    "Q = J . P as world-space matrices about the field-of-view centre: P the volume's pose, or the \
+                     trajectory through the volumes' poses placed at their first shots, linear in the six parameters \
+                     (within_volume_sampling = \"slice\"); J the summed jumps of the volume's events up to the shot. \
+                     Each shot's slices are resampled once."
+                }));
+                if let Some(gt) = obj.get_mut("GroundTruth").and_then(Value::as_array_mut) {
+                    gt.insert(2, json!("desc-motionShots_gt.tsv (each shot's composed pose, rotations in radians)"));
+                }
+            }
+            // P10 part C: a 3D readout's segments, each at its own pose
+            if out.segment_shots.is_some() {
+                let obj = block.as_object_mut().expect("an object");
+                obj.insert("WithinVolumeSampling".into(), json!(m.sampling.as_str()));
+                obj.insert("SegmentTransform".into(), json!(
+                    "each readout segment's lines are read from the volume's images moved further by J . P(t) . P_v^-1: \
+                     P(t) the trajectory's pose at the segment's first excitation, P_v the volume's pose (at its first \
+                     segment), J the summed jumps of the volume's events up to the segment"));
+                if let Some(a) = obj.get_mut("Approximations").and_then(Value::as_array_mut) {
+                    a.push(json!("one pose per readout segment: a segment's echo train is read at one pose"));
+                    a.push(json!("segment images are resampled from the volume's moved images (two interpolations)"));
+                }
+                if let Some(gt) = obj.get_mut("GroundTruth").and_then(Value::as_array_mut) {
+                    gt.insert(2, json!("desc-motionShots_gt.tsv (each segment's absolute pose J . P(t), rotations in radians; slices n/a)"));
+                }
+            }
+            // P10: a timed trajectory's block, written only for one (an untimed run's block is unchanged)
+            if let Some(t) = &m.timed {
+                let obj = block.as_object_mut().expect("an object");
+                let tr = &t.trace;
+                obj.insert("Trajectory".into(), json!({
+                    "File": t.path,
+                    "Timed": true,
+                    "Clock": format!("{}; seconds on the acquisition clock, 0 = the start of the first acquisition", t.clock),
+                    "Samples": tr.times.len(),
+                    "Span": [tr.times[0], tr.times[tr.times.len() - 1]],
+                    "MaxSampleInterval": tr.max_interval(),
+                    "MinShotSpacing": crate::series::shots::min_shot_spacing(p),
+                    "Sampling": if m.sampling.per_shot() { "the trace's pose at each shot's time" }
+                                else { "the trace's pose at each volume's first shot" },
+                    "Interpolation": "linear in the six parameters between samples; never extrapolated",
+                }));
+                if !m.shot_path {
+                    obj.insert("VolumePose".into(), json!("each volume's pose is the timed trajectory's at its first shot"));
+                }
+            }
+            // P9 part B
+            if m.spin_history {
+                let obj = block.as_object_mut().expect("an object");
+                let slab_mm = (0..3).map(|r| out.sim_grid.voxel_to_world[r][2].powi(2)).sum::<f64>().sqrt();
+                obj.insert("SpinHistory".into(), json!({
+                    "Model": "box-slab-piecewise-correction",
+                    "SliceProfile": "box",
+                    "SlabThickness": slab_mm,
+                    "MaxPieces": mrsim_acq::spin_history::MAX_PIECES,
+                    "Merges": out.spin_history_merges,
+                    "Compartments": "tissue",
+                    "Reference": "longitudinal::tissue_mz under background suppression, mrsignal::tissue_se without",
+                    "Description": "each phantom voxel's z extent keeps the longitudinal magnetization and time of its last \
+                                    excitation in exact pieces, stepped through every slice excitation at its shot's pose; \
+                                    the tissue images get the difference from the closed form, so a still head is unchanged",
+                }));
+                if let Some(gt) = obj.get_mut("GroundTruth").and_then(Value::as_array_mut) {
+                    gt.push(json!("desc-spinHistory_gt (the tissue's correction)"));
+                }
+                if let Some(ap) = obj.get_mut("Approximations").and_then(Value::as_array_mut) {
+                    ap.push(json!("spin history: a box slice profile as thick as the slice spacing; a voxel's tilt under \
+                                   rotation is ignored; labeled blood is treated as fresh"));
+                }
+            }
+            block
+        });
         let mut block = json!({
             "Simulator": { "Name": "aslscan", "Version": env!("CARGO_PKG_VERSION") },
             "Seed": out.seeds.0,
@@ -559,7 +646,7 @@ mod writer {
             };
             block["Macrovascular"] = json!({
                 "ArterialBloodVolume": q(&m.abv, "abv.nii.gz"),
-                "ArterialTransitTime": q(&m.aatt, "aatt.nii.gz"),
+                "ArterialCompartmentATT": q(&m.att_arterial, "att_arterial.nii.gz"),
                 "T2Arterial": resolved(m.t2_arterial),
                 "Model": "plug flow, no dispersion (Chappell et al. 2010, the macrovascular term)",
             });
@@ -1010,6 +1097,19 @@ mod writer {
                 "Resampling": mean,
             }))?;
         }
+        // P9 part B: the spin-history correction of the tissue
+        if let Some(sh) = &gt.spin_history {
+            write_4d(&PathBuf::from(format!("{gt_prefix}_desc-spinHistory_gt.nii.gz")), out.acq_grid.dims, out.n_volumes, sh, &out.acq_grid)
+                .map_err(|e| e.to_string())?;
+            write_json(&PathBuf::from(format!("{gt_prefix}_desc-spinHistory_gt.json")), &json!({
+                "Units": "arbitrary (the tissue signal's, as the M0map before the acquisition's signal scale)",
+                "Description": "the spin-history correction added to the tissue: the tissue's longitudinal magnetization at \
+                                each excitation minus the closed form's, summed over the tissue classes, per volume, \
+                                box-averaged; before the physiological and dropout factors; zero means no effect",
+                "Model": "box-slab-piecewise-correction",
+                "Resampling": mean,
+            }))?;
+        }
         // P4 ground truth (addendum, "Outputs"): each names the stages it includes.
         let frame = if moved { "moved by each row's pose like desc-deltam_gt" } else { "static" };
         let stages_of = if out.ge3d.is_some() {
@@ -1045,8 +1145,8 @@ mod writer {
         if let Some(a) = &gt.abv {
             wgt("aBV", a, "fraction", mean)?;
         }
-        if let Some(a) = &gt.aatt {
-            wgt("aATT", a, "s", "volume-weighted mean over phantom voxels with aBV > 0; 0 where none")?;
+        if let Some(a) = &gt.att_arterial {
+            wgt("attArterial", a, "s", "volume-weighted mean over phantom voxels with aBV > 0; 0 where none")?;
         }
         if out.hadamard.is_none() {
             write_volume_tables(&gt_prefix, p, out)?;
@@ -1165,6 +1265,32 @@ mod writer {
                                      e.jump_deg[0].to_radians(), e.jump_deg[1].to_radians(), e.jump_deg[2].to_radians()));
             }
             std::fs::write(format!("{gt_prefix}_desc-motionEvents_gt.tsv"), ev).map_err(|e| e.to_string())?;
+        }
+        // P9 part A: each shot's composed pose, on the per-shot path only
+        if let Some(plan) = &out.shots {
+            let mut tsv = String::from("volume\tshot\tslices\ttime\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+            for (v, times) in plan.times.iter().enumerate() {
+                for (s, t) in times.iter().enumerate() {
+                    let q = plan.pose(v, s);
+                    let r = q.rot_deg.map(f64::to_radians);
+                    let slices = plan.schedule[s].iter().map(|z| z.to_string()).collect::<Vec<_>>().join(",");
+                    tsv.push_str(&format!("{v}\t{s}\t{slices}\t{t}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                          q.trans_mm[0], q.trans_mm[1], q.trans_mm[2], r[0], r[1], r[2]));
+                }
+            }
+            std::fs::write(format!("{gt_prefix}_desc-motionShots_gt.tsv"), tsv).map_err(|e| e.to_string())?;
+        }
+        // P10 part C: a 3D readout's segments under per-segment sampling (no slices: n/a)
+        if let (None, Some(seg)) = (&out.shots, &out.segment_shots) {
+            let mut tsv = String::from("volume\tshot\tslices\ttime\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+            for (v, (times, poses)) in seg.times.iter().zip(&seg.poses).enumerate() {
+                for (s, (t, q)) in times.iter().zip(poses).enumerate() {
+                    let r = q.rot_deg.map(f64::to_radians);
+                    tsv.push_str(&format!("{v}\t{s}\tn/a\t{t}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                          q.trans_mm[0], q.trans_mm[1], q.trans_mm[2], r[0], r[1], r[2]));
+                }
+            }
+            std::fs::write(format!("{gt_prefix}_desc-motionShots_gt.tsv"), tsv).map_err(|e| e.to_string())?;
         }
         Ok(())
     }

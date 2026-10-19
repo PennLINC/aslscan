@@ -208,7 +208,7 @@ fn p4_all(rows: &str, extra: &str) -> Protocol {
          [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n\
          [kinetic]\nexchange_time = 0.4\n\
          [macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }}\n\
-         arterial_transit_time = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n\
+         arterial_compartment_att = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n\
          [vascular_crushing]\narterial_velocity = {{ grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }}\n\
          [physio]\ntissue_cardiac = 0.02\ntissue_respiratory = 0.01\nlabel_cardiac = 0.03\nlabel_drift = 0.01\n{extra}"
     )).unwrap();
@@ -232,7 +232,7 @@ fn p4_one(row: &str, tau_ex: f64) -> Protocol {
          [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n\
          [kinetic]\nexchange_time = {tau_ex}\n\
          [macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }}\n\
-         arterial_transit_time = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n\
+         arterial_compartment_att = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n\
          [vascular_crushing]\narterial_velocity = {{ grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }}\n\
          [physio]\ntissue_cardiac = 0.02\ntissue_respiratory = 0.01\nlabel_cardiac = 0.03\nlabel_drift = 0.01\n"
     )).unwrap();
@@ -248,7 +248,7 @@ fn p4_linearity(tau_ex: f64, ov_c: RowOverride, ov_l: RowOverride) -> f64 {
 
 #[test]
 fn linearity_holds_with_every_p4_part_on() {
-    // the arterial compartment is in its window at the readout (t = 3.6, 3.65; aATT 2.5 / 2.7)
+    // the arterial compartment is in its window at the readout (t = 3.6, 3.65; ATT_arterial 2.5 / 2.7)
     let out = simulate_with(&p4_one("label", 0.4), &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
     assert!(out.ground_truth.delta_m_arterial.as_ref().unwrap().iter().any(|v| *v > 0.0));
     let worst = p4_linearity(0.4, RowOverride::None, RowOverride::None);
@@ -306,7 +306,7 @@ fn p4_sidecar_blocks_and_ground_truth_files() {
     assert_eq!(side["VascularCrushing"], json!(true));
     assert_eq!(side["VascularCrushingVENC"], json!([0.0, 4.0, 0.0, 4.0]));
     let gt = dir.join("sub-01/perf/ground-truth");
-    for f in ["deltamIntravascular", "deltamSuppressed", "deltamArterial", "aBV", "aATT"] {
+    for f in ["deltamIntravascular", "deltamSuppressed", "deltamArterial", "aBV", "attArterial"] {
         assert!(gt.join(format!("sub-01_desc-{f}_gt.nii.gz")).exists(), "{f}");
         assert!(gt.join(format!("sub-01_desc-{f}_gt.json")).exists(), "{f}");
     }
@@ -333,7 +333,7 @@ fn p4_sidecar_blocks_and_ground_truth_files() {
         }
         assert!(nonzero > 0, "{f} is all zero");
     }
-    for (f, data) in [("aBV", &g.abv), ("aATT", &g.aatt)] {
+    for (f, data) in [("aBV", &g.abv), ("attArterial", &g.att_arterial)] {
         let data = data.as_ref().unwrap();
         let (vol, grid) = mrsim_acq::io::load_volume(&gt.join(format!("sub-01_desc-{f}_gt.nii.gz"))).unwrap();
         assert_eq!(grid.dims, [nx, ny, nz], "{f}");
@@ -760,7 +760,7 @@ fn grase_all(rows: &str, ov: RowOverride) -> Vec<(f64, f64)> {
          [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n\
          [kinetic]\nexchange_time = 0.4\n\
          [macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-         arterial_transit_time = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n\
+         arterial_compartment_att = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n\
          [vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n\
          [physio]\ntissue_cardiac = 0.05\nlabel_cardiac = 0.05\nlabel_drift = 0.02\n\
          [motion]\nwithin_volume = { dropout_rate = 1.0, severity = 0.3, jump_mm = [0.4, 0.0, 0.0], jump_deg = [0.0, 0.0, 1.0] }\n"
@@ -805,7 +805,7 @@ fn spiral_protocol(rows: &str) -> Protocol {
          [background_suppression]\nmodel = \"bolus-position\"\npulse_region = \"slab\"\nslab_entry_time = 0.3\n\
          [kinetic]\nexchange_time = 0.4\n\
          [macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-         arterial_transit_time = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n\
+         arterial_compartment_att = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n\
          [vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n\
          [physio]\ntissue_cardiac = 0.05\nlabel_cardiac = 0.05\nlabel_drift = 0.02\n\
          [motion]\nwithin_volume = { dropout_rate = 1.0, severity = 0.3, jump_mm = [0.4, 0.0, 0.0], jump_deg = [0.0, 0.0, 1.0] }\n"
@@ -1127,7 +1127,7 @@ fn the_legacy_manifest_keeps_the_identity_schedule() {
     let crush = crop_json(json!({"BackgroundSuppression": false, "VascularCrushing": true, "VascularCrushingVENC": [0.0, 4.0, 0.0, 4.0]}));
     let ctx = "volume_type\ncontrol\nlabel\ncontrol\nlabel\n";
     let motion = "seed = 3\n[motion]\nmode = \"random\"\ntrans_mm = [1.0, 1.0, 0.0]\nrot_deg = [0.0, 0.0, 2.0]\nvolumes = [1, 3]\n";
-    let macro_ov = "seed = 3\n[kinetic]\nexchange_time = 0.5\n[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\narterial_transit_time = { grey_matter = 3.0, white_matter = 3.2, csf = 0.0 }\n[vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n";
+    let macro_ov = "seed = 3\n[kinetic]\nexchange_time = 0.5\n[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\narterial_compartment_att = { grey_matter = 3.0, white_matter = 3.2, csf = 0.0 }\n[vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n";
     for (name, s, ov) in [
         ("crop_bs", crop_json(bs([2.0, 3.2])), "seed = 3\n"),
         ("crop_ir", plain.clone(), "seed = 3\n[signal]\nacq_contrast = \"ir\"\n"),
@@ -1351,7 +1351,7 @@ fn gradient_echo_delta_m_with_the_arterial_term() {
     // or the two parts' decays coincide)
     let macro_ov = "t2_arterial = 0.25\n[kinetic]\nexchange_time = 0.5\n\
                     [macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-                    arterial_transit_time = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n";
+                    arterial_compartment_att = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n";
     let p = multi_te("deltam", tes, macro_ov, true);
     let out = simulate_with(&p, &ph, T2Mode::Class, &phase(), RowOverride::None).unwrap();
     // T2' of the tissue labels: 1/T2' = 1/T2* - 1/T2, which the blood and arterial parts share
@@ -2008,7 +2008,7 @@ fn follow_up_review_fixes() {
 fn look_locker_with_p4_parts_writes_the_parts() {
     let parts = "[kinetic]\nexchange_time = 0.6\n[macrovascular]\n\
                  arterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-                 arterial_transit_time = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n";
+                 arterial_compartment_att = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n";
     let dir = std::env::temp_dir().join(format!("aslscan-e2e-p7a-{}", std::process::id()));
     for (extra, on) in [(parts, true), ("", false)] {
         let p = look_locker(&["control", "label"], 4, 35.0, 4.5, extra);
@@ -2288,5 +2288,146 @@ fn ll3d_fixture_writes_its_delays_and_m0() {
         assert!(sim["Readout"].get(k).is_none(), "the M0 readout block has {k}");
     }
     assert_eq!(m0["FlipAngle"].as_f64(), Some(8.0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P9 part A, end to end: single-band shot events on the crop take the per-shot path; the shots
+/// TSV holds every volume's shots with its times and poses; the sidecar names the path; the
+/// events written are read back as an events file and reproduce the images (to the rounding the
+/// TSV's radians and attenuations allow); a P3-path run's sidecar has none of the new keys.
+#[test]
+fn per_shot_motion_writes_its_table_and_replays_its_events() {
+    let wv = "[motion]\nmode = \"linear\"\ntrans_mm = [0.0, 0.0, 0.6]\nwithin_volume_sampling = \"slice\"\n\
+              [motion.within_volume]\ndropout_rate = 0.5\nseverity = 0.3\njump_mm = [0.4, 0.0, 0.6]\njump_deg = [0.0, 0.0, 1.5]\n";
+    let rows = "control,label,control,label";
+    let p = protocol_with(rows, 0.0, false, wv);
+    assert!(p.motion.as_ref().unwrap().shot_path);
+    let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert!(!out.events.is_empty(), "the seed must draw at least one event");
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-shots-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    aslscan::bids::write_dataset(&dir, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+    let perf = dir.join("sub-01/perf");
+    let side: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    let m = &side["AslscanSimulation"]["Motion"];
+    assert_eq!((m["Path"].clone(), m["WithinVolumeSampling"].clone()), (json!("shot"), json!("slice")));
+    assert!(m["GroundTruth"].as_array().unwrap().iter().any(|g| g.as_str().unwrap().starts_with("desc-motionShots_gt.tsv")));
+    let gt = perf.join("ground-truth");
+    let shots = std::fs::read_to_string(gt.join("sub-01_desc-motionShots_gt.tsv")).unwrap();
+    let table: Vec<Vec<f64>> = shots.lines().skip(1)
+        .map(|l| l.split('\t').enumerate().filter(|(i, _)| *i != 2).map(|(_, c)| c.parse().unwrap()).collect()).collect();
+    assert_eq!(table.len(), 4 * 2, "four volumes of two single-band shots");
+    // volume 1, shot 0: on the trajectory's node, the linear drift's pose (0.6 / 4 mm per volume, 2 listed)
+    let row = &table[2];
+    assert_eq!((row[0], row[1]), (1.0, 0.0));
+    assert!((row[2] - (4.0 + 3.6)).abs() < 1e-9, "time {}", row[2]);
+    let plan = out.shots.as_ref().unwrap();
+    assert!((row[5] - plan.pose(1, 0).trans_mm[2]).abs() < 1e-12);
+    // replay: the written events as an events file reproduce the images
+    let ev_path = gt.join("sub-01_desc-motionEvents_gt.tsv").to_string_lossy().replace('\\', "\\\\");
+    let wf = format!("[motion]\nmode = \"linear\"\ntrans_mm = [0.0, 0.0, 0.6]\nwithin_volume_sampling = \"slice\"\n\
+                      [motion.within_volume]\nevents = \"{ev_path}\"\n");
+    let q = protocol_with(rows, 0.0, false, &wf);
+    let again = simulate_with(&q, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    assert_eq!(again.events.len(), out.events.len());
+    let peak = out.mag.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let worst = out.mag.iter().zip(&again.mag).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(worst <= 1e-6 * peak, "replay differs by {worst} of peak {peak}");
+    // a P3-path run writes none of the new keys or files
+    let p3 = protocol_with(rows, 0.0, false, "[motion]\nmode = \"random\"\ntrans_mm = [1.0, 0.0, 0.0]\n");
+    assert!(!p3.motion.as_ref().unwrap().shot_path);
+    let out3 = simulate_with(&p3, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let dir3 = dir.join("p3");
+    aslscan::bids::write_dataset(&dir3, &aslscan::bids::Names::new("01", None), &p3, &out3).unwrap();
+    let perf3 = dir3.join("sub-01/perf");
+    let side3: Value = serde_json::from_str(&std::fs::read_to_string(perf3.join("sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    let m3 = side3["AslscanSimulation"]["Motion"].as_object().unwrap();
+    for k in ["Path", "WithinVolumeSampling", "EventsFile", "ShotTransform"] {
+        assert!(!m3.contains_key(k), "P3 sidecar has {k}");
+    }
+    assert!(!perf3.join("ground-truth/sub-01_desc-motionShots_gt.tsv").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P10, end to end: a timed trajectory writes its `Trajectory` block, under "shot" on the shot path
+/// and under "volume" on P3's path (with `VolumePose`); the shots table's times are on the clock
+/// the trace is sampled on; an untimed run's block has no `Trajectory`.
+#[test]
+fn a_timed_trajectory_writes_its_block() {
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-timed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let tsv = dir.join("trace.tsv");
+    // 0 to 2 mm in z over 0 to 40 s, sampled at 1 Hz
+    let mut text = String::from("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+    for i in 0..=40 {
+        text.push_str(&format!("{i}\t0\t0\t{}\t0\t0\t0\n", i as f64 / 20.0));
+    }
+    std::fs::write(&tsv, text).unwrap();
+    let path = tsv.to_string_lossy().replace('\\', "\\\\");
+    let rows = "control,label,control,label";
+    for (name, sampling) in [("shot", "shot"), ("volume", "volume")] {
+        let ov = format!("[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\nwithin_volume_sampling = \"{sampling}\"\n");
+        let p = protocol_with(rows, 0.0, false, &ov);
+        let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+        let d = dir.join(name);
+        aslscan::bids::write_dataset(&d, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+        let perf = d.join("sub-01/perf");
+        let side: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("sub-01_part-mag_asl.json")).unwrap()).unwrap();
+        let m = &side["AslscanSimulation"]["Motion"];
+        let t = &m["Trajectory"];
+        assert_eq!((t["Timed"].clone(), t["Samples"].clone(), t["Span"].clone()), (json!(true), json!(41), json!([0.0, 40.0])), "{name}");
+        assert_eq!(t["MaxSampleInterval"], json!(1.0));
+        assert!(t["Clock"].as_str().unwrap().starts_with("time column"), "{name}");
+        assert_eq!(m["Mode"], json!("trajectory"));
+        if sampling == "shot" {
+            assert_eq!((m["Path"].clone(), m["WithinVolumeSampling"].clone()), (json!("shot"), json!("shot")));
+            assert!(m["ShotTransform"].as_str().unwrap().contains("timed trajectory"));
+            let shots = std::fs::read_to_string(perf.join("ground-truth/sub-01_desc-motionShots_gt.tsv")).unwrap();
+            for l in shots.lines().skip(1) {
+                let c: Vec<f64> = l.split('\t').enumerate().filter(|(i, _)| *i != 2).map(|(_, x)| x.parse().unwrap()).collect();
+                assert!((c[5] - c[2] / 20.0).abs() < 1e-9, "the shot's z is the trace at its time: {l}");
+            }
+        } else {
+            assert!(m.get("Path").is_none() && m["VolumePose"].is_string());
+            for (v, q) in out.poses.iter().enumerate() {
+                let first = p.row_start[v] + p.rows[v].t;
+                assert!((q.trans_mm[2] - first / 20.0).abs() < 1e-9, "volume {v}");
+            }
+        }
+    }
+    // an untimed run: no Trajectory block
+    let p3 = protocol_with(rows, 0.0, false, "[motion]\nmode = \"random\"\ntrans_mm = [1.0, 0.0, 0.0]\n");
+    let out3 = simulate_with(&p3, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+    let d3 = dir.join("untimed");
+    aslscan::bids::write_dataset(&d3, &aslscan::bids::Names::new("01", None), &p3, &out3).unwrap();
+    let side3: Value = serde_json::from_str(&std::fs::read_to_string(d3.join("sub-01/perf/sub-01_part-mag_asl.json")).unwrap()).unwrap();
+    assert!(side3["AslscanSimulation"]["Motion"].get("Trajectory").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P9 part B, end to end: spin history writes its ground truth and sidecar block, and a run
+/// without it writes neither.
+#[test]
+fn spin_history_writes_its_truth_and_sidecar_block() {
+    let base = "[motion]\nmode = \"linear\"\ntrans_mm = [0.0, 0.0, 0.6]\nwithin_volume_sampling = \"slice\"\n";
+    let dir = std::env::temp_dir().join(format!("aslscan-e2e-spin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (name, extra, want) in [("with", "spin_history = true\n", true), ("without", "", false)] {
+        let p = protocol_with("control,label,control,label", 0.0, false, &format!("{base}{extra}"));
+        let out = simulate_with(&p, &crop(), T2Mode::Auto, &phase(), RowOverride::None).unwrap();
+        let d = dir.join(name);
+        aslscan::bids::write_dataset(&d, &aslscan::bids::Names::new("01", None), &p, &out).unwrap();
+        let perf = d.join("sub-01/perf");
+        assert_eq!(perf.join("ground-truth/sub-01_desc-spinHistory_gt.nii.gz").exists(), want, "{name}");
+        let side: Value = serde_json::from_str(&std::fs::read_to_string(perf.join("sub-01_part-mag_asl.json")).unwrap()).unwrap();
+        let m = &side["AslscanSimulation"]["Motion"];
+        assert_eq!(m.get("SpinHistory").is_some(), want, "{name}");
+        if want {
+            assert_eq!(m["SpinHistory"]["Model"], json!("box-slab-piecewise-correction"));
+            assert_eq!(m["SpinHistory"]["SliceProfile"], json!("box"));
+            assert!((m["SpinHistory"]["SlabThickness"].as_f64().unwrap() - 3.0).abs() < 1e-9);
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

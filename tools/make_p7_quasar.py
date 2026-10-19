@@ -48,7 +48,7 @@ exchange_time = 0.6
 
 [macrovascular]
 arterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }}
-arterial_transit_time = {{ grey_matter = 0.5, white_matter = 0.7, csf = 0.0 }}
+arterial_compartment_att = {{ grey_matter = 0.5, white_matter = 0.7, csf = 0.0 }}
 
 [vascular_crushing]
 arterial_velocity = {{ grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }}

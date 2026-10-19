@@ -18,10 +18,11 @@
 # enough to survive reconstruction and the f32 cast; never committed). It passes only if every run
 # succeeds AND at least one NIfTI differs in content.
 #
-# Needs work/phantom-3t, work/phantom-3t-z100, work/phantom-3t-z97, work/phantom-3t-z120 and
-# work/phantom-3t-asl001 (see tools/hrgt_to_bids.py: z97 is --crop 0:197 0:233 46:143, which fits
-# asl004's 24 slices of 4.05 mm; z120 and asl001 are the P5 acceptance crops named in the
-# asl005_p5 and asl001_p5 overlays).
+# Needs work/phantom-3t, work/phantom-3t-z100, work/phantom-3t-z97, work/phantom-3t-z120,
+# work/phantom-3t-asl001 and work/phantom-3t-hcp (see tools/hrgt_to_bids.py: z97 is --crop 0:197
+# 0:233 46:143, which fits asl004's 24 slices of 4.05 mm; z120 and asl001 are the P5 acceptance
+# crops named in the asl005_p5 and asl001_p5 overlays; hcp is --crop 0:197 0:233 20:155, the P8
+# fixture's 36 partitions).
 #
 # A case may name a required feature as its seventh field (kspace): a build without it skips the
 # case, and the run checks the executed and skipped counts per build. Under --self-test every
@@ -146,10 +147,10 @@ printf 'seed = 3\n' > $A/crop-seed.toml
 # P4 cases on the crop: physiological noise alone; the arterial compartment with crushing and
 # exchange; bolus-position suppression with a slab pulse during labeling
 printf 'seed = 3\n[physio]\ntissue_cardiac = 0.02\ntissue_drift = 0.01\nlabel_respiratory = 0.03\n' > $A/crop-physio.toml
-printf 'seed = 3\n[kinetic]\nexchange_time = 0.5\n[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\narterial_transit_time = { grey_matter = 3.0, white_matter = 3.2, csf = 0.0 }\n[vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n' > $A/crop-macro.toml
+printf 'seed = 3\n[kinetic]\nexchange_time = 0.5\n[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\narterial_compartment_att = { grey_matter = 3.0, white_matter = 3.2, csf = 0.0 }\n[vascular_crushing]\narterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }\n' > $A/crop-macro.toml
 printf 'seed = 3\n[background_suppression]\nmodel = "bolus-position"\npulse_region = "slab"\nslab_entry_time = 0.3\n' > $A/crop-bolus.toml
 crop_json '"BackgroundSuppression": true, "BackgroundSuppressionNumberPulses": 2, "BackgroundSuppressionPulseTime": [1.5, 2.7]' > $A/crop-bs-early.json
-# PASL on the crop: cutoff 0.7 s, PLD 1.8 s; suppression after the cutoff, and motion
+# PASL on the crop: cutoff 0.7 s, TI 1.8 s; suppression after the cutoff, and motion
 pasl_json() {
   printf '{"ArterialSpinLabelingType": "PASL", "BolusCutOffFlag": true, "BolusCutOffTechnique": "Q2TIPS", "BolusCutOffDelayTime": 0.7, "PostLabelingDelay": 1.8, "M0Type": "Absent", "RepetitionTimePreparation": 4.0, "EchoTime": 0.012, "MagneticFieldStrength": 3, "AcquisitionVoxelSize": [2.0, 2.0, 3.0], "MRAcquisitionType": "2D", "SliceTiming": [0.0, 0.05], "PhaseEncodingDirection": "j-", "TotalReadoutTime": 0.012, %s}\n' "$1"
 }
@@ -176,6 +177,7 @@ sed '/^\[m0\]/,$d' $P/p5_ge/overlay.toml > $A/p5-ge-incl.toml
 { cat $P/p5_grase/overlay.toml; printf '\n[motion.within_volume]\ndropout_rate = 1.0\nseverity = 0.3\njump_mm = [0.5, 0.0, 0.0]\njump_deg = [0.0, 0.0, 1.0]\n'; } > $A/p5-grase-seg.toml
 Z120=$HERE/work/phantom-3t-z120
 P001=$HERE/work/phantom-3t-asl001
+HCP=$HERE/work/phantom-3t-hcp
 # P6 cases: the two generated p6_ll variants (one readout per cycle, the legacy dispatch; an
 # included m0scan between the cycles); the multi-TE fixtures pass one sidecar per echo
 python3 "$HERE/tools/regress_p6_inputs.py" "$P/p6_ll" "$A"
@@ -206,6 +208,7 @@ cases=(
   "p5_grase_seg|$P/p5_grase/asl.json|$P/p5_grase/aslcontext.tsv|$A/p5-grase-seg.toml|$CROP"
   "asl005_p5|$P/asl005/asl.json|$P/asl005/aslcontext.tsv|$P/asl005_p5/overlay.toml|$Z120"
   "asl001_p5|$P/asl001/asl.json|$P/asl001/aslcontext.tsv|$P/asl001_p5/overlay.toml|$P001||kspace"
+  "p8_spiral_kz|$P/p8_spiral_kz/asl.json|$P/p8_spiral_kz/aslcontext.tsv|$P/p8_spiral_kz/overlay.toml|$HCP||kspace"
   "p6_hadamard|$P/p6_hadamard/asl.json|$P/p6_hadamard/aslcontext.tsv|$P/p6_hadamard/overlay.toml|$CROP"
   "p6_hadamard_3t|$P/p6_hadamard_3t/asl.json|$P/p6_hadamard_3t/aslcontext.tsv|$P/p6_hadamard_3t/overlay.toml|$Z97"
   "p6_hadamard_grase|$P/p6_hadamard_grase/asl.json|$P/p6_hadamard_grase/aslcontext.tsv|$P/p6_hadamard_grase/overlay.toml|$Z120"
@@ -215,9 +218,13 @@ cases=(
   "p6_ll|$P/p6_ll/asl.json|$P/p6_ll/aslcontext.tsv|$P/p6_ll/overlay.toml|$CROP"
   "p6_ll_legacy|$A/p6-ll-legacy.json|$A/p6-ll-legacy.tsv|$A/p6-ll-legacy.toml|$CROP"
   "p6_ll_m0|$A/p6-ll-m0.json|$A/p6-ll-m0.tsv|$A/p6-ll-m0.toml|$CROP"
+  # P9's shot path (P10 plan, Task 0): an events file with spin history, and the per-slice sampling
+  # of a drift with spin history, the paths a timed trace extends
+  "p9_shot_spin|$P/p9_single_band/asl.json|$P/p9_single_band/aslcontext.tsv|$P/p9_single_band/overlay-sh-event.toml|$Z100"
+  "p9_slice_drift|$P/p9_single_band/asl.json|$P/p9_single_band/aslcontext.tsv|$P/p9_single_band/overlay-sh-drift.toml|$Z100"
 )
 # executed cases per build (the rest are skipped for a missing feature)
-declare -A expect=([cli-kspace-par]=34 [cli]=33)
+declare -A expect=([cli-kspace-par]=37 [cli]=35)
 
 fail=0; undetected=0
 for feats in cli,kspace,par cli; do

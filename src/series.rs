@@ -30,7 +30,7 @@ use mrsim_acq::io::hires_grid;
 use mrsim_acq::kspace::{simulate_acquisition_oversampled, Acquisition, T2Volume};
 use mrsim_acq::kspace3d::{simulate_acquisition_3d_kz, KzOptions, LineWeights, ShotSet};
 use mrsim_acq::motion::{
-    apply_motion, apply_multiband_motion, resolve_poses, slice_schedule, DropoutLaw, DroppedShot, MotionEvent, Pose,
+    apply_motion, apply_multiband_motion, slice_schedule, DropoutLaw, DroppedShot, MotionEvent, Pose,
 };
 use mrsim_acq::phase::PhaseModel;
 
@@ -54,6 +54,7 @@ pub const M0_SEED_SALT: u64 = 0x4D30_5343_414E;
 pub const MOTION_SEED_SALT: u64 = 0x4D4F_5449_4F4E;
 
 mod p6;
+pub mod shots;
 mod ge3d;
 
 /// Ground-truth maps on the acquisition grid (`resample` rules per map, see the spec).
@@ -86,9 +87,12 @@ pub struct GroundTruth {
     pub delta_m_suppressed: Option<Vec<f32>>,
     /// P4, part B: the arterial `delta_m` with `g = 1` (before factors and crushing).
     pub delta_m_arterial: Option<Vec<f32>>,
-    /// P4, part B: `aBV` (mean) and `aATT` (mean over `aBV > 0`), static.
+    /// P4, part B: `aBV` (mean) and `ATT_arterial` (mean over `aBV > 0`), static.
     pub abv: Option<Vec<f32>>,
-    pub aatt: Option<Vec<f32>>,
+    pub att_arterial: Option<Vec<f32>>,
+    /// P9 part B: the spin-history correction summed over the tissue classes, per volume on the
+    /// acquisition grid (`vox * n_volumes + v`), before the physiological and dropout factors.
+    pub spin_history: Option<Vec<f32>>,
 }
 
 /// The physiological factors applied (P4, part E): one line per volume and slice.
@@ -134,6 +138,13 @@ pub struct SeriesOutput {
     pub motion_seed: Option<u64>,
     pub events: Vec<MotionEvent>,
     pub dropped: Vec<DroppedShot>,
+    /// The per-shot plan, on the P9 shot path only.
+    pub shots: Option<shots::ShotPlan>,
+    /// P10 part C: a 3D readout's segments under `within_volume_sampling = "shot"`: each motion
+    /// unit's segment times and absolute poses `J . P(t)` (`desc-motionShots_gt.tsv`).
+    pub segment_shots: Option<shots::SegmentShots>,
+    /// P9 part B: how often the spin-history engine merged a full voxel's pieces.
+    pub spin_history_merges: Option<u64>,
     /// Under `[compat] asldro = true`: what the SNR resolved to.
     pub compat: Option<CompatFacts>,
     /// P4, part C: the arterial survival per row and label (in `labels` order).
@@ -415,7 +426,7 @@ struct P4 {
     label_of: Vec<usize>,
     /// Per phantom voxel, part B.
     abv: Option<Vec<f64>>,
-    aatt: Option<Vec<f64>>,
+    att_arterial: Option<Vec<f64>>,
     /// Per row, per label (part C); all ones without crushing.
     crush: Option<Vec<Vec<f64>>>,
     physio: Option<Physio>,
@@ -438,8 +449,8 @@ impl P4 {
                 if let QuantitySource::Table(x) = &m.abv {
                     t.push(("macrovascular.arterial_blood_volume", x));
                 }
-                if let QuantitySource::Table(x) = &m.aatt {
-                    t.push(("macrovascular.arterial_transit_time", x));
+                if let QuantitySource::Table(x) = &m.att_arterial {
+                    t.push(("macrovascular.arterial_compartment_att", x));
                 }
             }
             if let Some(v) = p.crushing.as_ref().and_then(|c| c.arterial_velocity.as_ref()) {
@@ -483,8 +494,8 @@ impl P4 {
                 }
             }
         };
-        let (abv, aatt) = match &p.macrovascular {
-            Some(m) => (Some(resolve(&m.abv, &ph.abv, "abv")?), Some(resolve(&m.aatt, &ph.aatt, "aatt")?)),
+        let (abv, att_arterial) = match &p.macrovascular {
+            Some(m) => (Some(resolve(&m.abv, &ph.abv, "abv")?), Some(resolve(&m.att_arterial, &ph.att_arterial, "att_arterial")?)),
             None => (None, None),
         };
 
@@ -496,10 +507,10 @@ impl P4 {
                         "background_suppression.slab_entry_time {d} s exceeds the ATT {} s of perfused voxel {i}: the \
                          label would enter the slab after reaching the voxel", ph.att[i]));
                 }
-                if let (Some(b), Some(a)) = (&abv, &aatt) {
+                if let (Some(b), Some(a)) = (&abv, &att_arterial) {
                     if b[i] > 0.0 && d > a[i] {
                         return Err(format!(
-                            "background_suppression.slab_entry_time {d} s exceeds the arterial transit time {} s of \
+                            "background_suppression.slab_entry_time {d} s exceeds the arterial compartment's ATT {} s of \
                              voxel {i}", a[i]));
                     }
                 }
@@ -541,7 +552,7 @@ impl P4 {
                 }
             })
             .collect();
-        Ok(P4 { label_path, label_of, abv, aatt, crush, physio, label_physio })
+        Ok(P4 { label_path, label_of, abv, att_arterial, crush, physio, label_physio })
     }
 }
 
@@ -600,6 +611,19 @@ fn simulate_legacy(
              {} mm slices)", p.slice_offsets.len(), ph.grid.dims[2] as f64 * pv[2], p.voxel_size_mm[2]));
     }
     let slice_offsets: Vec<f64> = if res3d.is_some() { vec![0.0; nz] } else { p.slice_offsets.clone() };
+    // P10: a timed trajectory covers every time this series queries it at, checked before anything
+    // is simulated (the protocol rows' clock; a 3D readout queries each volume's first segment)
+    let row_t: Vec<f64> = p.rows.iter().map(|r| r.t).collect();
+    if let Some(m) = p.motion.as_ref() {
+        let q = match &res3d {
+            // P10 part C: every segment of a 3D row, one repetition apart
+            Some(r3) if m.sampling.per_shot() => (0..p.rows.len())
+                .flat_map(|v| (0..r3.n_shots).map(move |s| p.row_start[v] + s as f64 * p.rows[v].tr + p.rows[v].t))
+                .collect(),
+            _ => shots::query_times(&p.row_start, &row_t, &slice_offsets, m.sampling.per_shot() && res3d.is_none()),
+        };
+        m.check_timed_coverage(&q)?;
+    }
     let dv = p.voxel_size_mm;
     let sim_vox = [dv[0] / o as f64, dv[1] / o as f64, dv[2]];
     let off = corner_offset(&ph.grid, &acq_grid)?;
@@ -1085,7 +1109,7 @@ fn simulate_legacy(
                     if ph.dseg[i] <= 0 {
                         continue;
                     }
-                    let (f_ml, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
+                    let (f_ml_100g_min, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
                     // the tissue label: (scale, total, intravascular), the single-sub-bolus factor
                     // folded into the scale as P3 folds its factor into the sign
                     let (scale, dm, iv) = match &bolus {
@@ -1094,17 +1118,17 @@ fn simulate_legacy(
                             let key = delta.map_or(u64::MAX, f64::to_bits);
                             let sb = partitions.entry(key).or_insert_with(|| subbolus_factors(pulses, *eps, kin.tau, delta));
                             if sb.len() == 1 {
-                                let iv = p.exchange_time.map(|te| delta_m_iv(&kin, f_ml, att, t1t, m0, t, te));
-                                (sb[0].2, delta_m(&kin, f_ml, att, t1t, m0, t), iv)
+                                let iv = p.exchange_time.map(|te| delta_m_iv(&kin, f_ml_100g_min, att, t1t, m0, t, te));
+                                (sb[0].2, delta_m(&kin, f_ml_100g_min, att, t1t, m0, t), iv)
                             } else {
-                                let dm: f64 = sb.iter().map(|&(a, b, f)| f * delta_m_sub(&kin, f_ml, att, t1t, m0, t, a, b)).sum();
+                                let dm: f64 = sb.iter().map(|&(a, b, f)| f * delta_m_sub(&kin, f_ml_100g_min, att, t1t, m0, t, a, b)).sum();
                                 let iv = p.exchange_time.map(|te| {
-                                    sb.iter().map(|&(a, b, f)| f * delta_m_iv_sub(&kin, f_ml, att, t1t, m0, t, a, b, te)).sum::<f64>()
+                                    sb.iter().map(|&(a, b, f)| f * delta_m_iv_sub(&kin, f_ml_100g_min, att, t1t, m0, t, a, b, te)).sum::<f64>()
                                 });
                                 (1.0, dm, iv)
                             }
                         }
-                        None => (1.0, delta_m(&kin, f_ml, att, t1t, m0, t), p.exchange_time.map(|te| delta_m_iv(&kin, f_ml, att, t1t, m0, t, te))),
+                        None => (1.0, delta_m(&kin, f_ml_100g_min, att, t1t, m0, t), p.exchange_time.map(|te| delta_m_iv(&kin, f_ml_100g_min, att, t1t, m0, t, te))),
                     };
                     let s = sign0 * scale;
                     match iv {
@@ -1116,17 +1140,17 @@ fn simulate_legacy(
                     }
                     if !giv.is_empty() {
                         // the unsuppressed intravascular part: kinetics and the split only
-                        giv[j] = delta_m_iv(&kin, f_ml, att, t1t, m0, t, p.exchange_time.unwrap());
+                        giv[j] = delta_m_iv(&kin, f_ml_100g_min, att, t1t, m0, t, p.exchange_time.unwrap());
                     }
                     if !gsup.is_empty() {
                         gsup[j] = scale * dm;
                     }
-                    if let (Some(abv), Some(aatt)) = (&p4.abv, &p4.aatt) {
-                        let (va, a) = arterial_dm(&kin, abv[i], aatt[i], m0, t);
+                    if let (Some(abv), Some(att_arterial)) = (&p4.abv, &p4.att_arterial) {
+                        let (va, a) = arterial_dm(&kin, abv[i], att_arterial[i], m0, t);
                         if let Some(a) = a {
                             let g = match &bolus {
                                 Some((region, pulses, eps)) => {
-                                    arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, aatt[i]))
+                                    arterial_factor(pulses, *eps, a, entry_offset(p.label_type, *region, att_arterial[i]))
                                 }
                                 None => 1.0,
                             };
@@ -1188,11 +1212,64 @@ fn simulate_legacy(
     let mut poses = vec![Pose::IDENTITY; n];
     let mut events = Vec::new();
     let mut dropped = Vec::new();
+    let mut shot_plan: Option<shots::ShotPlan> = None;
     let mut gt_moved: Option<Vec<f32>> = None;
+    let mut gt_spin: Option<Vec<f32>> = None;
+    let mut spin_history_merges: Option<u64> = None;
     if let (Some(m), Some(seed)) = (&p.motion, motion_seed) {
         let v2w = sim_grid.voxel_to_world;
-        poses = resolve_poses(&m.mode, n, seed);
-        apply_motion(&mut images, sim_grid.dims, n, v2w, &poses);
+        // a timed trajectory's pose at each volume's first shot (P10), else the mode's poses
+        poses = m.volume_poses(&shots::reference_times(&p.row_start, &row_t), seed);
+        if m.shot_path {
+            // P9 part A: one resampling per shot, by the pose at its own time and its jumps
+            let plan = shots::shot_plan(m, &poses, &p.row_start, &row_t, &slice_offsets, &sim_grid,
+                                        |n_shots| draw_events(m.within.as_ref(), n, n_shots, seed));
+            dropped = shots::apply(&plan, &mut images, &sim_grid, n);
+            if m.spin_history {
+                // P9 part B: the tissue's correction for its history, against the closed form the
+                // images were made with, then scaled by what the tissue carries per slice (the
+                // physiological factor) and per shot (the dropout attenuation)
+                let class: Vec<u8> = (0..ph.nvox())
+                    .map(|i| masks.iter().position(|mk| mk[i]).map_or(mrsim_acq::spin_history::NO_CLASS, |c| c as u8))
+                    .collect();
+                let inputs = shots::SpinInputs {
+                    grid: &ph.grid, t1: &ph.t1, m0: &ph.m0, class: &class, n_classes: k,
+                    suppression: suppression[0].as_ref(), tr: p.rows[0].tr, signal_t: p.rows[0].t, starts: &p.row_start,
+                };
+                let (corr, merges) = shots::spin_history_correction(&plan, &inputs, &sim_grid, &slice_offsets);
+                let mut sum = vec![0.0f32; nvox_sim * n];
+                for c in &corr {
+                    for (s, x) in sum.iter_mut().zip(c) {
+                        *s += *x;
+                    }
+                }
+                gt_spin = Some(block_mean_inplane(&sum, sim_grid.dims, o, n));
+                let mut shot_of = vec![0usize; nz];
+                for (s, sl) in plan.schedule.iter().enumerate() {
+                    for &z in sl {
+                        shot_of[z] = s;
+                    }
+                }
+                for v in 0..n {
+                    for z in 0..nz {
+                        let tf = p4.physio.as_ref().map_or(1.0, |ph_| ph_.tissue_factor(p.row_start[v] + p.rows[v].t + slice_offsets[z]));
+                        let att: f32 = plan.attenuation[v][shot_of[z]].iter().product();
+                        let f = tf as f32 * att;
+                        for (c, cc) in corr.iter().enumerate() {
+                            for xy in 0..slab {
+                                let i = (z * slab + xy) * n + v;
+                                images[c][i] += cc[i] * f;
+                            }
+                        }
+                    }
+                }
+                spin_history_merges = Some(merges);
+            }
+            events = plan.events.clone();
+            shot_plan = Some(plan);
+        } else {
+            apply_motion(&mut images, sim_grid.dims, n, v2w, &poses);
+        }
         let mut gt_arr = [std::mem::take(&mut gt_sim)];
         apply_motion(&mut gt_arr, sim_grid.dims, n, v2w, &poses);
         let [moved] = gt_arr;
@@ -1210,7 +1287,7 @@ fn simulate_legacy(
             // P5 part D: a shot is a readout segment; the events are drawn per shot as in 2D, but
             // act through per-shot images and shot gains below, not on slice groups
             events = draw_events(m.within.as_ref(), n, n_shots, seed);
-        } else {
+        } else if !m.shot_path {
             let n_shots = slice_schedule(nz, p.mb, p.mb_interleaved).len();
             events = draw_events(m.within.as_ref(), n, n_shots, seed);
             if !events.is_empty() {
@@ -1226,16 +1303,24 @@ fn simulate_legacy(
     // 1 - severity (DropoutLaw::Uniform), a shot gain.
     let mut shot_gain = vec![vec![1.0f64; n_shots]; n];
     let mut shot_sets: Vec<Vec<ShotSet>> = vec![Vec::new(); n];
-    if res3d.is_some() && !events.is_empty() {
+    // P10 part C: under within_volume_sampling = "shot" each segment takes the trajectory's pose at
+    // its own excitation time, relative to the pose the volume's images already carry
+    let seg = res3d.is_some() && p.motion.as_ref().is_some_and(|m| m.sampling.per_shot());
+    let mut segment_shots: Option<shots::SegmentShots> = None;
+    if res3d.is_some() && (!events.is_empty() || seg) {
         let v2w = sim_grid.voxel_to_world;
-        for (g, sets) in shot_sets.iter_mut().enumerate() {
+        let center = mrsim_acq::motion::fov_center(sim_grid.dims, v2w);
+        let ref_times = shots::reference_times(&p.row_start, &row_t);
+        let mut pose_of_all: Vec<Option<Vec<Pose>>> = vec![None; n];
+        let (mut seg_times, mut seg_abs) = (Vec::new(), Vec::new());
+        for (g, slot) in pose_of_all.iter_mut().enumerate() {
             let evs: Vec<&MotionEvent> = events.iter().filter(|e| e.volume == g && e.shot < n_shots).collect();
-            if evs.is_empty() {
+            if evs.is_empty() && !seg {
                 continue;
             }
             let mut cum = Pose::IDENTITY;
-            let mut pose_of = vec![Pose::IDENTITY; n_shots];
-            for (s, pose) in pose_of.iter_mut().enumerate() {
+            let mut cums = vec![Pose::IDENTITY; n_shots];
+            for (s, pose) in cums.iter_mut().enumerate() {
                 for e in evs.iter().filter(|e| e.shot == s) {
                     for i in 0..3 {
                         cum.trans_mm[i] += e.jump_mm[i];
@@ -1244,6 +1329,29 @@ fn simulate_legacy(
                 }
                 *pose = cum;
             }
+            *slot = Some(if seg {
+                let m = p.motion.as_ref().expect("per-segment sampling is motion");
+                let times: Vec<f64> = (0..n_shots).map(|s| p.row_start[g] + s as f64 * p.rows[g].tr + p.rows[g].t).collect();
+                let pose_at = |t: f64| match &m.timed {
+                    Some(tt) => tt.trace.pose_at(t),
+                    None => mrsim_acq::motion::sample_trajectory(&ref_times, &poses, t),
+                };
+                let (rel, abs) = shots::segment_poses(&cums, &times, poses[g], pose_at, center)?;
+                seg_times.push(times);
+                seg_abs.push(abs);
+                rel
+            } else {
+                cums
+            });
+        }
+        if seg {
+            let sets: usize = pose_of_all.iter().flatten().map(|po| shots::distinct_moved(po)).sum();
+            shots::check_segment_memory(sets, images.len(), nvox_sim, p.segment_images_gib)?;
+            segment_shots = Some(shots::SegmentShots { times: seg_times, poses: seg_abs });
+        }
+        for (g, sets) in shot_sets.iter_mut().enumerate() {
+            let Some(pose_of) = pose_of_all[g].take() else { continue };
+            let evs: Vec<&MotionEvent> = events.iter().filter(|e| e.volume == g && e.shot < n_shots).collect();
             let mut distinct: Vec<Pose> = Vec::new();
             for &q in &pose_of {
                 if q != Pose::IDENTITY && !distinct.contains(&q) {
@@ -1399,20 +1507,21 @@ fn simulate_legacy(
         delta_m_suppressed: gt_sup,
         delta_m_arterial: gt_art,
         abv: p4.abv.as_ref().map(|a| r_acq.mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>())),
-        aatt: match (&p4.abv, &p4.aatt) {
+        att_arterial: match (&p4.abv, &p4.att_arterial) {
             (Some(b), Some(a)) => {
                 let has: Vec<bool> = b.iter().map(|x| *x > 0.0).collect();
                 Some(r_acq.masked_mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>(), &has))
             }
             _ => None,
         },
+        spin_history: gt_spin,
     };
 
     Ok(SeriesOutput {
         acq_grid, sim_grid, n_volumes: n, mag, phase: phase_out, m0, mode: mode_used,
         labels: ph.labels.clone(), n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(),
         seeds: (p.seed, m0_seed), acquisition: acq, ground_truth, label_factors, poses, motion_seed,
-        events, dropped, compat: compat_facts,
+        events, dropped, shots: shot_plan, segment_shots, spin_history_merges, compat: compat_facts,
         crush_survival: p4.crush.clone(), physio: p4.physio.as_ref().map(|_| physio_lines),
         readout: res3d.clone(),
         echo_amplitudes,
@@ -1835,6 +1944,315 @@ mod tests {
         assert_eq!(b.ground_truth.delta_m, *b.ground_truth.delta_m_static.as_ref().unwrap());
     }
 
+    // ------------------------------------------------------------------ P9 part A
+
+    #[test]
+    fn single_band_events_drop_one_slice_each() {
+        // 6 slices at 1 mm single band: 6 shots; every shot halved, no jumps: the image halves
+        let ph = phantom();
+        let s = sidecar([1.0, 1.0, 1.0], 6);
+        let base = protocol_from(&s, "control,label", "[acquisition]\noversample = 1\n");
+        let ev = protocol_from(&s, "control,label",
+                               "[acquisition]\noversample = 1\n[motion.within_volume]\ndropout_rate = 1.0\nseverity = 0.5\n");
+        assert!(ev.motion.as_ref().unwrap().shot_path);
+        let a = simulate(&base, &ph, T2Mode::Class, &no_phase()).unwrap();
+        let b = simulate(&ev, &ph, T2Mode::Class, &no_phase()).unwrap();
+        assert_eq!((b.events.len(), b.dropped.len()), (12, 12));
+        assert!(b.dropped.iter().all(|d| (d.attenuation - 0.5).abs() < 1e-6 && d.slices.len() == 1));
+        let plan = b.shots.as_ref().unwrap();
+        assert_eq!(plan.schedule, (0..6).map(|z| vec![z]).collect::<Vec<_>>());
+        assert!((plan.times[1][2] - (4.0 + 3.6 + 0.08)).abs() < 1e-12, "{}", plan.times[1][2]);
+        let scale = max_abs(&a.mag) as f64;
+        let worst = a.mag.iter().zip(&b.mag).fold(0.0f64, |m, (x, y)| m.max((0.5 * *x as f64 - *y as f64).abs() / scale));
+        assert!(worst < 1e-6, "{worst}");
+        assert!(a.shots.is_none(), "no motion, no plan");
+    }
+
+    /// An events file with one +1 mm x jump at shot 3 of volume 0: the simulation-grid images of
+    /// slices 0-2 and of volume 1 are the static ones exactly; slices 3-5 of volume 0 are the static
+    /// ones shifted one voxel in x (1 mm voxels, oversample 1).
+    #[test]
+    fn an_in_plane_step_shifts_exactly_the_later_shots() {
+        let ph = phantom();
+        let s = sidecar([1.0, 1.0, 1.0], 6);
+        let dir = std::env::temp_dir().join(format!("aslscan-shots-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tsv = dir.join("events.tsv");
+        std::fs::write(&tsv, "volume\tshot\tslices\tattenuation\tjump_x\tjump_y\tjump_z\tjump_rx\tjump_ry\tjump_rz\n\
+                              0\t3\t3\t1\t1\t0\t0\t0\t0\t0\n").unwrap();
+        let path = tsv.to_string_lossy().replace('\\', "\\\\");
+        let ev = protocol_from(&s, "control,label",
+                               &format!("[acquisition]\noversample = 1\n[motion.within_volume]\nevents = \"{path}\"\n"));
+        let base = protocol_from(&s, "control,label", "[acquisition]\noversample = 1\n");
+        let (mut ca, mut cb): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+        let a = simulate_core(&base, &ph, T2Mode::Class, &no_phase(), RowOverride::None, Some(&mut ca)).unwrap();
+        let b = simulate_core(&ev, &ph, T2Mode::Class, &no_phase(), RowOverride::None, Some(&mut cb)).unwrap();
+        assert_eq!(b.dropped.len(), 1);
+        let [nx, ny, nz] = a.sim_grid.dims;
+        let (n, slab) = (2usize, nx * ny);
+        let at = |x: usize, y: usize, z: usize, g: usize| (x + nx * (y + ny * z)) * n + g;
+        let mut moved = false;
+        for (comp, (ia, ib)) in ca.iter().zip(&cb).enumerate() {
+            let peak = max_abs(ia);
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        assert_eq!(ib[at(x, y, z, 1)].to_bits(), ia[at(x, y, z, 1)].to_bits(), "volume 1 is static");
+                        if z < 3 {
+                            assert_eq!(ib[at(x, y, z, 0)].to_bits(), ia[at(x, y, z, 0)].to_bits(), "comp {comp} slice {z}");
+                        } else if x >= 1 {
+                            let (got, want) = (ib[at(x, y, z, 0)], ia[at(x - 1, y, z, 0)]);
+                            assert!((got - want).abs() <= 1e-5 * peak, "comp {comp} ({x},{y},{z}): {got} vs {want}");
+                            moved |= (got - ia[at(x, y, z, 0)]).abs() > 1e-3 * peak;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(moved, "the jump must move something");
+        let _ = (slab, std::fs::remove_dir_all(&dir));
+    }
+
+    // ------------------------------------------------------------------ P10
+
+    /// A timed trajectory whose samples are the untimed rows at each volume's first shot, plus one
+    /// at the last shot holding the last pose (coverage), is P9's run bit for bit: the same nodes,
+    /// the same cells read with the same arithmetic. Under "volume", "slice"/"shot", and with spin
+    /// history.
+    #[test]
+    fn a_timed_trajectory_on_the_untimed_nodes_is_the_untimed_run() {
+        let ph = phantom();
+        let s = sidecar([1.0, 1.0, 1.0], 6);
+        let rows = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.3, 0.0, 1.5, 0.0, 0.0, 0.02],
+                    [0.0, -0.4, 2.5, 0.03, 0.0, 0.0], [0.1, 0.0, 0.5, 0.0, -0.01, 0.0]];
+        let (dir, untimed) = write_trajectory(&rows);
+        let cells = |r: &[f64; 6]| r.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("\t");
+        let p0 = protocol_from(&s, "control,label,control,label", "[acquisition]\noversample = 1\n");
+        let refs: Vec<f64> = p0.row_start.iter().zip(&p0.rows).map(|(a, r)| a + r.t).collect();
+        let last_shot = refs[3] + p0.slice_offsets.iter().cloned().fold(0.0, f64::max);
+        let mut text = String::from("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+        for (t, r) in refs.iter().zip(&rows) {
+            text.push_str(&format!("{t}\t{}\n", cells(r)));
+        }
+        text.push_str(&format!("{last_shot}\t{}\n", cells(&rows[3])));
+        let timed_tsv = dir.join("timed.tsv");
+        std::fs::write(&timed_tsv, text).unwrap();
+        let timed = timed_tsv.to_string_lossy().replace('\\', "\\\\");
+        for (untimed_extra, timed_extra) in [("", "within_volume_sampling = \"volume\"\n"),
+                                             ("within_volume_sampling = \"slice\"\n", "within_volume_sampling = \"shot\"\n"),
+                                             ("within_volume_sampling = \"slice\"\nspin_history = true\n",
+                                              "within_volume_sampling = \"shot\"\nspin_history = true\n")] {
+            let ov = |path: &str, extra: &str| format!(
+                "[acquisition]\noversample = 1\n[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\n{extra}");
+            let a = protocol_from(&s, "control,label,control,label", &ov(&untimed, untimed_extra));
+            let b = protocol_from(&s, "control,label,control,label", &ov(&timed, timed_extra));
+            assert!(a.motion.as_ref().unwrap().timed.is_none() && b.motion.as_ref().unwrap().timed.is_some());
+            let (oa, ob) = (simulate(&a, &ph, T2Mode::Class, &no_phase()).unwrap(), simulate(&b, &ph, T2Mode::Class, &no_phase()).unwrap());
+            assert_eq!(oa.poses, ob.poses, "{timed_extra:?}: the volume poses");
+            if let (Some(pa), Some(pb)) = (&oa.shots, &ob.shots) {
+                assert_eq!(pa.transforms, pb.transforms, "{timed_extra:?}: the shot transforms");
+            }
+            assert_eq!(oa.shots.is_some(), ob.shots.is_some());
+            assert!(oa.mag.iter().zip(&ob.mag).all(|(x, y)| x.to_bits() == y.to_bits()), "{timed_extra:?}: magnitude");
+            assert_eq!(oa.ground_truth.spin_history, ob.ground_truth.spin_history);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P10 part C on the spin-echo 3D path (the P5 GRASE fixture, two segments per volume): a timed
+    /// trace that holds still within each volume gives under "shot" the "volume" run bit for bit
+    /// (equal poses reuse the base images); one that moves between the segments of volume 1 changes
+    /// that volume only, and the segment truth holds each segment's time and absolute pose; the
+    /// memory limit is checked first; "slice" is refused in 3D.
+    #[test]
+    fn three_d_segments_take_the_trace_at_their_own_times() {
+        let ph = phantom();
+        let fx = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols/p5_grase/asl.json");
+        let s: Value = serde_json::from_str(&std::fs::read_to_string(fx).unwrap()).unwrap();
+        let rows = "control,label,control,label";
+        let base = "[acquisition]\noversample = 1\n[m0]\nrepetition_time = 6.0\n";
+        let p0 = protocol_from(&s, rows, base);
+        let shots = p0.readout.as_ref().unwrap().number_shots.0;
+        assert_eq!(shots, 2);
+        let seg_t = |v: usize, k: usize| p0.row_start[v] + k as f64 * p0.rows[v].tr + p0.rows[v].t;
+        let pose = |v: usize| [0.0, 0.5 * v as f64, 0.2, 0.0, 0.0, 0.035 * (v + 1) as f64];
+        let dir = std::env::temp_dir().join(format!("aslscan-3dseg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, samples: &[(f64, [f64; 6])]| {
+            let mut text = String::from("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+            for (t, r) in samples {
+                text.push_str(&format!("{t}\t{}\t{}\t{}\t{}\t{}\t{}\n", r[0], r[1], r[2], r[3], r[4], r[5]));
+            }
+            let tsv = dir.join(format!("{name}.tsv"));
+            std::fs::write(&tsv, text).unwrap();
+            tsv.to_string_lossy().replace('\\', "\\\\")
+        };
+        // still within each volume: each volume's pose from its first segment through its last
+        let held: Vec<(f64, [f64; 6])> = (0..4).flat_map(|v| [(seg_t(v, 0), pose(v)), (seg_t(v, shots - 1), pose(v))]).collect();
+        let held = write("held", &held);
+        let ov = |path: &str, extra: &str| format!("{base}[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\n{extra}");
+        let vol = protocol_from(&s, rows, &ov(&held, "within_volume_sampling = \"volume\"\n"));
+        let seg = protocol_from(&s, rows, &ov(&held, "within_volume_sampling = \"shot\"\n"));
+        let (ov_, os) = (simulate(&vol, &ph, T2Mode::Class, &no_phase()).unwrap(), simulate(&seg, &ph, T2Mode::Class, &no_phase()).unwrap());
+        assert!(ov_.segment_shots.is_none());
+        assert_eq!(ov_.poses, os.poses);
+        assert!(ov_.poses.iter().all(|q| *q != Pose::IDENTITY));
+        assert!(ov_.mag.iter().zip(&os.mag).all(|(a, b)| a.to_bits() == b.to_bits()), "held still: \"shot\" is \"volume\"");
+        let st = os.segment_shots.as_ref().expect("segment truth");
+        for v in 0..4 {
+            for k in 0..shots {
+                assert!((st.times[v][k] - seg_t(v, k)).abs() < 1e-12);
+                assert_eq!(st.poses[v][k], os.poses[v], "volume {v}, segment {k}");
+            }
+        }
+        // moving between the segments of volume 1: only volume 1 changes
+        let mut moved = held_samples(&seg_t, &pose, shots);
+        let step = [0.0, 0.0, 2.0, 0.0, 0.0, 0.035 * 2.0];
+        moved[3] = (seg_t(1, 1), step); // volume 1, segment 1: 2 mm up
+        let moved = write("moved", &moved);
+        let mv = protocol_from(&s, rows, &ov(&moved, "within_volume_sampling = \"shot\"\n"));
+        let om = simulate(&mv, &ph, T2Mode::Class, &no_phase()).unwrap();
+        let n = 4;
+        let peak = max_abs(&os.mag);
+        let vol_diff = |v: usize| os.mag.iter().zip(&om.mag).skip(v).step_by(n).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        for v in [0, 2, 3] {
+            assert_eq!(vol_diff(v), 0.0, "volume {v} is unchanged");
+        }
+        assert!(vol_diff(1) > 1e-3 * peak, "volume 1 changes: {}", vol_diff(1));
+        let sm = om.segment_shots.as_ref().unwrap();
+        assert!((sm.poses[1][1].trans_mm[2] - 2.0).abs() < 1e-9 && sm.poses[1][0] == om.poses[1]);
+        // the dataset writes the segment table, slices n/a
+        let d = dir.join("ds");
+        crate::bids::write_dataset(&d, &crate::bids::Names::new("01", None), &mv, &om).unwrap();
+        let tsv = std::fs::read_to_string(d.join("sub-01/perf/ground-truth/sub-01_desc-motionShots_gt.tsv")).unwrap();
+        assert_eq!(tsv.lines().count(), 1 + 4 * shots);
+        assert!(tsv.lines().skip(1).all(|l| l.split('\t').nth(2) == Some("n/a")));
+        // the limit, accepted only on the per-segment path and checked before the sets are made
+        let tight = protocol_from(&s, rows, &format!("{}[images]\nmax_memory_gib = 1e-9\n", ov(&moved, "within_volume_sampling = \"shot\"\n")));
+        let e = simulate(&tight, &ph, T2Mode::Class, &no_phase()).unwrap_err();
+        assert!(e.contains("max_memory_gib") && e.contains("segment image sets"), "{e}");
+        let ovl: Overlay = toml::from_str(&format!("{}[images]\nmax_memory_gib = 1.0\n",
+                                                   ov(&moved, "within_volume_sampling = \"volume\"\n"))).unwrap();
+        let ctx = "volume_type\ncontrol\nlabel\ncontrol\nlabel\n";
+        assert!(parse(&s, ctx, Some(&ovl), ph.params.as_ref()).unwrap_err().contains("max_memory_gib"));
+        let ovl: Overlay = toml::from_str(&ov(&moved, "within_volume_sampling = \"slice\"\n")).unwrap();
+        assert!(parse(&s, ctx, Some(&ovl), ph.params.as_ref()).unwrap_err().contains("\"slice\" is for 2D"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The held-still samples of [`three_d_segments_take_the_trace_at_their_own_times`].
+    fn held_samples(seg_t: &dyn Fn(usize, usize) -> f64, pose: &dyn Fn(usize) -> [f64; 6], shots: usize) -> Vec<(f64, [f64; 6])> {
+        (0..4).flat_map(|v| [(seg_t(v, 0), pose(v)), (seg_t(v, shots - 1), pose(v))]).collect()
+    }
+
+    /// Coverage is over the queried set: a trace ending at the last volume's first shot covers one
+    /// pose per volume and not one per shot, and the refusal names both spans; it comes from the
+    /// series, before the signal stage.
+    #[test]
+    fn timed_coverage_is_over_the_sampling_query_set() {
+        let ph = phantom();
+        let s = sidecar([1.0, 1.0, 1.0], 6);
+        let p0 = protocol_from(&s, "control,label", "[acquisition]\noversample = 1\n");
+        let refs: Vec<f64> = p0.row_start.iter().zip(&p0.rows).map(|(a, r)| a + r.t).collect();
+        let dir = std::env::temp_dir().join(format!("aslscan-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tsv = dir.join("trace.tsv");
+        std::fs::write(&tsv, format!("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n{}\t0\t0\t0\t0\t0\t0\n{}\t0\t0\t1\t0\t0\t0\n",
+                                     refs[0], refs[1])).unwrap();
+        let path = tsv.to_string_lossy().replace('\\', "\\\\");
+        let ov = |extra: &str| format!("[acquisition]\noversample = 1\n[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\n{extra}");
+        let vol = protocol_from(&s, "control,label", &ov("within_volume_sampling = \"volume\"\n"));
+        let out = simulate(&vol, &ph, T2Mode::Class, &no_phase()).unwrap();
+        assert_eq!(out.poses[1].trans_mm, [0.0, 0.0, 1.0]);
+        let shot = protocol_from(&s, "control,label", &ov("within_volume_sampling = \"shot\"\n"));
+        let t0 = std::time::Instant::now();
+        let e = simulate(&shot, &ph, T2Mode::Class, &no_phase()).unwrap_err();
+        assert!(e.contains("never extrapolated") && e.contains(&format!("spans {} s to {} s", refs[0], refs[1])), "{e}");
+        assert!(t0.elapsed().as_secs_f64() < 0.5, "refused before the signal stage ({:?})", t0.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------ P9 part B
+
+    /// Spin history with a head that does not move through the slices (an identity event, then an
+    /// in-plane jump) changes nothing: the correction is taken against the closed form the tissue
+    /// images were made with, under suppression and presaturation too.
+    #[test]
+    fn spin_history_leaves_a_still_or_in_plane_head_alone() {
+        let ph = phantom();
+        let dir = std::env::temp_dir().join(format!("aslscan-spin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let head = "volume\tshot\tslices\tattenuation\tjump_x\tjump_y\tjump_z\tjump_rx\tjump_ry\tjump_rz\n";
+        for (name, row, bs) in [("still", "0\t1\t1\t1\t0\t0\t0\t0\t0\t0\n", false),
+                                ("inplane", "1\t2\t2\t1\t1\t0.5\t0\t0\t0\t0.05\n", false),
+                                ("inplane_bs", "1\t2\t2\t1\t1\t0.5\t0\t0\t0\t0.05\n", true)] {
+            let tsv = dir.join(format!("{name}.tsv"));
+            std::fs::write(&tsv, format!("{head}{row}")).unwrap();
+            let path = tsv.to_string_lossy().replace('\\', "\\\\");
+            let mut s = sidecar([1.0, 1.0, 1.0], 6);
+            if bs {
+                s["BackgroundSuppression"] = json!(true);
+                s["BackgroundSuppressionNumberPulses"] = json!(2);
+                s["BackgroundSuppressionPulseTime"] = json!([1.9, 3.0]);
+            }
+            let presat = if bs { "[background_suppression]\npresaturation = true\n" } else { "" };
+            let ov = |sh: bool| format!("[acquisition]\noversample = 1\n{presat}[motion]\nspin_history = {sh}\n\
+                                         [motion.within_volume]\nevents = \"{path}\"\n");
+            let without = protocol_from(&s, "control,label,control,label", &ov(false));
+            let with = protocol_from(&s, "control,label,control,label", &ov(true));
+            assert!(with.motion.as_ref().unwrap().spin_history);
+            let a = simulate(&without, &ph, T2Mode::Class, &no_phase()).unwrap();
+            let b = simulate(&with, &ph, T2Mode::Class, &no_phase()).unwrap();
+            assert_eq!(b.spin_history_merges, Some(0));
+            let peak = max_abs(&a.mag);
+            let worst = a.mag.iter().zip(&b.mag).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+            assert!(worst <= 1e-6 * peak, "{name}: {worst} of {peak}");
+            let gt = b.ground_truth.spin_history.as_ref().unwrap();
+            assert!(gt.iter().all(|x| x.abs() <= 1e-6 * peak), "{name}: the correction map");
+            assert!(a.ground_truth.spin_history.is_none());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The spin-history ground truth is the summed tissue correction before the acquisition: with
+    /// physiology off and attenuation 1 it equals the difference of the captured tissue compartment
+    /// images with and without the key (1 mm voxels, oversample 1: the grids coincide in-plane).
+    #[test]
+    fn spin_history_truth_is_the_tissue_correction() {
+        let ph = phantom();
+        let dir = std::env::temp_dir().join(format!("aslscan-spin-gt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tsv = dir.join("events.tsv");
+        std::fs::write(&tsv, "volume\tshot\tslices\tattenuation\tjump_x\tjump_y\tjump_z\tjump_rx\tjump_ry\tjump_rz\n\
+                              1\t2\t2\t1\t0\t0\t0.3\t0\t0\t0\n").unwrap();
+        let path = tsv.to_string_lossy().replace('\\', "\\\\");
+        let s = sidecar([1.0, 1.0, 1.0], 6);
+        let ov = |sh: bool| format!("[acquisition]\noversample = 1\n[motion]\nspin_history = {sh}\n\
+                                     [motion.within_volume]\nevents = \"{path}\"\n");
+        let (mut ca, mut cb): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+        let without = protocol_from(&s, "control,label,control,label", &ov(false));
+        let with = protocol_from(&s, "control,label,control,label", &ov(true));
+        simulate_core(&without, &ph, T2Mode::Class, &no_phase(), RowOverride::None, Some(&mut ca)).unwrap();
+        let b = simulate_core(&with, &ph, T2Mode::Class, &no_phase(), RowOverride::None, Some(&mut cb)).unwrap();
+        let k = ph.labels.len();
+        let n = 4;
+        let gt = b.ground_truth.spin_history.as_ref().unwrap();
+        assert_eq!(gt.len(), ca[0].len(), "same grid in-plane at oversample 1, voxel-major with 4 volumes");
+        let peak = max_abs(&ca[0]).max(max_abs(&ca[1]));
+        let mut nonzero = false;
+        for i in 0..gt.len() {
+            let diff: f32 = (0..k).map(|c| cb[c][i] - ca[c][i]).sum();
+            assert!((diff - gt[i]).abs() <= 1e-5 * peak, "{i}: {diff} vs {}", gt[i]);
+            nonzero |= gt[i].abs() > 1e-4 * peak;
+        }
+        assert!(nonzero, "the jump must leave a correction");
+        // the blood is untouched
+        for c in k..ca.len() {
+            assert!(ca[c].iter().zip(&cb[c]).all(|(x, y)| x == y), "compartment {c}");
+        }
+        let _ = (n, std::fs::remove_dir_all(&dir));
+    }
+
     // ------------------------------------------------------------------ P2
 
     /// A compat sidecar on the crop: `voxel` mm, all-zero slice timing for `nz` slices, simasl's
@@ -2006,7 +2424,7 @@ mod tests {
 
     const HOM: &str = "[acquisition]\noversample = 1\n";
     const TABLES: &str = "[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-                          arterial_transit_time = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n";
+                          arterial_compartment_att = { grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }\n";
 
     fn run(s: &Value, rows: &str, ov: &str, mode: T2Mode) -> SeriesOutput {
         simulate(&protocol_from(s, rows, ov), &phantom(), mode, &no_phase()).unwrap()
@@ -2051,10 +2469,10 @@ mod tests {
     }
 
     #[allow(clippy::needless_range_loop)]
-    fn check_arterial_image(s: &Value, rows: &str, aatt_gm: f64, expect_signal: bool) {
+    fn check_arterial_image(s: &Value, rows: &str, att_arterial_gm: f64, expect_signal: bool) {
         let ph = phantom();
         let ov = format!("{HOM}[macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.0, csf = 0.0 }}\n\
-                          arterial_transit_time = {{ grey_matter = {aatt_gm}, white_matter = 0.0, csf = 0.0 }}\n");
+                          arterial_compartment_att = {{ grey_matter = {att_arterial_gm}, white_matter = 0.0, csf = 0.0 }}\n");
         let p = protocol_from(s, rows, &ov);
         let (img, out) = simulate_compartments(&p, &ph, T2Mode::Class, &no_phase(), RowOverride::None).unwrap();
         let k = out.labels.len();
@@ -2066,7 +2484,7 @@ mod tests {
         for i in 0..ph.nvox() {
             let z = i / (nx * ny);
             let t = row.t + p.slice_offsets[z];
-            let want = if ph.dseg[i] == 1 { -arterial_dm(&kin, 0.03, aatt_gm, ph.m0[i] as f64, t).0 } else { 0.0 };
+            let want = if ph.dseg[i] == 1 { -arterial_dm(&kin, 0.03, att_arterial_gm, ph.m0[i] as f64, t).0 } else { 0.0 };
             let got = img[2 * k][i] as f64;
             assert!((got - want).abs() <= 1e-6 * want.abs().max(1e-9), "voxel {i}: {got} vs {want}");
             seen = seen.max(got.abs());
@@ -2081,7 +2499,7 @@ mod tests {
         // PCASL: t = 3.6 + offsets, window [2.5, 4.3)
         check_arterial_image(&sidecar([1.0, 1.0, 1.0], 6), "label", 2.5, true);
         check_arterial_image(&sidecar([1.0, 1.0, 1.0], 6), "label", 0.5, false);
-        // PASL: t = PLD 1.8 + offsets, bolus 0.7, window [1.5, 2.2)
+        // PASL: t = TI 1.8 + offsets, bolus 0.7, window [1.5, 2.2)
         let mut s = sidecar([1.0, 1.0, 1.0], 6);
         s["ArterialSpinLabelingType"] = json!("PASL");
         s["BolusCutOffFlag"] = json!(true);
@@ -2099,7 +2517,7 @@ mod tests {
             s["VascularCrushing"] = json!(true);
             s["VascularCrushingVENC"] = json!(venc);
             let ov = format!("{HOM}{vel}[macrovascular]\narterial_blood_volume = {{ grey_matter = {}, white_matter = {}, csf = 0.0 }}\n\
-                              arterial_transit_time = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n", abv.0, abv.1);
+                              arterial_compartment_att = {{ grey_matter = 2.5, white_matter = 2.7, csf = 0.0 }}\n", abv.0, abv.1);
             let o = run(&s, "label", &ov, mode);
             (complex_from(&o.mag, &o.phase), o)
         };
@@ -2367,7 +2785,7 @@ mod tests {
         assert!(e.contains("share the name"), "{e}");
         let p = protocol_from(&sidecar([1.0, 1.0, 1.0], 6), "label",
                               &format!("{HOM}[macrovascular]\narterial_blood_volume = {{ grey_matter = 0.03, white_matter = 0.0 }}\n\
-                                        arterial_transit_time = {{ grey_matter = 1.0, white_matter = 1.0, csf = 0.0, other = 1.0 }}\n"));
+                                        arterial_compartment_att = {{ grey_matter = 1.0, white_matter = 1.0, csf = 0.0, other = 1.0 }}\n"));
         let e = simulate(&p, &phantom(), T2Mode::Class, &no_phase()).unwrap_err();
         assert!(e.contains("csf") || e.contains("other"), "{e}");
         // a slab entry after a voxel's arrival

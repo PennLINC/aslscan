@@ -101,7 +101,7 @@ pub(super) fn m0_train_mz(t1_s: f64, m0_tr_s: f64, n_exc: usize, spacing_s: f64,
 
 /// How long before its arrival a voxel's label entered the slab (P7 addendum, part C, "Depletion
 /// from slab entry"): `arrival - d`, zero for `"arrival"`. A slab entry after the arrival is
-/// refused, naming the voxel (`what` names the arrival: "ATT" or "aATT").
+/// refused, naming the voxel (`what` names the arrival: "ATT" or "ATT_arterial").
 pub(super) fn entry_lead(entry: SlabEntryTime, arrival_s: f64, voxel: usize, what: &str) -> Result<f64, String> {
     match entry {
         SlabEntryTime::Arrival => Ok(0.0),
@@ -258,6 +258,8 @@ pub(super) struct Ge3dBuild<'a> {
     pub poses: Vec<Pose>,
     pub shot_pose: Vec<Vec<Pose>>,
     pub shot_gain: Vec<Vec<f64>>,
+    /// P10 part C: the segments' times and absolute poses under per-segment sampling.
+    pub segment_shots: Option<super::shots::SegmentShots>,
     pub v2w: [[f64; 4]; 4],
     pub sim_dims: [usize; 3],
 }
@@ -305,7 +307,7 @@ impl Ge3dBuild<'_> {
         let kin = p.kinetic(row);
         let (e, flips, offset) = self.cycle(v);
         let n = self.res.n_exc;
-        let (f_ml, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
+        let (f_ml_100g_min, att, t1t, m0) = (ph.perfusion[i] as f64, ph.att[i] as f64, ph.t1[i] as f64, ph.m0[i] as f64);
         let bolus = self.bolus_region.map(|region| {
             let s = p.suppression.as_ref().unwrap().for_row(self.sched.preps[self.sched.raws[v].prep].suppression);
             (region, s.pulse_times, s.epsilon)
@@ -323,27 +325,27 @@ impl Ge3dBuild<'_> {
                 }
             }
         }
-        let all = crate::kinetic::delta_m_read_all(&kin, f_ml, att, t1t, m0, &e, &flips, &subs, p.exchange_time, self.lead[i]);
+        let all = crate::kinetic::delta_m_read_all(&kin, f_ml_100g_min, att, t1t, m0, &e, &flips, &subs, p.exchange_time, self.lead[i]);
         let parts = &all[offset..offset + n];
         self.families.iter().map(|fam| match fam {
             Family::Blood => parts.iter().map(|q| q.iv).collect(),
             Family::Extravascular => parts.iter().map(|q| q.ev).collect(),
             Family::Arterial => {
-                let (Some(abv), Some(aatt)) = (&self.p4.abv, &self.p4.aatt) else { return vec![0.0; n] };
+                let (Some(abv), Some(att_arterial)) = (&self.p4.abv, &self.p4.att_arterial) else { return vec![0.0; n] };
                 let crush = self.p4.crush.as_ref().map_or(1.0, |cr| cr[v][self.p4.label_of[i]]);
                 (offset..offset + n).map(|x| {
                     // the parcel the arteries hold at e_x counts only where its labeling is in a span
-                    let a = e[x] - aatt[i];
+                    let a = e[x] - att_arterial[i];
                     if !spans.iter().any(|&(lo, hi)| lo <= a && a < hi) {
                         return 0.0;
                     }
                     let g = match &bolus {
-                        Some((region, pulses, eps)) => arterial_factor(pulses, *eps, e[x] - aatt[i],
-                                                                       entry_offset(p.label_type, *region, aatt[i])),
+                        Some((region, pulses, eps)) => arterial_factor(pulses, *eps, e[x] - att_arterial[i],
+                                                                       entry_offset(p.label_type, *region, att_arterial[i])),
                         None => 1.0,
                     };
                     let earlier: Vec<(f64, f64)> = e[..x].iter().copied().zip(flips[..x].iter().copied()).collect();
-                    crate::kinetic::arterial_read(&kin, abv[i], aatt[i], m0, e[x], &earlier, self.lead_a[i], g * crush)
+                    crate::kinetic::arterial_read(&kin, abv[i], att_arterial[i], m0, e[x], &earlier, self.lead_a[i], g * crush)
                 }).collect()
             }
         }).collect()
@@ -536,6 +538,22 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
     // ---- the schedule, its suppression, its trains and the tissue timeline ----
     let sched = Schedule::new(p);
     let n = sched.raw_rows.len();
+    // P10: each raw volume's reference time, its first segment's first excitation (the train starts
+    // at the row's signal time after its preparation); a timed trajectory must cover them, checked
+    // before anything is simulated
+    let raw_starts: Vec<f64> = sched.raws.iter().map(|r| sched.preps[r.prep].start_s).collect();
+    let raw_t: Vec<f64> = sched.raw_rows.iter().map(|r| r.t).collect();
+    let ref_times = super::shots::reference_times(&raw_starts, &raw_t);
+    // P10 part C: under per-segment sampling, every segment's first excitation
+    let segment_time = |v: usize, s: usize| sched.preps_of(v)[s].start_s + raw_t[v];
+    if let Some(m) = p.motion.as_ref() {
+        if m.sampling.per_shot() {
+            let q: Vec<f64> = (0..n).flat_map(|v| (0..res.n_shots).map(move |s| (v, s))).map(|(v, s)| segment_time(v, s)).collect();
+            m.check_timed_coverage(&q)?;
+        } else {
+            m.check_timed_coverage(&ref_times)?;
+        }
+    }
     let ge = p.ge.as_ref().expect("epi3d is gradient echo");
     // the separate M0's excitation: Look-Locker's [m0] flip_angle, else the series'
     let flip_deg = p.look_locker.as_ref().and_then(|l| l.m0_flip_deg).map_or(ge.flip_deg, |f| f.0);
@@ -611,9 +629,9 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
         if ph.dseg[i] > 0 && ph.perfusion[i] > 0.0 {
             lead[i] = entry_lead(g3.slab_entry.0, ph.att[i] as f64, i, "ATT")?;
         }
-        if let (Some(abv), Some(aatt)) = (&p4.abv, &p4.aatt) {
+        if let (Some(abv), Some(att_arterial)) = (&p4.abv, &p4.att_arterial) {
             if ph.dseg[i] > 0 && abv[i] > 0.0 {
-                lead_a[i] = entry_lead(g3.slab_entry.0, aatt[i], i, "aATT")?;
+                lead_a[i] = entry_lead(g3.slab_entry.0, att_arterial[i], i, "ATT_arterial")?;
             }
         }
     }
@@ -625,12 +643,17 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
     let mut poses = vec![Pose::IDENTITY; n];
     let mut events = Vec::new();
     if let (Some(m), Some(seed)) = (&p.motion, motion_seed) {
-        poses = resolve_poses(&m.mode, n, seed);
+        poses = m.volume_poses(&ref_times, seed);
         events = draw_events(m.within.as_ref(), n, n_shots, seed);
     }
     let mut shot_pose = vec![vec![Pose::IDENTITY; n_shots]; n];
     let mut shot_gain = vec![vec![1.0f64; n_shots]; n];
     let mut dropped = Vec::new();
+    // P10 part C: under within_volume_sampling = "shot" each segment takes the trajectory's pose at
+    // its first excitation, relative to the raw volume's (its images carry that one)
+    let seg = p.motion.as_ref().filter(|m| m.sampling.per_shot());
+    let center = mrsim_acq::motion::fov_center(sim_grid.dims, sim_grid.voxel_to_world);
+    let (mut seg_times, mut seg_abs) = (Vec::new(), Vec::new());
     for (g, sp) in shot_pose.iter_mut().enumerate() {
         let evs: Vec<&MotionEvent> = events.iter().filter(|e| e.volume == g && e.shot < n_shots).collect();
         let mut cum = Pose::IDENTITY;
@@ -643,6 +666,17 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
             }
             *pose = cum;
         }
+        if let Some(m) = seg {
+            let times: Vec<f64> = (0..n_shots).map(|s| segment_time(g, s)).collect();
+            let pose_at = |t: f64| match &m.timed {
+                Some(tt) => tt.trace.pose_at(t),
+                None => mrsim_acq::motion::sample_trajectory(&ref_times, &poses, t),
+            };
+            let (rel, abs) = super::shots::segment_poses(sp, &times, poses[g], pose_at, center)?;
+            *sp = rel;
+            seg_times.push(times);
+            seg_abs.push(abs);
+        }
         for e in &evs {
             let atten = DropoutLaw::Uniform.attenuation(g, e.severity);
             shot_gain[g][e.shot] *= atten as f64;
@@ -650,9 +684,11 @@ pub(super) fn prepare_ge3d<'a>(p: &'a Protocol, ph: &'a Phantom, mode: T2Mode, o
         }
     }
 
+
     let mut b = Ge3dBuild {
         p, ph, res, table, sched, r_sim, masks, groups, group_images, group_mz, families, k_nodes: 0, nodes: Vec::new(),
         shot_factors, label_scale, p4, bolus_region, lead, lead_a, flip_deg, raw_flip, spans, spacing_s, poses, shot_pose, shot_gain,
+        segment_shots: seg.map(|_| super::shots::SegmentShots { times: seg_times, poses: seg_abs }),
         v2w: sim_grid.voxel_to_world, sim_dims: sim_grid.dims,
     };
 
@@ -1017,13 +1053,14 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
         delta_m_suppressed: None,
         delta_m_arterial: gt_art,
         abv: b.p4.abv.as_ref().map(|a| r_acq.mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>())),
-        aatt: match (&b.p4.abv, &b.p4.aatt) {
+        att_arterial: match (&b.p4.abv, &b.p4.att_arterial) {
             (Some(bv), Some(a)) => {
                 let has: Vec<bool> = bv.iter().map(|x| *x > 0.0).collect();
                 Some(r_acq.masked_mean(&a.iter().map(|x| *x as f32).collect::<Vec<f32>>(), &has))
             }
             _ => None,
         },
+        spin_history: None,
     };
 
     let ge3d = Ge3dSeries {
@@ -1063,7 +1100,7 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
     Ok(SeriesOutput {
         acq_grid, sim_grid, n_volumes: n_out, mag, phase: phase_out, m0, mode: mode_used, labels: ph.labels.clone(),
         n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(), seeds: (p.seed, m0_seed), acquisition: acq,
-        ground_truth, label_factors, poses: b.poses.clone(), motion_seed, events, dropped, compat: None, crush_survival: b.p4.crush.clone(),
+        ground_truth, label_factors, poses: b.poses.clone(), motion_seed, events, dropped, shots: None, segment_shots: b.segment_shots.clone(), spin_history_merges: None, compat: None, crush_survival: b.p4.crush.clone(),
         physio: b.p4.physio.as_ref().map(|_| physio_lines), ge_rule: Some(
             "every excitation of the train an event on the tissue's timeline (spoiled): the first preparation at its \
              steady state, each later one from the end of the one before"),
@@ -1256,8 +1293,8 @@ mod tests {
     fn slab_entry_leads_and_the_memory_bound() {
         assert_eq!(entry_lead(SlabEntryTime::Arrival, 1.2, 0, "ATT").unwrap(), 0.0);
         assert!((entry_lead(SlabEntryTime::Seconds(0.5), 1.2, 0, "ATT").unwrap() - 0.7).abs() < 1e-15);
-        let e = entry_lead(SlabEntryTime::Seconds(0.9), 0.8, 417, "aATT").unwrap_err();
-        assert!(e.contains("voxel 417") && e.contains("aATT"), "{e}");
+        let e = entry_lead(SlabEntryTime::Seconds(0.9), 0.8, 417, "ATT_arterial").unwrap_err();
+        assert!(e.contains("voxel 417") && e.contains("ATT_arterial"), "{e}");
         // with depletion before arrival the read is smaller than with none
         let (_, early) = train_reads(&[1.0], 0.2);
         let e = train_times(2.0, 32, 0.04);
@@ -1350,7 +1387,7 @@ mod tests {
                             let mut v = ph.m0[i] as f64 * m;
                             if sign != 0.0 && ph.perfusion[i] > 0.0 {
                                 let c = Case {
-                                    k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
+                                    k: kin, f_ml_100g_min: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
                                     m0: ph.m0[i] as f64, t: e[j], excitations: e[..j].iter().map(|&t| (t, 12.0)).collect(),
                                     entry_lead: if lead_on { ph.att[i] as f64 - 0.5 } else { 0.0 }, pulses: vec![2.0],
                                     epsilon: eps, region: PRegion::Global, tau_ex: Some(0.4), span: (0.0, kin.tau),
@@ -1454,6 +1491,59 @@ mod tests {
         assert_ne!(out_m.mag, out_s.mag);
     }
 
+    /// P10 part C on the 3D gradient-echo train (four segments per volume): held still within each
+    /// volume, "shot" is the "volume" run bit for bit; moving between segments 1 and 2 of volume 1
+    /// gives its later segments a pose relative to the volume's, and the segment truth holds each
+    /// segment's first excitation and absolute pose.
+    #[test]
+    fn train_segments_take_the_trace_at_their_first_excitation() {
+        let ph = crop();
+        let p0 = ge3d_protocol("");
+        let sched = Schedule::new(&p0);
+        let seg_t = |v: usize, k: usize| sched.preps_of(v)[k].start_s + sched.raw_rows[v].t;
+        let pose = |v: usize| [0.3, 0.0, 0.0, 0.0, 0.0, 0.02 * (v + 1) as f64];
+        let dir = std::env::temp_dir().join(format!("aslscan-ge3d-seg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, samples: &[(f64, [f64; 6])]| {
+            let mut text = String::from("time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+            for (t, r) in samples {
+                text.push_str(&format!("{t}\t{}\t{}\t{}\t{}\t{}\t{}\n", r[0], r[1], r[2], r[3], r[4], r[5]));
+            }
+            let tsv = dir.join(format!("{name}.tsv"));
+            std::fs::write(&tsv, text).unwrap();
+            tsv.to_string_lossy().replace('\\', "\\\\")
+        };
+        let mut samples: Vec<(f64, [f64; 6])> = (0..2).flat_map(|v| [(seg_t(v, 0), pose(v)), (seg_t(v, 3), pose(v))]).collect();
+        let held = write("held", &samples);
+        // volume 1 holds through segment 1, then is 1.5 mm up from segment 2 on
+        samples.insert(3, (seg_t(1, 1), pose(1)));
+        samples[3 + 1] = (seg_t(1, 3), [0.3, 0.0, 1.5, 0.0, 0.0, 0.04]);
+        samples.insert(4, (seg_t(1, 2), [0.3, 0.0, 1.5, 0.0, 0.0, 0.04]));
+        let moved = write("moved", &samples);
+        let proto = |path: &str, sampling: &str| ge3d_protocol(&format!(
+            "[motion]\nmode = \"trajectory\"\ntrajectory = \"{path}\"\nwithin_volume_sampling = \"{sampling}\"\n"));
+        let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
+        let (pv, ps) = (proto(&held, "volume"), proto(&held, "shot"));
+        let ov_ = simulate_ge3d(&pv, &ph, T2Mode::Class, &phase, RowOverride::None).unwrap();
+        let os = simulate_ge3d(&ps, &ph, T2Mode::Class, &phase, RowOverride::None).unwrap();
+        assert!(ov_.poses.iter().all(|q| *q != Pose::IDENTITY) && ov_.poses == os.poses);
+        assert!(ov_.mag.iter().zip(&os.mag).all(|(a, b)| a.to_bits() == b.to_bits()), "held still: \"shot\" is \"volume\"");
+        assert!(ov_.segment_shots.is_none());
+        let st = os.segment_shots.as_ref().expect("segment truth");
+        assert!((0..2).all(|v| (0..4).all(|k| (st.times[v][k] - seg_t(v, k)).abs() < 1e-12 && st.poses[v][k] == os.poses[v])));
+        let pm = proto(&moved, "shot");
+        let mv = prepare_ge3d(&pm, &ph, T2Mode::Class, RowOverride::None).unwrap();
+        let b = &mv.b;
+        assert!(b.shot_pose[0].iter().all(|q| *q == Pose::IDENTITY), "volume 0 holds still");
+        assert_eq!(&b.shot_pose[1][..2], &[Pose::IDENTITY; 2]);
+        let rel = b.shot_pose[1][2];
+        assert!(rel != Pose::IDENTITY && rel == b.shot_pose[1][3], "segments 2-3 share one moved pose: {rel:?}");
+        assert!((rel.trans_mm[2] - 1.5).abs() < 1e-9, "relative to the volume's pose (the rotation about z leaves z alone)");
+        let abs = &b.segment_shots.as_ref().unwrap().poses[1];
+        assert!((abs[2].trans_mm[2] - 1.5).abs() < 1e-9 && (abs[2].rot_deg[2] - 0.04f64.to_degrees()).abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- Task 16: 3D Look-Locker
 
     /// `ge3d_protocol`'s train read by Look-Locker: control then label cycles of `plds.len()`
@@ -1544,7 +1634,7 @@ mod tests {
                         let mut v = ph.m0[i] as f64 * brute(ph.t1[i] as f64, &cycles)[prep][x];
                         if sign != 0.0 && ph.perfusion[i] > 0.0 {
                             let c = Case {
-                                k: kin, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
+                                k: kin, f_ml_100g_min: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
                                 m0: ph.m0[i] as f64, t: e_all[x],
                                 excitations: e_all[..x].iter().copied().zip(f_all[..x].iter().copied()).collect(),
                                 entry_lead: ph.att[i] as f64 - 0.5, pulses: vec![2.0], epsilon: eps, region: PRegion::Global,
@@ -1762,9 +1852,9 @@ mod tests {
     // ---- Task 18: Hadamard, and the P4 parts, in 3D
 
     const MACRO: &str = "[macrovascular]\narterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }\n\
-                         arterial_transit_time = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n";
+                         arterial_compartment_att = { grey_matter = 1.2, white_matter = 1.8, csf = 0.0 }\n";
     const ABV: [f64; 4] = [0.0, 0.03, 0.015, 0.0];
-    const AATT: [f64; 4] = [0.0, 1.2, 1.8, 0.0];
+    const ATT_ARTERIAL: [f64; 4] = [0.0, 1.2, 1.8, 0.0];
 
     /// `ge3d_protocol`'s train, Hadamard order 4 (sub-boli of 0.6 s), `cycles` encoding cycles, each
     /// row read at every PLD of `plds` (Look-Locker with more than one), no suppression.
@@ -1810,15 +1900,15 @@ mod tests {
             return 0.0;
         }
         let c = Case {
-            k, f: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
+            k, f_ml_100g_min: ph.perfusion[i] as f64, att: ph.att[i] as f64, t1t: ph.t1[i] as f64,
             m0: ph.m0[i] as f64, t: e_all[x], excitations: e_all[..x].iter().map(|&t| (t, 12.0)).collect(),
             entry_lead: ph.att[i] as f64 - 0.5, pulses: vec![], epsilon: 0.0, region: PRegion::Global, tau_ex: Some(0.4), span,
         };
         let mut v = if ph.perfusion[i] > 0.0 { c.read(4).1 } else { 0.0 };
         let l = l as usize;
-        let a = e_all[x] - AATT[l];
+        let a = e_all[x] - ATT_ARTERIAL[l];
         if arterial && ABV[l] > 0.0 && span.0 <= a && a < span.1 {
-            v += c.arterial(ABV[l], AATT[l], AATT[l] - 0.5);
+            v += c.arterial(ABV[l], ATT_ARTERIAL[l], ATT_ARTERIAL[l] - 0.5);
         }
         v
     }
@@ -1871,8 +1961,8 @@ mod tests {
                             if arterial && !art_seen {
                                 art_seen = (0..ph.nvox()).any(|i| {
                                     let l = ph.dseg[i].max(0) as usize;
-                                    let a = e_all[x] - AATT[l];
-                                    ABV[l] > 0.0 && h.spans[j].0 <= a && a < h.spans[j].1 && AATT[l] <= e_all[x]
+                                    let a = e_all[x] - ATT_ARTERIAL[l];
+                                    ABV[l] > 0.0 && h.spans[j].0 <= a && a < h.spans[j].1 && ATT_ARTERIAL[l] <= e_all[x]
                                 });
                             }
                             let want = b.r_sim.mean(&per);
@@ -1894,7 +1984,7 @@ mod tests {
     }
 
     /// 3D Hadamard: decoded (j, n) against the independent sub-bolus read, with exchange and the
-    /// arterial term, both entering the slab at d = 0.5 s < aATT; each shot repeats its encoding row.
+    /// arterial term, both entering the slab at d = 0.5 s < ATT_arterial; each shot repeats its encoding row.
     #[test]
     fn hadamard_decodes_to_each_sub_bolus_with_the_arterial_term() {
         let p = had3d_protocol(&[0.5], 1, MACRO);
