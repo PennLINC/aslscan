@@ -138,6 +138,16 @@ fn run() -> Result<(), String> {
             r.train.refocusing_deg, segs.iter().map(|g| g.l).max().unwrap_or(0),
             segs.iter().map(|g| g.bound).fold(0.0, f64::max),
         );
+        if !sp.kz.is_full() || sp.coil_rows > 1 {
+            println!(
+                "kz: {} of {} partitions read (partial Fourier {}{}, acceleration {}), {} coil ring(s) along z{}",
+                sp.partitions_read, out.acq_grid.dims[2], sp.kz.partial_fourier,
+                if sp.partial_fourier_recon == mrsim_acq::kspace3d::KzPartialFourierRecon::Pocs { " by POCS" } else { "" },
+                sp.kz.accel, sp.coil_rows,
+                sp.calibration.map_or(String::new(), |c| format!(
+                    "; kernel calibrated on volume {} with a {}-echo train", c.volume, c.etl)),
+            );
+        }
     } else if let Some(r) = &out.readout {
         println!(
             "readout: 3D {} train, {} shot(s), {} echoes of {:.4} ms, {} lines of {:.4} ms per echo ({}), refocusing {} degrees",

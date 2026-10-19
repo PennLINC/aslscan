@@ -14,10 +14,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use mrsim_acq::kspace::{Acquisition, EchoFormation, KspaceWindow, PartialFourierMode};
+use mrsim_acq::kspace3d::KzPartialFourierRecon;
 use mrsim_acq::motion::{load_motion_tsv, MotionMode};
 use mrsim_acq::readout::{
     centre_echo, check_ge3d_timing, check_grase_timing, check_spiral_timing, esp_from_echo_time, ge3d_lines, grase_block,
-    grase_lines, spiral_esp_from_echo_time, spiral_lines, EchoTrain, ExcitationTrain, Ge3dReadout, KzOrder, Readout3d,
+    grase_lines, spiral_centre_echo, spiral_esp_from_echo_time, spiral_lines, EchoTrain, ExcitationTrain, Ge3dReadout, KzOrder,
+    KzSampling, Readout3d,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -83,6 +85,8 @@ pub struct OverlayAcq {
     pub n_spikes: usize,
     pub spike_amplitude: f64,
     pub n_coils: usize,
+    /// The coils' rings along z (P8): a stack of spirals accelerated along kz needs them.
+    pub coil_rows: usize,
     /// ms; the `Acquisition::t_inhom` fallback the per-compartment T2' overrides.
     pub t_inhom_ms: f64,
     pub window: KspaceWindow,
@@ -107,6 +111,7 @@ impl Default for OverlayAcq {
             n_spikes: 0,
             spike_amplitude: 1.0,
             n_coils: 1,
+            coil_rows: 1,
             t_inhom_ms: 50.0,
             window: KspaceWindow::None,
             partial_fourier: 1.0,
@@ -213,6 +218,15 @@ pub struct ReadoutOverlay {
     /// How much denser than the Nyquist spacing a spiral's turns are (at least 1; default
     /// [`DEFAULT_RADIAL_OVERSAMPLING`]).
     pub radial_oversampling: Option<f64>,
+    /// Spiral (P8): the fraction of the kz partitions read, in `(0.5, 1]`; otherwise the sidecar's
+    /// `PartialFourier` when its `PartialFourierDirection` is the slice axis, else 1.
+    pub kz_partial_fourier: Option<f64>,
+    /// Spiral (P8): every `kz_acceleration`-th partition is read; otherwise the sidecar's
+    /// `ParallelReductionFactorOutOfPlane`, else 1.
+    pub kz_acceleration: Option<usize>,
+    /// Spiral (P8): `"zero-fill"` (default) or `"pocs"`, what fills the partitions partial Fourier
+    /// along kz leaves out. POCS is not linear, so it is refused with `deltam` rows.
+    pub kz_partial_fourier_reconstruction: Option<String>,
     /// `"epi3d"` (P7 part C): the excitation spacing within a train (ms), required.
     pub excitation_spacing: Option<f64>,
     /// `"epi3d"`: the excitation pulse reserved about each excitation (ms, default 2).
@@ -443,6 +457,7 @@ pub struct AcqOverlay {
     pub n_spikes: Option<usize>,
     pub spike_amplitude: Option<f64>,
     pub n_coils: Option<usize>,
+    pub coil_rows: Option<usize>,
     /// ms
     pub t_inhom: Option<f64>,
     /// `none` | `hann` | `tukey:<alpha>` | `fermi:<radius>,<width>`
@@ -546,6 +561,10 @@ pub struct ReadoutSpec {
     pub interleaves: Option<(usize, Source)>,
     pub spiral_readout_ms: Option<(f64, Source)>,
     pub radial_oversampling: Option<(f64, Source)>,
+    /// Spirals (P8): partial Fourier and acceleration along kz.
+    pub kz_partial_fourier: Option<(f64, Source)>,
+    pub kz_acceleration: Option<(usize, Source)>,
+    pub kz_partial_fourier_recon: Option<(KzPartialFourierRecon, Source)>,
     /// P7 part C, `"epi3d"` only: the excitation spacing and pulse (ms), the slab entry (from
     /// `[readout]` or bolus-position's), the tissue groups allowed and the interpolation tolerance.
     pub ge3d: Option<Ge3dSpec>,
@@ -610,6 +629,27 @@ pub struct SpiralResolution {
     pub tau_c_ms: f64,
     /// The turns' density over the Nyquist spacing, and its source.
     pub radial_oversampling: (f64, Source),
+    /// P8: the partitions read (partial Fourier and acceleration along kz, with their sources),
+    /// their count, the first partition of the partial-Fourier band, the coils' rings along z, and
+    /// an acceleration's calibration.
+    pub kz: KzSampling,
+    pub kz_partial_fourier_source: Source,
+    pub kz_acceleration_source: Source,
+    pub partitions_read: usize,
+    pub band_start: usize,
+    pub coil_rows: usize,
+    pub calibration: Option<KzCalibration>,
+    /// What fills the partitions partial Fourier left out.
+    pub partial_fourier_recon: KzPartialFourierRecon,
+}
+
+/// The calibration of a kz acceleration (P8): the series volume whose compartment images the
+/// preparation repetitions read, and the length of their train (the series' without the
+/// acceleration).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KzCalibration {
+    pub volume: usize,
+    pub etl: usize,
 }
 
 /// The resolved gradient-echo excitation (P5 addendum, part A) with its source.
@@ -921,6 +961,7 @@ fn overlay_acq(o: Option<&AcqOverlay>) -> Result<OverlayAcq, String> {
     if let Some(v) = o.n_spikes { a.n_spikes = v; }
     if let Some(v) = o.spike_amplitude { a.spike_amplitude = v; }
     if let Some(v) = o.n_coils { a.n_coils = v; }
+    if let Some(v) = o.coil_rows { a.coil_rows = v; }
     if let Some(v) = o.t_inhom { a.t_inhom_ms = v; }
     if let Some(v) = &o.window { a.window = parse_window(v)?; }
     if let Some(v) = o.partial_fourier { a.partial_fourier = v; }
@@ -941,6 +982,10 @@ fn overlay_acq(o: Option<&AcqOverlay>) -> Result<OverlayAcq, String> {
     }
     if a.n_coils == 0 {
         return Err("overlay: acquisition.n_coils must be at least 1".to_string());
+    }
+    if a.coil_rows == 0 || !a.n_coils.is_multiple_of(a.coil_rows) {
+        return Err(format!("overlay: acquisition.coil_rows {} must be at least 1 and divide n_coils {} (the coils form \
+                            that many equal rings along z)", a.coil_rows, a.n_coils));
     }
     require_finite_positive(a.t_inhom_ms, "overlay acquisition.t_inhom")?;
     require_finite_positive(a.eddy_tau_ms, "overlay acquisition.eddy_tau")?;
@@ -2071,7 +2116,10 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
                               ("readout_samples", r.readout_samples.is_some())];
             let spiral_only = [("interleaves", r.interleaves.is_some()),
                                ("spiral_readout_time", r.spiral_readout_time.is_some()), ("dwell_time", r.dwell_time.is_some()),
-                               ("radial_oversampling", r.radial_oversampling.is_some())];
+                               ("radial_oversampling", r.radial_oversampling.is_some()),
+                               ("kz_partial_fourier", r.kz_partial_fourier.is_some()),
+                               ("kz_acceleration", r.kz_acceleration.is_some()),
+                               ("kz_partial_fourier_reconstruction", r.kz_partial_fourier_reconstruction.is_some())];
             // P7 part C: the spin-echo train's keys and the 3D EPI train's
             let echo_train_only = [("echo_spacing", r.echo_spacing.is_some()), ("refocusing_time", r.refocusing_time.is_some()),
                                    ("refocusing_flip_angle", r.refocusing_flip_angle.is_some())];
@@ -2090,17 +2138,87 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
             if let Some((key, _, other)) = wrong.iter().find(|(_, on, _)| *on) {
                 return Err(format!("overlay: readout.{key} is a {other} key; the readout is {}", kind.as_str()));
             }
-            if let Some(v) = opt_num(sidecar, "ParallelReductionFactorOutOfPlane")? {
-                if v != 1.0 {
-                    return Err(format!("asl.json: ParallelReductionFactorOutOfPlane {v}: out-of-plane acceleration \
-                                        (CAIPI) is deferred"));
+            // P8: undersampling along kz is the stack of spirals'; the sidecar's fields are its
+            // inputs there (the overlay's over them) and refused elsewhere
+            let side_kz_accel = match opt_num(sidecar, "ParallelReductionFactorOutOfPlane")? {
+                None => None,
+                Some(v) if v >= 1.0 && v.fract() == 0.0 && (kind == ReadoutKind::Spiral || v < 2.0) => Some(v as usize),
+                Some(v) if kind == ReadoutKind::Spiral => {
+                    return Err(format!("asl.json: ParallelReductionFactorOutOfPlane {v} is not a positive integer"))
+                }
+                Some(v) => {
+                    return Err(format!("asl.json: ParallelReductionFactorOutOfPlane {v}: out-of-plane acceleration is \
+                                        the stack of spirals' (regular undersampling along kz); with a {} readout it \
+                                        (CAIPI) is deferred", kind.as_str()))
+                }
+            };
+            let side_kz_pf = match sidecar.get("PartialFourierDirection") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(d)) if matches!(d.to_ascii_lowercase().as_str(), "k" | "k-" | "slice" | "partition") => {
+                    if kind != ReadoutKind::Spiral {
+                        return Err(format!("asl.json: PartialFourierDirection {d:?}: partial Fourier along kz is the stack \
+                                            of spirals'; with a {} readout it is deferred", kind.as_str()));
+                    }
+                    match opt_num(sidecar, "PartialFourier")? {
+                        Some(v) => Some(v),
+                        // the overlay's fraction stands in for a sidecar that names only the direction
+                        None if r.kz_partial_fourier.is_some() => None,
+                        None => return Err(format!(
+                            "asl.json: PartialFourierDirection {d:?} without PartialFourier: the fraction of the kz \
+                             partitions read is missing (or give [readout] kz_partial_fourier)")),
+                    }
+                }
+                Some(Value::String(_)) => None,
+                Some(other) => return Err(format!("asl.json: PartialFourierDirection {other} is not a string")),
+            };
+            let kz_partial_fourier = match (kind, r.kz_partial_fourier, side_kz_pf) {
+                (ReadoutKind::Spiral, Some(v), _) => Some((v, Source::Overlay)),
+                (ReadoutKind::Spiral, None, Some(v)) => Some((v, Source::Sidecar)),
+                (ReadoutKind::Spiral, None, None) => Some((1.0, Source::Default)),
+                _ => None,
+            };
+            if let Some((v, src)) = kz_partial_fourier {
+                if !(v.is_finite() && v > 0.5 && v <= 1.0) {
+                    return Err(format!("partial Fourier along kz ({}) must be in (0.5, 1], got {v}", match src {
+                        Source::Overlay => "overlay readout.kz_partial_fourier",
+                        _ => "asl.json PartialFourier with a slice PartialFourierDirection",
+                    }));
                 }
             }
-            if let Some(d) = sidecar.get("PartialFourierDirection").and_then(Value::as_str) {
-                if matches!(d.to_ascii_lowercase().as_str(), "k" | "k-" | "slice" | "partition") {
-                    return Err(format!("asl.json: PartialFourierDirection {d:?}: partial Fourier along kz is deferred"));
+            let kz_acceleration = match (kind, r.kz_acceleration, side_kz_accel) {
+                (ReadoutKind::Spiral, Some(0), _) => {
+                    return Err("overlay: readout.kz_acceleration must be at least 1".to_string())
                 }
-            }
+                (ReadoutKind::Spiral, Some(v), _) => Some((v, Source::Overlay)),
+                (ReadoutKind::Spiral, None, Some(v)) => Some((v, Source::Sidecar)),
+                (ReadoutKind::Spiral, None, None) => Some((1, Source::Default)),
+                _ => None,
+            };
+            // what fills the partitions partial Fourier leaves out: zero filling, or POCS
+            let kz_partial_fourier_recon = match (kind, r.kz_partial_fourier_reconstruction.as_deref()) {
+                (ReadoutKind::Spiral, None) => Some((KzPartialFourierRecon::ZeroFill, Source::Default)),
+                (ReadoutKind::Spiral, Some("zero-fill")) => Some((KzPartialFourierRecon::ZeroFill, Source::Overlay)),
+                (ReadoutKind::Spiral, Some("pocs")) => {
+                    if kz_partial_fourier.is_some_and(|v| v.0 >= 1.0) {
+                        return Err("overlay: readout.kz_partial_fourier_reconstruction = \"pocs\" without partial Fourier \
+                                    along kz: there is nothing for it to reconstruct".to_string());
+                    }
+                    // a deltam row is simulated as the reconstruction of the difference object, which
+                    // is the difference of the reconstructions only when the reconstruction is linear
+                    if kinds.contains(&RowKind::Deltam) {
+                        return Err("overlay: readout.kz_partial_fourier_reconstruction = \"pocs\" with deltam rows: POCS \
+                                    is not linear, so the reconstruction of a difference is not the difference of the \
+                                    reconstructions a scanner would subtract; list control and label rows and subtract \
+                                    the volumes, or use \"zero-fill\"".to_string());
+                    }
+                    Some((KzPartialFourierRecon::Pocs, Source::Overlay))
+                }
+                (ReadoutKind::Spiral, Some(other)) => {
+                    return Err(format!("overlay: readout.kz_partial_fourier_reconstruction {other:?}: expected \"zero-fill\" \
+                                        or \"pocs\""))
+                }
+                _ => None,
+            };
             let pos = |v: Option<f64>, what: &str| -> Result<Option<f64>, String> {
                 v.map(|x| require_finite_positive(x, what)).transpose()
             };
@@ -2221,6 +2339,9 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
                 interleaves,
                 spiral_readout_ms,
                 radial_oversampling,
+                kz_partial_fourier,
+                kz_acceleration,
+                kz_partial_fourier_recon,
                 ge3d: None,
             })
         }
@@ -2621,6 +2742,17 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
             return Err(format!("asl.json: ParallelReductionFactorInPlane {accel} with a spiral readout: GRAPPA has no \
                                 spiral meaning in this model"));
         }
+        // P8: an acceleration along kz is resolved by coils that differ along z
+        let kz_accel = readout.as_ref().and_then(|r| r.kz_acceleration).map_or(1, |v| v.0);
+        if kz_accel > 1 && acq.coil_rows < kz_accel {
+            return Err(format!(
+                "a kz acceleration of {kz_accel} needs coils that differ along z: [acquisition] coil_rows is {} (the coils' \
+                 rings along z, each of n_coils / coil_rows elements) and must be at least {kz_accel}; for example \
+                 n_coils = {} with coil_rows = {}", acq.coil_rows, 2 * kz_accel, 2 * kz_accel));
+        }
+    } else if acq.coil_rows != 1 {
+        return Err(format!("overlay: acquisition.coil_rows = {} without a spiral readout: coil rings along z are the \
+                            stack of spirals' (P8)", acq.coil_rows));
     }
 
     // Compat (P2 addendum, part A): pinned values checked against what was set explicitly.
@@ -3332,20 +3464,36 @@ fn resolve_spiral(p: &Protocol, r: &ReadoutSpec, acq_dims: [usize; 3]) -> Result
         return Err(format!("a spiral readout needs a square in-plane matrix, not {nx} x {ny}: set [acquisition] matrix"));
     }
     let kz_segments = r.kz_segments.0;
-    if nz % kz_segments != 0 {
-        return Err(format!(
-            "{nz} partitions (the phantom's extent at the slab's voxel size) do not divide into {kz_segments} kz \
-             segments; crop the phantom or change kz_segments"));
-    }
-    let etl = nz / kz_segments;
     let (Some((interleaves, _)), Some((readout_ms, _)), Some((dwell_s, dwell_source)), Some(radial_oversampling)) =
         (r.interleaves, r.spiral_readout_ms, r.dwell_time_s, r.radial_oversampling) else {
         unreachable!("a parsed spiral carries its interleaves, readout time and dwell time")
     };
+    // P8: the partitions the train reads; the echo train length counts those
+    let (Some(kz_pf), Some(kz_accel)) = (r.kz_partial_fourier, r.kz_acceleration) else {
+        unreachable!("a parsed spiral carries its kz sampling")
+    };
+    let kz = KzSampling { partial_fourier: kz_pf.0, accel: kz_accel.0 };
+    let coil_rows = p.acq.coil_rows;
+    if (!kz.is_full() || coil_rows != 1) && p.p6_active() {
+        return Err("partial Fourier or acceleration along kz, and coil rings along z, with Hadamard encoding: deferred \
+                    (P8 covers the plain label/control series)".to_string());
+    }
+    let n_read = kz.n_acquired(nz)?;
+    if n_read % kz_segments != 0 {
+        return Err(if kz.is_full() {
+            format!("{nz} partitions (the phantom's extent at the slab's voxel size) do not divide into {kz_segments} kz \
+                     segments; crop the phantom or change kz_segments")
+        } else {
+            format!("the {n_read} partitions read (of {nz}, the phantom's extent at the slab's voxel size, at partial \
+                     Fourier {} and acceleration {} along kz) do not divide into {kz_segments} kz segments; crop the \
+                     phantom or change kz_segments", kz.partial_fourier, kz.accel)
+        });
+    }
+    let etl = n_read / kz_segments;
     let dwell_ms = dwell_s * 1000.0;
     let probe = EchoTrain { etl, esp_ms: 1.0, refocusing_deg: r.refocusing_flip_deg.0, kz_order: r.kz_order.0, kz_segments,
                             refocusing_time_ms: r.refocusing_time_ms.0 };
-    let e_c = centre_echo(&probe, nz)?;
+    let e_c = spiral_centre_echo(&probe, &kz, nz)?;
     let te_ms = p.echo_time_s * 1000.0;
     let esp_ms = match r.echo_spacing_ms {
         Some(esp) => {
@@ -3359,9 +3507,40 @@ fn resolve_spiral(p: &Protocol, r: &ReadoutSpec, acq_dims: [usize; 3]) -> Result
         None => spiral_esp_from_echo_time(te_ms, e_c),
     };
     let train = EchoTrain { esp_ms, ..probe };
-    let readout = Readout3d::Spiral { interleaves, readout_ms, dwell_ms, radial_oversampling: radial_oversampling.0 };
+    let readout = Readout3d::Spiral { interleaves, readout_ms, dwell_ms, radial_oversampling: radial_oversampling.0, kz };
     let table = spiral_lines(&train, &readout, nx, ny, nz)?;
     debug_assert_eq!(table.n_shots, r.number_shots.0);
+    if r.kz_partial_fourier_recon.is_some_and(|v| v.0 == KzPartialFourierRecon::Pocs) && table.band_start == 0 {
+        return Err(format!("[readout] kz_partial_fourier_reconstruction = \"pocs\": partial Fourier {} keeps every one of \
+                            the {nz} partitions, so there is nothing for it to reconstruct", kz.partial_fourier));
+    }
+    // P8: an acceleration's kernel is fitted to preparation repetitions of the series' first
+    // labeled volume, read by the same train without the acceleration, which must fit as well
+    let calibration = if kz.accel > 1 {
+        let n_cal = kz.calibration().n_acquired(nz)?;
+        if n_cal % kz_segments != 0 {
+            return Err(format!("the kz calibration train reads the {n_cal} partitions of the partial-Fourier band, which do \
+                                not divide into {kz_segments} kz segments"));
+        }
+        let cal_train = EchoTrain { etl: n_cal / kz_segments, ..train.clone() };
+        let cal_readout = Readout3d::Spiral { interleaves, readout_ms, dwell_ms, radial_oversampling: radial_oversampling.0,
+                                              kz: kz.calibration() };
+        let cal_table = spiral_lines(&cal_train, &cal_readout, nx, ny, nz)?;
+        // a scanner calibrates on what it acquires: the first control or label volume; a series of
+        // differences has none, and its m0scan (the tissue's signal) stands in before a deltam
+        let first = |kinds: &[RowKind]| p.rows.iter().position(|row| kinds.contains(&row.kind));
+        let volume = first(&[RowKind::Control, RowKind::Label])
+            .or_else(|| first(&[RowKind::M0scan]))
+            .or_else(|| first(&[RowKind::Deltam]))
+            .ok_or("a kz acceleration needs a volume to calibrate on: the series is empty")?;
+        let row = &p.rows[volume];
+        check_spiral_timing(&cal_train, &cal_table, row.t * 1000.0, row.tr * 1000.0)
+            .map_err(|e| format!("the kz calibration repetition (the train without the acceleration, {} echoes): {e}",
+                                 cal_train.etl))?;
+        Some(KzCalibration { volume, etl: cal_train.etl })
+    } else {
+        None
+    };
     let mut seen: Vec<(u64, u64)> = Vec::new();
     let excitations = p.rows.iter().map(|row| (row.t, row.tr)).chain(p.m0_repetition_time_s.map(|tr| (0.0, tr)));
     for (t_exc, tr) in excitations {
@@ -3379,6 +3558,9 @@ fn resolve_spiral(p: &Protocol, r: &ReadoutSpec, acq_dims: [usize; 3]) -> Result
             interleaves, readout_ms, dwell_ms, dwell_source, radial_oversampling, samples_per_interleaf: tj.n_samples(),
             k_max: tj.k_max,
             n_turns: tj.n_turns, tau_c_ms: tj.tau_c_ms,
+            kz, kz_partial_fourier_source: kz_pf.1, kz_acceleration_source: kz_accel.1, partitions_read: n_read,
+            band_start: table.band_start, coil_rows, calibration,
+            partial_fourier_recon: r.kz_partial_fourier_recon.map_or(KzPartialFourierRecon::ZeroFill, |v| v.0),
         }),
     })
 }
@@ -4372,6 +4554,132 @@ mod tests {
         assert!(resolve_readout(&parse(&base(), CTX, Some(&m0_overlay()), None).unwrap(), [64, 64, 3]).unwrap().is_none());
     }
 
+    /// P8: partial Fourier and acceleration along kz on the spiral fixture (20 partitions), from the
+    /// overlay and from the sidecar, and what they refuse.
+    #[test]
+    fn kz_undersampling_of_a_spiral_parses_resolves_and_refuses() {
+        let (s, c) = fixture("asl001");
+        let ov_text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols/asl001_p5/overlay.toml")).unwrap();
+        let ov = |acq: &str, readout: &str| overlay(&format!("{}{readout}", ov_text.replace("matrix = [64, 64]", &format!("matrix = [64, 64]\n{acq}"))));
+        let coils = "n_coils = 4\ncoil_rows = 4";
+        // the overlay's keys
+        let p = parse(&s, &c, Some(&ov(coils, "kz_partial_fourier = 0.75\nkz_acceleration = 2\n")), None).unwrap();
+        let r = p.readout.as_ref().unwrap();
+        assert_eq!((r.kz_partial_fourier, r.kz_acceleration), (Some((0.75, Source::Overlay)), Some((2, Source::Overlay))));
+        assert_eq!((p.acq.n_coils, p.acq.coil_rows, r.number_shots.0), (4, 4, 8));
+        if cfg!(feature = "kspace") {
+            // 20 partitions: the band keeps kz -5..9, of which the even ones are read
+            let res = resolve_readout(&p, [64, 64, 20]).unwrap().unwrap();
+            let sp = res.spiral.as_ref().unwrap();
+            assert_eq!((res.etl, res.e_c, res.n_shots, sp.partitions_read, sp.band_start, sp.coil_rows), (7, 1, 8, 7, 5, 4));
+            assert_eq!(sp.kz, KzSampling { partial_fourier: 0.75, accel: 2 });
+            // a series of an m0scan and a deltam has no control or label: the kernel is calibrated
+            // on the m0scan, by the 15-echo train
+            assert_eq!((p.rows[0].kind, p.rows[1].kind), (RowKind::M0scan, RowKind::Deltam));
+            assert_eq!(sp.calibration, Some(KzCalibration { volume: 0, etl: 15 }));
+            // the read partitions must divide into the kz segments
+            let p2 = parse(&s, &c, Some(&ov(coils, "kz_partial_fourier = 0.75\nkz_acceleration = 2\nkz_segments = 2\n")), None)
+                .unwrap();
+            assert!(resolve_readout(&p2, [64, 64, 20]).unwrap_err().contains("7 partitions read"));
+            // partial Fourier alone needs no rings and no calibration
+            let p3 = parse(&s, &c, Some(&ov("", "kz_partial_fourier = 0.75\n")), None).unwrap();
+            let res = resolve_readout(&p3, [64, 64, 20]).unwrap().unwrap();
+            let sp = res.spiral.as_ref().unwrap();
+            assert_eq!((res.etl, sp.partitions_read, sp.coil_rows, sp.calibration), (15, 15, 1, None));
+            // unset, the train reads every partition as before
+            let p4 = parse(&s, &c, Some(&ov("", "")), None).unwrap();
+            let sp = resolve_readout(&p4, [64, 64, 20]).unwrap().unwrap().spiral.unwrap();
+            assert!(sp.kz.is_full() && sp.kz_partial_fourier_source == Source::Default && sp.partitions_read == 20);
+        }
+        // the acceptance protocol (Vidorreta et al. 2017 as SPIRAL_V20_HCP prescribes it): 13 of 36
+        // partitions per train, two shots, the kernel calibrated on the first label volume
+        let (sh, ch) = fixture("p8_spiral_kz");
+        let ph = parse(&sh, &ch, Some(&overlay_file("p8_spiral_kz")), None).unwrap();
+        let rh = ph.readout.as_ref().unwrap();
+        assert_eq!((rh.kz_partial_fourier, rh.kz_acceleration, rh.number_shots),
+                   (Some((0.75, Source::Sidecar)), Some((2, Source::Sidecar)), (2, Source::Sidecar)));
+        assert_eq!((ph.rows.len(), ph.acq.n_coils, ph.acq.coil_rows), (29, 8, 4));
+        if cfg!(feature = "kspace") {
+            let res = resolve_readout(&ph, [64, 64, 36]).unwrap().unwrap();
+            let sp = res.spiral.as_ref().unwrap();
+            assert_eq!((res.etl, res.e_c, res.n_shots, sp.partitions_read, sp.band_start), (13, 1, 2, 13, 9));
+            assert!((res.esp_ms - 10.0).abs() < 1e-9 && sp.samples_per_interleaf == 4000, "{res:?}");
+            assert_eq!(sp.calibration, Some(KzCalibration { volume: 1, etl: 27 }));
+        }
+        // POCS for the partitions partial Fourier leaves out: with control and label rows only
+        let pocs = "kz_partial_fourier_reconstruction = \"pocs\"\n";
+        let ov_h = |extra: &str| {
+            let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols/p8_spiral_kz/overlay.toml")).unwrap();
+            overlay(&text.replace("[readout]", &format!("[readout]\n{extra}")))
+        };
+        let pp = parse(&sh, &ch, Some(&ov_h(pocs)), None).unwrap();
+        assert_eq!(pp.readout.as_ref().unwrap().kz_partial_fourier_recon, Some((KzPartialFourierRecon::Pocs, Source::Overlay)));
+        assert_eq!(ph.readout.as_ref().unwrap().kz_partial_fourier_recon, Some((KzPartialFourierRecon::ZeroFill, Source::Default)));
+        if cfg!(feature = "kspace") {
+            assert_eq!(resolve_readout(&pp, [64, 64, 36]).unwrap().unwrap().spiral.unwrap().partial_fourier_recon,
+                       KzPartialFourierRecon::Pocs);
+            // a fraction that rounds to every partition leaves POCS nothing to do
+            let all = parse(&sh, &ch, Some(&ov_h(&format!("{pocs}kz_partial_fourier = 0.99\n"))), None).unwrap();
+            assert!(resolve_readout(&all, [64, 64, 36]).unwrap_err().contains("keeps every one of the 36 partitions"));
+        }
+        assert!(parse(&sh, &ch, Some(&ov_h("kz_partial_fourier_reconstruction = \"homodyne\"\n")), None).unwrap_err()
+            .contains("expected \"zero-fill\" or \"pocs\""));
+        assert!(parse(&sh, &ch, Some(&ov_h(&format!("{pocs}kz_partial_fourier = 1.0\n"))), None).unwrap_err()
+            .contains("nothing for it to reconstruct"));
+        // the spiral fixture lists a deltam row, which a nonlinear reconstruction cannot stand for
+        assert!(parse(&s, &c, Some(&ov("", &format!("kz_partial_fourier = 0.75\n{pocs}"))), None).unwrap_err()
+            .contains("with deltam rows"));
+        // the sidecar's fields, and the overlay over them
+        let mut s2 = s.clone();
+        s2["ParallelReductionFactorOutOfPlane"] = json!(2);
+        s2["PartialFourier"] = json!(0.75);
+        s2["PartialFourierDirection"] = json!("k");
+        let r = parse(&s2, &c, Some(&ov(coils, "")), None).unwrap().readout.unwrap();
+        assert_eq!((r.kz_partial_fourier, r.kz_acceleration), (Some((0.75, Source::Sidecar)), Some((2, Source::Sidecar))));
+        let r = parse(&s2, &c, Some(&ov(coils, "kz_partial_fourier = 1.0\nkz_acceleration = 1\n")), None).unwrap().readout.unwrap();
+        assert_eq!((r.kz_partial_fourier, r.kz_acceleration), (Some((1.0, Source::Overlay)), Some((1, Source::Overlay))));
+        // a sidecar PartialFourier without a slice direction stays what it was: not the readout's
+        let mut s3 = s.clone();
+        s3["PartialFourier"] = json!(0.75);
+        assert_eq!(parse(&s3, &c, Some(&ov("", "")), None).unwrap().readout.unwrap().kz_partial_fourier, Some((1.0, Source::Default)));
+        s3["PartialFourierDirection"] = json!("j");
+        assert_eq!(parse(&s3, &c, Some(&ov("", "")), None).unwrap().readout.unwrap().kz_partial_fourier, Some((1.0, Source::Default)));
+        let mut s4 = s.clone();
+        s4["PartialFourierDirection"] = json!("k");
+        assert!(parse(&s4, &c, Some(&ov("", "")), None).unwrap_err().contains("without PartialFourier"));
+        // ... unless the overlay gives the fraction
+        assert_eq!(parse(&s4, &c, Some(&ov("", "kz_partial_fourier = 0.75\n")), None).unwrap().readout.unwrap().kz_partial_fourier,
+                   Some((0.75, Source::Overlay)));
+        s4["PartialFourierDirection"] = json!(42);
+        assert!(parse(&s4, &c, Some(&ov("", "")), None).unwrap_err().contains("not a string"));
+        // refusals
+        let err = |acq: &str, readout: &str| parse(&s, &c, Some(&ov(acq, readout)), None).unwrap_err();
+        assert!(err("", "kz_acceleration = 2\n").contains("coil_rows is 1"));
+        assert!(err("n_coils = 4\ncoil_rows = 2", "kz_acceleration = 3\n").contains("at least 3"));
+        assert!(err("n_coils = 4\ncoil_rows = 3", "").contains("divide n_coils"));
+        assert!(err("coil_rows = 0", "").contains("divide n_coils"));
+        assert!(err("", "kz_acceleration = 0\n").contains("at least 1"));
+        for pf in ["0.5", "1.2", "nan"] {
+            assert!(err("", &format!("kz_partial_fourier = {pf}\n")).contains("(0.5, 1]"), "{pf}");
+        }
+        s2["ParallelReductionFactorOutOfPlane"] = json!(1.5);
+        assert!(parse(&s2, &c, Some(&ov(coils, "")), None).unwrap_err().contains("not a positive integer"));
+        // elsewhere the keys are refused: GRASE, and coil rings on a 2D readout
+        let (s5, c5) = fixture("asl005");
+        let grase = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/protocols/asl005_p5/overlay.toml")).unwrap();
+        let mut s6 = s5.clone();
+        s6["ParallelReductionFactorOutOfPlane"] = json!(2);
+        assert!(parse(&s6, &c5, Some(&overlay(&grase)), None).unwrap_err().contains("stack of spirals"));
+        let mut s7 = s5.clone();
+        s7["PartialFourier"] = json!(0.75);
+        s7["PartialFourierDirection"] = json!("k");
+        assert!(parse(&s7, &c5, Some(&overlay(&grase)), None).unwrap_err().contains("stack of spirals"));
+        assert!(parse(&s5, &c5, Some(&overlay(&grase.replace("[readout]", "[readout]\nkz_acceleration = 2"))), None).unwrap_err()
+            .contains("spiral key"));
+        let two_d = overlay("[acquisition]\nn_coils = 2\ncoil_rows = 2\n[m0]\nrepetition_time = 8.0\n");
+        assert!(parse(&base(), CTX, Some(&two_d), None).unwrap_err().contains("without a spiral readout"));
+    }
+
     /// asl001 (a GE 3D spiral) with its overlay resolves to the reviewed numbers (P5 part C, plan
     /// Task 14), and the spiral rules refuse what they must.
     #[test]
@@ -4391,7 +4699,8 @@ mod tests {
             assert_eq!((res.etl, res.e_c, res.n_shots, sp.interleaves, sp.samples_per_interleaf), (20, 1, 8, 8, 1000));
             assert!((res.esp_ms - 10.528).abs() < 1e-9 && (sp.dwell_ms - 0.004).abs() < 1e-15, "{res:?}");
             assert!(sp.tau_c_ms > 0.0 && sp.tau_c_ms < 0.1, "{}", sp.tau_c_ms);
-            assert_eq!(res.readout, Readout3d::Spiral { interleaves: 8, readout_ms: 4.0, dwell_ms: sp.dwell_ms, radial_oversampling: 1.2 });
+            assert_eq!(res.readout, Readout3d::Spiral { interleaves: 8, readout_ms: 4.0, dwell_ms: sp.dwell_ms, radial_oversampling: 1.2,
+                                                           kz: KzSampling::FULL });
             assert_eq!(sp.radial_oversampling, (1.2, Source::Default));
             // a rectangular matrix
             assert!(resolve_readout(&p, [64, 48, 20]).unwrap_err().contains("square"));
