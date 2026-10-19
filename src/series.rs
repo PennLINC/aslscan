@@ -1219,8 +1219,10 @@ fn simulate_legacy(
         }
     }
     // The in-plane GRAPPA kernels are fitted once per series, on a reference scan of the same
-    // volume (its images before any motion, read without physiology or shot events, on a noise
-    // stream of the series seed), and applied to every volume. The separate M0 is its own series
+    // volume (its images before any motion or shot event, on a noise stream of the series seed),
+    // and applied to every volume. In 2D those images carry the volume's physiological tissue and
+    // label factors, as a scanner's reference scan is acquired under physiology too; a per-slice
+    // scale does not change the kernel, which is scale-free. The separate M0 is its own series
     // with its own reference scan (mrsim-acq's default: its one volume).
     let grappa_cal_volume = if acq.accel > 1 {
         Some(crate::protocol::calibration_volume(&p.rows).ok_or("GRAPPA needs a volume to calibrate on: the series is empty")?)

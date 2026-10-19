@@ -368,6 +368,17 @@ pub(super) fn volume_inputs(b: &Ge3dBuild, g: usize) -> mrsim_acq::kspace3d::GeV
 
 /// [`volume_inputs`], with `labels` false the tissue alone (P6 part A, the leakage).
 pub(super) fn volume_inputs_with(b: &Ge3dBuild, g: usize, labels: bool) -> mrsim_acq::kspace3d::GeVolume {
+    ge_inputs(b, g, labels, false)
+}
+
+/// The in-plane GRAPPA reference scan's input: raw volume `g` as [`volume_inputs`] builds it, but
+/// unmoved, without within-volume events (no shot images, no shot gains). Its physiology stays,
+/// as in the 2D series' reference.
+pub(super) fn reference_inputs(b: &Ge3dBuild, g: usize) -> mrsim_acq::kspace3d::GeVolume {
+    ge_inputs(b, g, true, true)
+}
+
+fn ge_inputs(b: &Ge3dBuild, g: usize, labels: bool, still: bool) -> mrsim_acq::kspace3d::GeVolume {
     let ph = b.ph;
     let ncomp = b.n_compartments();
     let nk = b.masks.len();
@@ -404,14 +415,14 @@ pub(super) fn volume_inputs_with(b: &Ge3dBuild, g: usize, labels: bool) -> mrsim
     }
     // motion (P5 part D): the volume's pose moves its images; the shots after a within-volume event
     // see them moved again by the event's jump (each distinct pose one shot set)
-    let pose = b.poses[g];
+    let pose = if still { Pose::IDENTITY } else { b.poses[g] };
     if pose != Pose::IDENTITY {
         for im in images.iter_mut().filter(|im| !im.is_empty()) {
             *im = mrsim_acq::motion::resample_by_pose(im, b.sim_dims, b.v2w, pose);
         }
     }
     let mut distinct: Vec<Pose> = Vec::new();
-    for &q in &b.shot_pose[g] {
+    for &q in b.shot_pose[g].iter().filter(|_| !still) {
         if q != Pose::IDENTITY && !distinct.contains(&q) {
             distinct.push(q);
         }
@@ -438,7 +449,7 @@ pub(super) fn volume_inputs_with(b: &Ge3dBuild, g: usize, labels: bool) -> mrsim
             let prep = first_prep + shot;
             debug_assert_eq!(preps[shot].shot, shot);
             let (tf, lf) = b.shot_factors[g][shot];
-            let gain = b.shot_gain[g][shot];
+            let gain = if still { 1.0 } else { b.shot_gain[g][shot] };
             let (tf, lf) = (tf * gain, lf * gain);
             let at = |c: usize| (p * ky_segments + sy) * ncomp + c;
             if tissue_on {
@@ -802,9 +813,23 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
     }
 
     // ---- the acquisition: every echo, volumes on demand ----
+    // the in-plane GRAPPA reference scan: the calibration raw volume (the first control or label,
+    // else m0scan, else deltam), unmoved and without within-volume events
+    let grappa_reference = if acq.accel > 1 {
+        let vol = crate::protocol::calibration_volume(&b.sched.raw_rows)
+            .ok_or("GRAPPA needs a volume to calibrate on: the series is empty")?;
+        let r = reference_inputs(&b, vol);
+        if r.images.iter().all(|im| im.iter().all(|v| *v == 0.0)) || r.weights.iter().all(|w| *w == 0.0) {
+            return Err(format!(
+                "the GRAPPA calibration volume (raw acquisition {vol}, the series' first control or label volume, else its                  first m0scan, else its first deltam) holds no signal, so the GRAPPA kernel cannot be fitted to it"));
+        }
+        Some(r)
+    } else {
+        None
+    };
     let mut echoes = mrsim_acq::kspace3d::simulate_acquisition_3d_ge(
         sim_grid.dims, acq_grid.dims, n, &t2_vols, &fmap_sim, Some(&ti_vols), &acq, &b.res.train, &b.res.readout,
-        &|g| volume_inputs(&b, g), phase, p.seed,
+        &|g| volume_inputs(&b, g), phase, p.seed, grappa_reference.as_ref(),
     );
 
     // ---- the separate M0: the same train without labeling or suppression at its own TR ----
@@ -832,7 +857,7 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
             };
             Some(mrsim_acq::kspace3d::simulate_acquisition_3d_ge(
                 sim_grid.dims, acq_grid.dims, 1, &t2_vols, &fmap_sim, Some(&ti_vols), &acq, &b.res.train, &b.res.readout,
-                &m0_volume, phase, seed,
+                &m0_volume, phase, seed, None,
             ))
         }
         (Some(_), None) => return Err("M0Type Separate without an M0 repetition time".to_string()),
@@ -985,7 +1010,7 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
                 };
                 let per_echo = mrsim_acq::kspace3d::simulate_acquisition_3d_ge(
                     sim_grid.dims, acq_grid.dims, nt, &t2_vols, &fmap_sim, Some(&ti_vols), &quiet, &b.res.train,
-                    &b.res.readout, &builder, phase, p.seed,
+                    &b.res.readout, &builder, phase, p.seed, None,
                 );
                 let brain: Vec<bool> = r_acq.majority(&ph.dseg).iter().map(|l| *l > 0).collect();
                 let norm = |img: &[(f64, f64)]| -> f64 {
@@ -1489,6 +1514,22 @@ mod tests {
         assert_ne!(gt.delta_m, out_s.ground_truth.delta_m);
         assert_eq!((out_m.poses.len(), out_m.events.len(), out_m.motion_seed.is_some()), (2, moving.events.len(), true));
         assert_ne!(out_m.mag, out_s.mag);
+    }
+
+    /// Codex review of the GRAPPA PRs: the in-plane GRAPPA reference scan's input is the volume
+    /// unmoved and without within-volume events (no shot images, shot gains of one), the still
+    /// series' volume bit for bit, while the volume as acquired carries its pose or events.
+    #[test]
+    fn the_grappa_reference_input_is_the_still_volume() {
+        let ph = crop();
+        let (ps, pm) = (ge3d_protocol(""), ge3d_protocol(MOTION));
+        let still = prepare_ge3d(&ps, &ph, T2Mode::Class, RowOverride::None).unwrap();
+        let moving = prepare_ge3d(&pm, &ph, T2Mode::Class, RowOverride::None).unwrap();
+        for g in 0..2 {
+            let want = volume_inputs(&still.b, g);
+            assert_eq!(reference_inputs(&moving.b, g), want, "volume {g}");
+            assert_ne!(volume_inputs(&moving.b, g), want, "volume {g} as acquired");
+        }
     }
 
     /// P10 part C on the 3D gradient-echo train (four segments per volume): held still within each

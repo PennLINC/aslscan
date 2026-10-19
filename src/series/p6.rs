@@ -263,6 +263,9 @@ struct Built {
     gt_read_iv: Option<Vec<f32>>,
     gt_read_ev: Option<Vec<f32>>,
     gt_read_art: Option<Vec<f32>>,
+    /// The in-plane GRAPPA reference scan's object: the calibration raw volume's images before
+    /// any motion or within-volume event (empty without acceleration).
+    grappa_cal_images: Vec<Vec<f32>>,
 }
 
 /// The P1-P5 series body up to the acquisition, with `echo_time_s` in place of the protocol's
@@ -1193,6 +1196,23 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
         gt_read_art = d_art;
     }
 
+    // The in-plane GRAPPA reference scan: the calibration raw volume (the first control or label,
+    // else m0scan, else deltam) as it is here, before any motion or within-volume event, as the
+    // plain series captures it. (mrsim-acq's default, the first volume as acquired, would carry
+    // its motion and dropout into every volume's kernel.)
+    let grappa_cal_images: Vec<Vec<f32>> = if acq.accel > 1 {
+        let vol = crate::protocol::calibration_volume(&sched.raw_rows)
+            .ok_or("GRAPPA needs a volume to calibrate on: the series is empty")?;
+        let cal: Vec<Vec<f32>> = images.iter().map(|im| (0..nvox_sim).map(|v| im[v * n + vol]).collect()).collect();
+        if cal.iter().all(|im| im.iter().all(|v| *v == 0.0)) {
+            return Err(format!(
+                "the GRAPPA calibration volume (raw acquisition {vol}, the series' first control or label volume, else its                  first m0scan, else its first deltam) holds no signal, so the GRAPPA kernel cannot be fitted to it"));
+        }
+        cal
+    } else {
+        Vec::new()
+    };
+
     // ---- motion: per-volume poses, then multiband shot events ----
     let motion_seed = p.motion.as_ref().map(|_| p.seed ^ MOTION_SEED_SALT);
     let mut poses = vec![Pose::IDENTITY; n];
@@ -1384,7 +1404,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
     };
     let ge_propagated_some = ge_propagated.is_some();
     Ok(Built {
-        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, shot_plan, segment_shots, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art,
+        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, shot_plan, segment_shots, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art, grappa_cal_images,
     })
 }
 
@@ -1419,16 +1439,19 @@ pub(super) fn simulate_p6(
         }
     }
     let Built {
-        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, shot_plan, segment_shots, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art,
+        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, shot_plan, segment_shots, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art, grappa_cal_images,
     } = build(p, ph, mode, ov, tes[0], &sched)?;
     // P6 part C: every echo's readout block on explicit intervals, on the acquired grid
     if tes.len() > 1 || p.look_locker.is_some() {
         check_excitation_timing(p, acq_grid.dims)?;
     }
     let mut echo_images: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut echo_cal_images: Vec<Vec<Vec<f32>>> = Vec::new();
     if p.compat.is_some() && tes.len() > 1 {
         for &te in &tes[1..] {
-            echo_images.push(build(p, ph, mode, ov, te, &sched)?.images);
+            let b = build(p, ph, mode, ov, te, &sched)?;
+            echo_images.push(b.images);
+            echo_cal_images.push(b.grappa_cal_images);
         }
     }
 
@@ -1533,26 +1556,40 @@ pub(super) fn simulate_p6(
     let spiral_segmentation = None;
     let echo_ms: Vec<f64> = tes.iter().map(|te| te * 1000.0).collect();
     let mut more_mag: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+    // the GRAPPA reference scan (per echo its own object, on the echo's receiver seed, as
+    // mrsim-acq's default draws it)
+    let accel = acq.accel > 1;
+    let grappa_cal = accel.then(|| GrappaCalibration { images: &grappa_cal_images, seed: p.seed });
     let (mag, phase_out) = match &res3d {
         None if tes.len() > 1 => {
             let per: Vec<&[Vec<f32>]> = (0..tes.len())
                 .map(|e| if e == 0 || echo_images.is_empty() { &images[..] } else { &echo_images[e - 1][..] })
                 .collect();
+            let cals: Vec<GrappaCalibration> = (0..tes.len())
+                .map(|e| GrappaCalibration {
+                    images: if e == 0 || echo_cal_images.is_empty() { &grappa_cal_images[..] } else { &echo_cal_images[e - 1][..] },
+                    seed: p.seed ^ mrsim_acq::kspace::echo_salt(e),
+                })
+                .collect();
             let mut all = simulate_acquisition_echoes(
                 sim_grid.dims, acq_grid.dims, n, &per, &t2_vols, &fmap_sim, Some(&ti_vols), &acq, &echo_ms,
-                &eddy_drive, &prep_drive, phase, p.seed, None,
+                &eddy_drive, &prep_drive, phase, p.seed, None, accel.then_some(&cals[..]),
             );
             more_mag = all.split_off(1);
             all.pop().expect("one echo at least")
         }
-        None => simulate_acquisition_oversampled(
-            sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, &fmap_sim, Some(&ti_vols), &acq,
-            &eddy_drive, &prep_drive, phase, p.seed, None,
+        None => acquire_2d(
+            AcquisitionInput {
+                sim_dims: sim_grid.dims, acq_dims: acq_grid.dims, n_volumes: n, images: &images, t2: &t2_vols,
+                fmap: &fmap_sim, t_inhom: Some(&ti_vols), eddy_drive: &eddy_drive, prep_drive: &prep_drive, phase,
+                seed: p.seed, noise_sigma: None,
+            },
+            &acq, grappa_cal,
         ),
-        Some(r3) => simulate_acquisition_3d(
+        Some(r3) => mrsim_acq::kspace3d::simulate_acquisition_3d_kz(
             sim_grid.dims, acq_grid.dims, n, &images, &t2_vols, t1_vols.as_deref(), &fmap_sim, Some(&ti_vols), &acq,
             &r3.train, &r3.readout, line_weights.as_ref(), shot_sets.iter().any(|s| !s.is_empty()).then_some(&shot_sets[..]),
-            phase, p.seed,
+            phase, p.seed, None, grappa_cal,
         ),
     };
     drop(images);
@@ -1584,7 +1621,7 @@ pub(super) fn simulate_p6(
                     let per: Vec<&[Vec<f32>]> = vec![&imgs[..]; tes.len()];
                     simulate_acquisition_echoes(
                         sim_grid.dims, acq_grid.dims, nt, &per, &t2_vols, &fmap_sim, Some(&ti_vols), &quiet, &echo_ms,
-                        &vec![None; nt], &vec![None; nt], phase, p.seed, None,
+                        &vec![None; nt], &vec![None; nt], phase, p.seed, None, None,
                     )
                 }
                 None => vec![simulate_acquisition_oversampled(
@@ -1637,7 +1674,7 @@ pub(super) fn simulate_p6(
                 let per: Vec<&[Vec<f32>]> = vec![&imgs[..]; tes.len()];
                 let mut all = simulate_acquisition_echoes(
                     sim_grid.dims, acq_grid.dims, 1, &per, &t2_vols, &fmap_sim, Some(&ti_vols), &acq, &echo_ms,
-                    &[None], &[None], phase, seed, None,
+                    &[None], &[None], phase, seed, None, None,
                 );
                 more_m0 = all.split_off(1);
                 all.pop().expect("one echo at least")
@@ -2280,6 +2317,54 @@ mod tests {
             assert_eq!(bits(phs), bits(&one.phase), "echo {e}");
         }
         assert_eq!(out.hadamard.as_ref().unwrap().raw_more_echoes.len(), 1);
+    }
+
+    /// Codex review of the GRAPPA PRs: under in-plane acceleration the P6 series' reference scan is
+    /// its calibration raw volume before motion and within-volume events, the same with and
+    /// without them, and not the volume as acquired (mrsim-acq's default would have taken that).
+    #[test]
+    fn the_grappa_reference_is_captured_before_motion() {
+        let ph = crop();
+        let n_sub = 3;
+        let (mut ld, mut pld, mut tr) = (Vec::new(), Vec::new(), Vec::new());
+        for j in 0..n_sub {
+            ld.push(TAU);
+            pld.push(PLD + TAU * (n_sub - 1 - j) as f64);
+            tr.push(4.0);
+        }
+        let mut s = sidecar(ld, pld, tr, "Absent", false);
+        s["ParallelReductionFactorInPlane"] = json!(2);
+        let ctx = format!("volume_type
+{}", "deltam
+".repeat(n_sub));
+        let parse = |m: &str| {
+            let ov = overlay(&format!("n_coils = 4
+acs_lines = 8
+[hadamard]
+order = 4
+{m}"), false);
+            parse_echoes(&[s.clone()], &ctx, Some(&ov), None).unwrap()
+        };
+        let motion = "[motion]
+mode = \"random\"
+trans_mm = [1.0, 1.0, 0.0]
+rot_deg = [0.0, 0.0, 2.0]
+                      [motion.within_volume]
+dropout_rate = 1.0
+severity = 0.5
+";
+        let (ps, pm) = (parse(""), parse(motion));
+        let sched = Schedule::new(&ps);
+        let bs = build(&ps, &ph, T2Mode::Class, RowOverride::None, ps.echo_times_s[0], &sched).unwrap();
+        let bm = build(&pm, &ph, T2Mode::Class, RowOverride::None, pm.echo_times_s[0], &Schedule::new(&pm)).unwrap();
+        let v = crate::protocol::calibration_volume(&sched.raw_rows).unwrap();
+        let vol = |b: &Built| -> Vec<Vec<f32>> { b.images.iter().map(|im| im.iter().skip(v).step_by(b.n).copied().collect()).collect() };
+        assert!(!bs.grappa_cal_images.is_empty());
+        assert_eq!(vol(&bs), bs.grappa_cal_images, "still: the reference is the calibration volume");
+        assert_eq!(bm.grappa_cal_images, bs.grappa_cal_images, "the reference does not move");
+        assert_ne!(vol(&bm), bm.grappa_cal_images, "the calibration volume as acquired is moved");
+        let out = simulate_p6(&pm, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).unwrap();
+        assert!(out.mag.iter().all(|x| x.is_finite()) && out.mag.iter().any(|x| *x > 0.0));
     }
 
     /// The transient with shot motion (2D, multiband shot events, gradient echo after an included
