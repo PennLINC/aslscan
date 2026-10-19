@@ -54,6 +54,7 @@ pub const M0_SEED_SALT: u64 = 0x4D30_5343_414E;
 pub const MOTION_SEED_SALT: u64 = 0x4D4F_5449_4F4E;
 
 mod p6;
+pub mod shots;
 mod ge3d;
 
 /// Ground-truth maps on the acquisition grid (`resample` rules per map, see the spec).
@@ -89,6 +90,9 @@ pub struct GroundTruth {
     /// P4, part B: `aBV` (mean) and `ATT_arterial` (mean over `aBV > 0`), static.
     pub abv: Option<Vec<f32>>,
     pub att_arterial: Option<Vec<f32>>,
+    /// P9 part B: the spin-history correction summed over the tissue classes, per volume on the
+    /// acquisition grid (`vox * n_volumes + v`), before the physiological and dropout factors.
+    pub spin_history: Option<Vec<f32>>,
 }
 
 /// The physiological factors applied (P4, part E): one line per volume and slice.
@@ -134,6 +138,10 @@ pub struct SeriesOutput {
     pub motion_seed: Option<u64>,
     pub events: Vec<MotionEvent>,
     pub dropped: Vec<DroppedShot>,
+    /// The per-shot plan, on the P9 shot path only.
+    pub shots: Option<shots::ShotPlan>,
+    /// P9 part B: how often the spin-history engine merged a full voxel's pieces.
+    pub spin_history_merges: Option<u64>,
     /// Under `[compat] asldro = true`: what the SNR resolved to.
     pub compat: Option<CompatFacts>,
     /// P4, part C: the arterial survival per row and label (in `labels` order).
@@ -1188,11 +1196,64 @@ fn simulate_legacy(
     let mut poses = vec![Pose::IDENTITY; n];
     let mut events = Vec::new();
     let mut dropped = Vec::new();
+    let mut shot_plan: Option<shots::ShotPlan> = None;
     let mut gt_moved: Option<Vec<f32>> = None;
+    let mut gt_spin: Option<Vec<f32>> = None;
+    let mut spin_history_merges: Option<u64> = None;
     if let (Some(m), Some(seed)) = (&p.motion, motion_seed) {
         let v2w = sim_grid.voxel_to_world;
         poses = resolve_poses(&m.mode, n, seed);
-        apply_motion(&mut images, sim_grid.dims, n, v2w, &poses);
+        if m.shot_path {
+            // P9 part A: one resampling per shot, by the pose at its own time and its jumps
+            let row_t: Vec<f64> = p.rows.iter().map(|r| r.t).collect();
+            let plan = shots::shot_plan(m, &poses, &p.row_start, &row_t, &slice_offsets, &sim_grid,
+                                        |n_shots| draw_events(m.within.as_ref(), n, n_shots, seed));
+            dropped = shots::apply(&plan, &mut images, &sim_grid, n);
+            if m.spin_history {
+                // P9 part B: the tissue's correction for its history, against the closed form the
+                // images were made with, then scaled by what the tissue carries per slice (the
+                // physiological factor) and per shot (the dropout attenuation)
+                let class: Vec<u8> = (0..ph.nvox())
+                    .map(|i| masks.iter().position(|mk| mk[i]).map_or(mrsim_acq::spin_history::NO_CLASS, |c| c as u8))
+                    .collect();
+                let inputs = shots::SpinInputs {
+                    grid: &ph.grid, t1: &ph.t1, m0: &ph.m0, class: &class, n_classes: k,
+                    suppression: suppression[0].as_ref(), tr: p.rows[0].tr, signal_t: p.rows[0].t, starts: &p.row_start,
+                };
+                let (corr, merges) = shots::spin_history_correction(&plan, &inputs, &sim_grid, &slice_offsets);
+                let mut sum = vec![0.0f32; nvox_sim * n];
+                for c in &corr {
+                    for (s, x) in sum.iter_mut().zip(c) {
+                        *s += *x;
+                    }
+                }
+                gt_spin = Some(block_mean_inplane(&sum, sim_grid.dims, o, n));
+                let mut shot_of = vec![0usize; nz];
+                for (s, sl) in plan.schedule.iter().enumerate() {
+                    for &z in sl {
+                        shot_of[z] = s;
+                    }
+                }
+                for v in 0..n {
+                    for z in 0..nz {
+                        let tf = p4.physio.as_ref().map_or(1.0, |ph_| ph_.tissue_factor(p.row_start[v] + p.rows[v].t + slice_offsets[z]));
+                        let att: f32 = plan.attenuation[v][shot_of[z]].iter().product();
+                        let f = tf as f32 * att;
+                        for (c, cc) in corr.iter().enumerate() {
+                            for xy in 0..slab {
+                                let i = (z * slab + xy) * n + v;
+                                images[c][i] += cc[i] * f;
+                            }
+                        }
+                    }
+                }
+                spin_history_merges = Some(merges);
+            }
+            events = plan.events.clone();
+            shot_plan = Some(plan);
+        } else {
+            apply_motion(&mut images, sim_grid.dims, n, v2w, &poses);
+        }
         let mut gt_arr = [std::mem::take(&mut gt_sim)];
         apply_motion(&mut gt_arr, sim_grid.dims, n, v2w, &poses);
         let [moved] = gt_arr;
@@ -1210,7 +1271,7 @@ fn simulate_legacy(
             // P5 part D: a shot is a readout segment; the events are drawn per shot as in 2D, but
             // act through per-shot images and shot gains below, not on slice groups
             events = draw_events(m.within.as_ref(), n, n_shots, seed);
-        } else {
+        } else if !m.shot_path {
             let n_shots = slice_schedule(nz, p.mb, p.mb_interleaved).len();
             events = draw_events(m.within.as_ref(), n, n_shots, seed);
             if !events.is_empty() {
@@ -1406,13 +1467,14 @@ fn simulate_legacy(
             }
             _ => None,
         },
+        spin_history: gt_spin,
     };
 
     Ok(SeriesOutput {
         acq_grid, sim_grid, n_volumes: n, mag, phase: phase_out, m0, mode: mode_used,
         labels: ph.labels.clone(), n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(),
         seeds: (p.seed, m0_seed), acquisition: acq, ground_truth, label_factors, poses, motion_seed,
-        events, dropped, compat: compat_facts,
+        events, dropped, shots: shot_plan, spin_history_merges, compat: compat_facts,
         crush_survival: p4.crush.clone(), physio: p4.physio.as_ref().map(|_| physio_lines),
         readout: res3d.clone(),
         echo_amplitudes,
@@ -1833,6 +1895,156 @@ mod tests {
         assert!(worst < 1e-6, "{worst}");
         // the moved ground truth excludes the events: identical to the static one
         assert_eq!(b.ground_truth.delta_m, *b.ground_truth.delta_m_static.as_ref().unwrap());
+    }
+
+    // ------------------------------------------------------------------ P9 part A
+
+    #[test]
+    fn single_band_events_drop_one_slice_each() {
+        // 6 slices at 1 mm single band: 6 shots; every shot halved, no jumps: the image halves
+        let ph = phantom();
+        let s = sidecar([1.0, 1.0, 1.0], 6);
+        let base = protocol_from(&s, "control,label", "[acquisition]\noversample = 1\n");
+        let ev = protocol_from(&s, "control,label",
+                               "[acquisition]\noversample = 1\n[motion.within_volume]\ndropout_rate = 1.0\nseverity = 0.5\n");
+        assert!(ev.motion.as_ref().unwrap().shot_path);
+        let a = simulate(&base, &ph, T2Mode::Class, &no_phase()).unwrap();
+        let b = simulate(&ev, &ph, T2Mode::Class, &no_phase()).unwrap();
+        assert_eq!((b.events.len(), b.dropped.len()), (12, 12));
+        assert!(b.dropped.iter().all(|d| (d.attenuation - 0.5).abs() < 1e-6 && d.slices.len() == 1));
+        let plan = b.shots.as_ref().unwrap();
+        assert_eq!(plan.schedule, (0..6).map(|z| vec![z]).collect::<Vec<_>>());
+        assert!((plan.times[1][2] - (4.0 + 3.6 + 0.08)).abs() < 1e-12, "{}", plan.times[1][2]);
+        let scale = max_abs(&a.mag) as f64;
+        let worst = a.mag.iter().zip(&b.mag).fold(0.0f64, |m, (x, y)| m.max((0.5 * *x as f64 - *y as f64).abs() / scale));
+        assert!(worst < 1e-6, "{worst}");
+        assert!(a.shots.is_none(), "no motion, no plan");
+    }
+
+    /// An events file with one +1 mm x jump at shot 3 of volume 0: the simulation-grid images of
+    /// slices 0-2 and of volume 1 are the static ones exactly; slices 3-5 of volume 0 are the static
+    /// ones shifted one voxel in x (1 mm voxels, oversample 1).
+    #[test]
+    fn an_in_plane_step_shifts_exactly_the_later_shots() {
+        let ph = phantom();
+        let s = sidecar([1.0, 1.0, 1.0], 6);
+        let dir = std::env::temp_dir().join(format!("aslscan-shots-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tsv = dir.join("events.tsv");
+        std::fs::write(&tsv, "volume\tshot\tslices\tattenuation\tjump_x\tjump_y\tjump_z\tjump_rx\tjump_ry\tjump_rz\n\
+                              0\t3\t3\t1\t1\t0\t0\t0\t0\t0\n").unwrap();
+        let path = tsv.to_string_lossy().replace('\\', "\\\\");
+        let ev = protocol_from(&s, "control,label",
+                               &format!("[acquisition]\noversample = 1\n[motion.within_volume]\nevents = \"{path}\"\n"));
+        let base = protocol_from(&s, "control,label", "[acquisition]\noversample = 1\n");
+        let (mut ca, mut cb): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+        let a = simulate_core(&base, &ph, T2Mode::Class, &no_phase(), RowOverride::None, Some(&mut ca)).unwrap();
+        let b = simulate_core(&ev, &ph, T2Mode::Class, &no_phase(), RowOverride::None, Some(&mut cb)).unwrap();
+        assert_eq!(b.dropped.len(), 1);
+        let [nx, ny, nz] = a.sim_grid.dims;
+        let (n, slab) = (2usize, nx * ny);
+        let at = |x: usize, y: usize, z: usize, g: usize| (x + nx * (y + ny * z)) * n + g;
+        let mut moved = false;
+        for (comp, (ia, ib)) in ca.iter().zip(&cb).enumerate() {
+            let peak = max_abs(ia);
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        assert_eq!(ib[at(x, y, z, 1)].to_bits(), ia[at(x, y, z, 1)].to_bits(), "volume 1 is static");
+                        if z < 3 {
+                            assert_eq!(ib[at(x, y, z, 0)].to_bits(), ia[at(x, y, z, 0)].to_bits(), "comp {comp} slice {z}");
+                        } else if x >= 1 {
+                            let (got, want) = (ib[at(x, y, z, 0)], ia[at(x - 1, y, z, 0)]);
+                            assert!((got - want).abs() <= 1e-5 * peak, "comp {comp} ({x},{y},{z}): {got} vs {want}");
+                            moved |= (got - ia[at(x, y, z, 0)]).abs() > 1e-3 * peak;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(moved, "the jump must move something");
+        let _ = (slab, std::fs::remove_dir_all(&dir));
+    }
+
+    // ------------------------------------------------------------------ P9 part B
+
+    /// Spin history with a head that does not move through the slices (an identity event, then an
+    /// in-plane jump) changes nothing: the correction is taken against the closed form the tissue
+    /// images were made with, under suppression and presaturation too.
+    #[test]
+    fn spin_history_leaves_a_still_or_in_plane_head_alone() {
+        let ph = phantom();
+        let dir = std::env::temp_dir().join(format!("aslscan-spin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let head = "volume\tshot\tslices\tattenuation\tjump_x\tjump_y\tjump_z\tjump_rx\tjump_ry\tjump_rz\n";
+        for (name, row, bs) in [("still", "0\t1\t1\t1\t0\t0\t0\t0\t0\t0\n", false),
+                                ("inplane", "1\t2\t2\t1\t1\t0.5\t0\t0\t0\t0.05\n", false),
+                                ("inplane_bs", "1\t2\t2\t1\t1\t0.5\t0\t0\t0\t0.05\n", true)] {
+            let tsv = dir.join(format!("{name}.tsv"));
+            std::fs::write(&tsv, format!("{head}{row}")).unwrap();
+            let path = tsv.to_string_lossy().replace('\\', "\\\\");
+            let mut s = sidecar([1.0, 1.0, 1.0], 6);
+            if bs {
+                s["BackgroundSuppression"] = json!(true);
+                s["BackgroundSuppressionNumberPulses"] = json!(2);
+                s["BackgroundSuppressionPulseTime"] = json!([1.9, 3.0]);
+            }
+            let presat = if bs { "[background_suppression]\npresaturation = true\n" } else { "" };
+            let ov = |sh: bool| format!("[acquisition]\noversample = 1\n{presat}[motion]\nspin_history = {sh}\n\
+                                         [motion.within_volume]\nevents = \"{path}\"\n");
+            let without = protocol_from(&s, "control,label,control,label", &ov(false));
+            let with = protocol_from(&s, "control,label,control,label", &ov(true));
+            assert!(with.motion.as_ref().unwrap().spin_history);
+            let a = simulate(&without, &ph, T2Mode::Class, &no_phase()).unwrap();
+            let b = simulate(&with, &ph, T2Mode::Class, &no_phase()).unwrap();
+            assert_eq!(b.spin_history_merges, Some(0));
+            let peak = max_abs(&a.mag);
+            let worst = a.mag.iter().zip(&b.mag).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+            assert!(worst <= 1e-6 * peak, "{name}: {worst} of {peak}");
+            let gt = b.ground_truth.spin_history.as_ref().unwrap();
+            assert!(gt.iter().all(|x| x.abs() <= 1e-6 * peak), "{name}: the correction map");
+            assert!(a.ground_truth.spin_history.is_none());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The spin-history ground truth is the summed tissue correction before the acquisition: with
+    /// physiology off and attenuation 1 it equals the difference of the captured tissue compartment
+    /// images with and without the key (1 mm voxels, oversample 1: the grids coincide in-plane).
+    #[test]
+    fn spin_history_truth_is_the_tissue_correction() {
+        let ph = phantom();
+        let dir = std::env::temp_dir().join(format!("aslscan-spin-gt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tsv = dir.join("events.tsv");
+        std::fs::write(&tsv, "volume\tshot\tslices\tattenuation\tjump_x\tjump_y\tjump_z\tjump_rx\tjump_ry\tjump_rz\n\
+                              1\t2\t2\t1\t0\t0\t0.3\t0\t0\t0\n").unwrap();
+        let path = tsv.to_string_lossy().replace('\\', "\\\\");
+        let s = sidecar([1.0, 1.0, 1.0], 6);
+        let ov = |sh: bool| format!("[acquisition]\noversample = 1\n[motion]\nspin_history = {sh}\n\
+                                     [motion.within_volume]\nevents = \"{path}\"\n");
+        let (mut ca, mut cb): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+        let without = protocol_from(&s, "control,label,control,label", &ov(false));
+        let with = protocol_from(&s, "control,label,control,label", &ov(true));
+        simulate_core(&without, &ph, T2Mode::Class, &no_phase(), RowOverride::None, Some(&mut ca)).unwrap();
+        let b = simulate_core(&with, &ph, T2Mode::Class, &no_phase(), RowOverride::None, Some(&mut cb)).unwrap();
+        let k = ph.labels.len();
+        let n = 4;
+        let gt = b.ground_truth.spin_history.as_ref().unwrap();
+        assert_eq!(gt.len(), ca[0].len(), "same grid in-plane at oversample 1, voxel-major with 4 volumes");
+        let peak = max_abs(&ca[0]).max(max_abs(&ca[1]));
+        let mut nonzero = false;
+        for i in 0..gt.len() {
+            let diff: f32 = (0..k).map(|c| cb[c][i] - ca[c][i]).sum();
+            assert!((diff - gt[i]).abs() <= 1e-5 * peak, "{i}: {diff} vs {}", gt[i]);
+            nonzero |= gt[i].abs() > 1e-4 * peak;
+        }
+        assert!(nonzero, "the jump must leave a correction");
+        // the blood is untouched
+        for c in k..ca.len() {
+            assert!(ca[c].iter().zip(&cb[c]).all(|(x, y)| x == y), "compartment {c}");
+        }
+        let _ = (n, std::fs::remove_dir_all(&dir));
     }
 
     // ------------------------------------------------------------------ P2

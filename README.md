@@ -278,13 +278,53 @@ trans_mm = [2.0, 2.0, 1.0]     # random/linear amplitudes
 rot_deg = [1.0, 1.0, 2.0]
 volumes = [5, 20, 40]          # volumes affected (default all)
 trajectory = "motion.tsv"      # "trajectory" mode: trans_x/y/z (mm), rot_x/y/z (radians), one row per volume
+within_volume_sampling = "volume"  # 2D: "volume" (each shot has its volume's pose) or "slice" (the pose at each shot's time)
 
-[motion.within_volume]         # multiband or segmented-3D shot events
+[motion.within_volume]         # shot events: 2D slice groups (single-band or multiband), or segmented-3D shots
 dropout_rate = 0.1
 severity = 0.5
 jump_mm = [0.5, 0.0, 0.0]
 jump_deg = [0.0, 0.0, 1.0]
+# events = "events.tsv"        # 2D: explicit events in the desc-motionEvents_gt.tsv format, instead of the draw
 ```
+
+On a 2D readout, a shot is the set of slices excited together, taken from `SliceTiming` (any slice
+order). With `within_volume_sampling = "slice"` (`linear` or `trajectory` mode), the volumes' poses
+become a trajectory, placed at each volume's first shot and sampled at every shot's time. A shot's
+transform is the volume's (or trajectory's) pose followed by the jumps of the events up to that
+shot. Single-band events, slice sampling, an events file, or a multiband slice order that the
+older path cannot represent move the images one shot at a time and write
+`desc-motionShots_gt.tsv` (every shot's time and pose). Other motion requests take the per-volume
+path, whose outputs are unchanged. A run's own `desc-motionEvents_gt.tsv` can be passed back as
+`events` to reproduce it.
+
+A slow drift moves each volume a little and leaves it otherwise clean; within-volume motion
+staggers the slices of a volume.
+
+**Spin history** (`[motion] spin_history = true`, 2D): tissue carried through the slice direction
+into a slice not yet excited is excited twice in one repetition and is dark the second time;
+tissue carried out of one is skipped and is bright in the next repetition. With the key set,
+aslscan steps each phantom voxel's longitudinal magnetization through every slice excitation at
+its shot's pose (a box slice profile as thick as the slice spacing) and adds the difference from
+the closed form to the tissue images, so a head that does not move through the slices is
+unchanged. It is written as `desc-spinHistory_gt` and described in `AslscanSimulation.Motion.SpinHistory`.
+It needs a spin-echo series of control and label rows that share one preparation, with one echo,
+no Look-Locker, Hadamard or ASLDRO compatibility; anything else is refused. Labeled blood is
+treated as fresh.
+
+What to expect, for 5 mm slices, TR 4.6 s and grey matter (T1 1.33 s):
+
+| Motion | Tissue signal in the affected slice |
+|---|---|
+| In-plane, any size | unchanged |
+| 0.5 mm through-plane between volumes | about 0.01% |
+| 0.5 mm through-plane jump between two slices 40 ms apart | -9.7% |
+| The same jump, neighbouring slice excited 0.4 s earlier | -7.3% |
+| Tissue skipped for one volume | +3.1% on the skipped part |
+
+Presaturation at labeling start erases what earlier volumes left, not the dip of a jump within a
+volume. A slow drift therefore stays visually clean; the effect is a dip of a few percent in one
+or two slices at an abrupt through-plane movement.
 
 **Vascular and physiological extensions:**
 

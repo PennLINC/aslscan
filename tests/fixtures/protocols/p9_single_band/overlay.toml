@@ -1,0 +1,13 @@
+# P9 acceptance (plan, Task 5): the motivating protocol, single-band 2D PCASL, 20 pairs, 20 slices
+# of 5 mm acquired in ascending order 40 ms apart, TR 4.6 s, on work/phantom-3t-z100. This overlay:
+# single-band within-volume events (criterion 1), one slice per event.
+seed = 20260923
+[acquisition]
+oversample = 2
+matrix = [64, 68]
+[m0]
+repetition_time = 8.0
+[motion.within_volume]
+dropout_rate = 0.1
+severity = 0.3
+jump_mm = [0.5, 0.0, 0.0]

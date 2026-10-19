@@ -18,10 +18,11 @@
 # enough to survive reconstruction and the f32 cast; never committed). It passes only if every run
 # succeeds AND at least one NIfTI differs in content.
 #
-# Needs work/phantom-3t, work/phantom-3t-z100, work/phantom-3t-z97, work/phantom-3t-z120 and
-# work/phantom-3t-asl001 (see tools/hrgt_to_bids.py: z97 is --crop 0:197 0:233 46:143, which fits
-# asl004's 24 slices of 4.05 mm; z120 and asl001 are the P5 acceptance crops named in the
-# asl005_p5 and asl001_p5 overlays).
+# Needs work/phantom-3t, work/phantom-3t-z100, work/phantom-3t-z97, work/phantom-3t-z120,
+# work/phantom-3t-asl001 and work/phantom-3t-hcp (see tools/hrgt_to_bids.py: z97 is --crop 0:197
+# 0:233 46:143, which fits asl004's 24 slices of 4.05 mm; z120 and asl001 are the P5 acceptance
+# crops named in the asl005_p5 and asl001_p5 overlays; hcp is --crop 0:197 0:233 20:155, the P8
+# fixture's 36 partitions).
 #
 # A case may name a required feature as its seventh field (kspace): a build without it skips the
 # case, and the run checks the executed and skipped counts per build. Under --self-test every
@@ -176,6 +177,7 @@ sed '/^\[m0\]/,$d' $P/p5_ge/overlay.toml > $A/p5-ge-incl.toml
 { cat $P/p5_grase/overlay.toml; printf '\n[motion.within_volume]\ndropout_rate = 1.0\nseverity = 0.3\njump_mm = [0.5, 0.0, 0.0]\njump_deg = [0.0, 0.0, 1.0]\n'; } > $A/p5-grase-seg.toml
 Z120=$HERE/work/phantom-3t-z120
 P001=$HERE/work/phantom-3t-asl001
+HCP=$HERE/work/phantom-3t-hcp
 # P6 cases: the two generated p6_ll variants (one readout per cycle, the legacy dispatch; an
 # included m0scan between the cycles); the multi-TE fixtures pass one sidecar per echo
 python3 "$HERE/tools/regress_p6_inputs.py" "$P/p6_ll" "$A"
@@ -206,6 +208,7 @@ cases=(
   "p5_grase_seg|$P/p5_grase/asl.json|$P/p5_grase/aslcontext.tsv|$A/p5-grase-seg.toml|$CROP"
   "asl005_p5|$P/asl005/asl.json|$P/asl005/aslcontext.tsv|$P/asl005_p5/overlay.toml|$Z120"
   "asl001_p5|$P/asl001/asl.json|$P/asl001/aslcontext.tsv|$P/asl001_p5/overlay.toml|$P001||kspace"
+  "p8_spiral_kz|$P/p8_spiral_kz/asl.json|$P/p8_spiral_kz/aslcontext.tsv|$P/p8_spiral_kz/overlay.toml|$HCP||kspace"
   "p6_hadamard|$P/p6_hadamard/asl.json|$P/p6_hadamard/aslcontext.tsv|$P/p6_hadamard/overlay.toml|$CROP"
   "p6_hadamard_3t|$P/p6_hadamard_3t/asl.json|$P/p6_hadamard_3t/aslcontext.tsv|$P/p6_hadamard_3t/overlay.toml|$Z97"
   "p6_hadamard_grase|$P/p6_hadamard_grase/asl.json|$P/p6_hadamard_grase/aslcontext.tsv|$P/p6_hadamard_grase/overlay.toml|$Z120"
@@ -217,7 +220,7 @@ cases=(
   "p6_ll_m0|$A/p6-ll-m0.json|$A/p6-ll-m0.tsv|$A/p6-ll-m0.toml|$CROP"
 )
 # executed cases per build (the rest are skipped for a missing feature)
-declare -A expect=([cli-kspace-par]=34 [cli]=33)
+declare -A expect=([cli-kspace-par]=35 [cli]=33)
 
 fail=0; undetected=0
 for feats in cli,kspace,par cli; do

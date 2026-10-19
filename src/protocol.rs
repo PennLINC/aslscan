@@ -403,21 +403,31 @@ pub struct MotionOverlay {
     pub rot_deg: Option<[f64; 3]>,
     /// The volumes `random`/`linear` affect; default all.
     pub volumes: Option<Vec<usize>>,
+    /// `"volume"` (default: every shot of a volume has the volume's pose) or `"slice"` (each shot
+    /// has the trajectory's pose at its own excitation time; P9 part A). 2D readouts only.
+    pub within_volume_sampling: Option<String>,
+    /// Spin history of the tissue under through-plane motion (P9 part B); default false.
+    pub spin_history: Option<bool>,
     pub within_volume: Option<WithinVolumeOverlay>,
 }
 
-/// `[motion.within_volume]`: multiband shot events (needs `MultibandAccelerationFactor > 1`).
+/// `[motion.within_volume]`: shot events. On a 2D readout a shot is the slices excited together
+/// (one slice single-band, P9); on a segmented 3D readout, a readout segment (P5 part D).
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WithinVolumeOverlay {
-    /// Probability that a shot has an event, in `[0, 1]`.
-    pub dropout_rate: f64,
+    /// Probability that a shot has an event, in `[0, 1]`. Required unless `events` is given.
+    pub dropout_rate: Option<f64>,
     /// Signal attenuation of the event shot's slices, in `[0, 1]` (`DropoutLaw::Uniform`).
-    pub severity: f64,
+    /// Required unless `events` is given.
+    pub severity: Option<f64>,
     /// Per-axis jump amplitudes (mm, degrees) drawn in `[-amp, amp]`, persisting for the rest of
     /// the volume; default zero (pure dropout).
     pub jump_mm: Option<[f64; 3]>,
     pub jump_deg: Option<[f64; 3]>,
+    /// A TSV of explicit events in the `desc-motionEvents_gt.tsv` format (P9 part A), instead of
+    /// the random draw; relative to the overlay file when read through [`load`]. 2D readouts only.
+    pub events: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -667,6 +677,35 @@ pub struct WithinVolume {
     pub severity: f64,
     pub jump_mm: [f64; 3],
     pub jump_deg: [f64; 3],
+    /// Explicit events from `[motion.within_volume] events` (P9); the random-draw fields are then
+    /// zero and unused.
+    pub events_file: Option<EventsFile>,
+}
+
+/// An events TSV, read and validated (P9 part A).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventsFile {
+    pub path: String,
+    pub events: Vec<FileEvent>,
+}
+
+/// One row of an events TSV: `severity = 1 - attenuation`, rotations converted to degrees.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FileEvent {
+    pub volume: usize,
+    pub shot: usize,
+    pub severity: f32,
+    pub jump_mm: [f64; 3],
+    pub jump_deg: [f64; 3],
+}
+
+/// How a volume's shots get their poses (P9 part A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithinVolumeSampling {
+    /// Every shot has the volume's pose (P3).
+    Volume,
+    /// Each shot has the trajectory's pose at its own excitation time.
+    Slice,
 }
 
 /// The resolved motion request.
@@ -676,6 +715,11 @@ pub struct MotionSpec {
     /// The overlay's mode name, for the sidecar.
     pub mode_name: String,
     pub within: Option<WithinVolume>,
+    pub sampling: WithinVolumeSampling,
+    /// The P9 per-shot path (`series::shots`) moves the images; otherwise P3's (P5's in 3D).
+    pub shot_path: bool,
+    /// P9 part B: the tissue is corrected for spin history (implies the shot path).
+    pub spin_history: bool,
 }
 
 /// One Hadamard encoding cycle (P6 addendum, part A): its `deltam` rows, in sub-bolus order.
@@ -1083,9 +1127,73 @@ fn vec3_amplitude(v: Option<[f64; 3]>, what: &str) -> Result<[f64; 3], String> {
     Ok(v)
 }
 
-/// `shots_3d`: a 3D protocol's NumberShots (P5 part D: there a shot is a readout segment).
-fn overlay_motion(m: Option<&MotionOverlay>, n: usize, mb: usize, shots_3d: Option<usize>) -> Result<Option<MotionSpec>, String> {
+/// What the motion parse needs to know about the readout (P9 part A).
+struct ShotContext<'a> {
+    /// A 3D protocol's NumberShots (P5 part D: there a shot is a readout segment); `None` in 2D.
+    shots_3d: Option<usize>,
+    mb: usize,
+    /// The 2D slice offsets (normalized, data slice order); empty in 3D.
+    slice_offsets: &'a [f64],
+    /// Whether `multiband_schedule` accepted the slice timing (always true single-band and in 3D).
+    mb_schedule_ok: bool,
+    look_locker: bool,
+}
+
+/// Read an events TSV (P9 part A): the `desc-motionEvents_gt.tsv` columns, every cell present and
+/// finite, `volume < n`, `shot < n_shots`, `attenuation` in `[0, 1]`, one row per volume and shot.
+fn load_events_file(path: &str, n: usize, n_shots: usize) -> Result<EventsFile, String> {
+    const COLS: [&str; 9] = ["volume", "shot", "attenuation", "jump_x", "jump_y", "jump_z", "jump_rx", "jump_ry", "jump_rz"];
+    let what = format!("overlay motion.within_volume.events {path}");
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{what}: {e}"))?;
+    let mut lines = text.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.trim().is_empty());
+    let header: Vec<&str> = lines.next().ok_or_else(|| format!("{what}: empty TSV"))?.split('\t').collect();
+    let idx = COLS
+        .iter()
+        .map(|c| header.iter().position(|h| h.trim() == *c).ok_or_else(|| format!("{what}: column {c:?} missing")))
+        .collect::<Result<Vec<usize>, String>>()?;
+    // `slices` must be there (the format's columns), though the schedule decides the slices
+    if !header.iter().any(|h| h.trim() == "slices") {
+        return Err(format!("{what}: column \"slices\" missing"));
+    }
+    let mut events: Vec<FileEvent> = Vec::new();
+    for (i, line) in lines.enumerate() {
+        let cells: Vec<&str> = line.split('\t').collect();
+        let mut v = [0.0f64; 9];
+        for (k, (&c, name)) in idx.iter().zip(COLS).enumerate() {
+            let cell = cells.get(c).map(|s| s.trim()).ok_or_else(|| format!("{what} row {i}: column {name} is missing"))?;
+            v[k] = match cell.parse::<f64>() {
+                Ok(x) if x.is_finite() => x,
+                _ => return Err(format!("{what} row {i}: {name} = {cell:?} is not a finite number")),
+            };
+        }
+        let index = |x: f64, name: &str, limit: usize| -> Result<usize, String> {
+            if x >= 0.0 && x.fract() == 0.0 && (x as usize) < limit {
+                Ok(x as usize)
+            } else {
+                Err(format!("{what} row {i}: {name} {x} is not an index below {limit}"))
+            }
+        };
+        let (volume, shot) = (index(v[0], "volume", n)?, index(v[1], "shot", n_shots)?);
+        if !(0.0..=1.0).contains(&v[2]) {
+            return Err(format!("{what} row {i}: attenuation {} is not in [0, 1]", v[2]));
+        }
+        if events.iter().any(|e| e.volume == volume && e.shot == shot) {
+            return Err(format!("{what} row {i}: a second event for volume {volume}, shot {shot}"));
+        }
+        events.push(FileEvent {
+            volume,
+            shot,
+            severity: (1.0 - v[2]) as f32,
+            jump_mm: [v[3], v[4], v[5]],
+            jump_deg: [v[6].to_degrees(), v[7].to_degrees(), v[8].to_degrees()],
+        });
+    }
+    Ok(EventsFile { path: path.to_string(), events })
+}
+
+fn overlay_motion(m: Option<&MotionOverlay>, n: usize, sc: &ShotContext) -> Result<Option<MotionSpec>, String> {
     let Some(m) = m else { return Ok(None) };
+    let (mb, shots_3d) = (sc.mb, sc.shots_3d);
     let mode_name = m.mode.clone().unwrap_or_else(|| "off".to_string()).to_ascii_lowercase();
     let volumes: Vec<usize> = match &m.volumes {
         Some(v) => {
@@ -1136,37 +1244,138 @@ fn overlay_motion(m: Option<&MotionOverlay>, n: usize, mb: usize, shots_3d: Opti
         }
         other => return Err(format!("overlay: motion.mode {other:?}: expected off | trajectory | random | linear")),
     };
+    let is_3d = shots_3d.is_some();
+    let sampling = match m.within_volume_sampling.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        None | Some("volume") => WithinVolumeSampling::Volume,
+        Some("slice") => WithinVolumeSampling::Slice,
+        Some(other) => {
+            return Err(format!("overlay: motion.within_volume_sampling {other:?}: expected \"volume\" or \"slice\""))
+        }
+    };
+    if sampling == WithinVolumeSampling::Slice {
+        if is_3d {
+            return Err("overlay: motion.within_volume_sampling = \"slice\" is for 2D readouts (a 3D readout has no \
+                        slice timing)".to_string());
+        }
+        if mode_name == "random" {
+            return Err("overlay: motion.within_volume_sampling = \"slice\" with mode = \"random\": random poses are \
+                        impulses that return to baseline, and interpolating between them would invent ramps"
+                .to_string());
+        }
+    }
+    let events_requested = m.within_volume.as_ref().is_some_and(|w| w.events.is_some());
+    if events_requested && is_3d {
+        return Err("overlay: motion.within_volume.events is for 2D readouts; a segmented 3D readout takes the \
+                    random draw (dropout_rate, severity)".to_string());
+    }
+    // P9: the per-shot path, 2D only. Single-band events, slice sampling, an events file, or a
+    // multiband schedule the P3 path cannot represent; everything else stays on P3's path.
+    let single_band_events = !is_3d && mb <= 1 && m.within_volume.is_some();
+    let spin_history = m.spin_history.unwrap_or(false);
+    if spin_history && is_3d {
+        return Err("overlay: motion.spin_history is for 2D readouts (one slab excitation has no slice history)".to_string());
+    }
+    let shot_path = !is_3d
+        && (sampling == WithinVolumeSampling::Slice || events_requested || single_band_events || !sc.mb_schedule_ok
+            || spin_history);
+    if shot_path {
+        if sc.look_locker {
+            return Err("overlay: per-shot motion (single-band within-volume events, within_volume_sampling = \
+                        \"slice\", an events file, or a multiband schedule only it represents) is not available \
+                        with LookLocker: true: a Look-Locker row reads several times, and which read a shot \
+                        index means is not settled".to_string());
+        }
+        if mb <= 1 {
+            // each distinct slice time must be one slice, or two slices would silently share a shot
+            let mut bits: Vec<u64> = sc.slice_offsets.iter().map(|t| t.to_bits()).collect();
+            bits.sort_unstable();
+            if let Some(w) = bits.windows(2).find(|w| w[0] == w[1]) {
+                return Err(format!(
+                    "asl.json: SliceTiming repeats the time {} without MultibandAccelerationFactor > 1; per-shot \
+                     motion needs one slice per excitation single-band", f64::from_bits(w[0])));
+            }
+        }
+    }
     let within = match &m.within_volume {
         None => None,
         Some(w) => {
-            match shots_3d {
-                None if mb <= 1 => {
-                    return Err("overlay: motion.within_volume describes multiband shot events and needs \
-                                MultibandAccelerationFactor > 1".to_string());
-                }
-                Some(s) if s <= 1 => {
-                    return Err("overlay: motion.within_volume describes events between the shots of a segmented \
-                                3D readout and needs NumberShots > 1".to_string());
-                }
-                _ => {}
+            if shots_3d.is_some_and(|s| s <= 1) {
+                return Err("overlay: motion.within_volume describes events between the shots of a segmented \
+                            3D readout and needs NumberShots > 1".to_string());
             }
-            for (name, v) in [("dropout_rate", w.dropout_rate), ("severity", w.severity)] {
-                if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
-                    return Err(format!("overlay: motion.within_volume.{name} must be in [0, 1], got {v}"));
+            if let Some(path) = &w.events {
+                if w.dropout_rate.is_some() || w.severity.is_some() || w.jump_mm.is_some() || w.jump_deg.is_some() {
+                    return Err("overlay: motion.within_volume.events replaces the random draw; drop dropout_rate, \
+                                severity, jump_mm and jump_deg".to_string());
                 }
+                let n_shots = mrsim_acq::motion::slice_schedule_from_times(sc.slice_offsets).len();
+                let file = load_events_file(path, n, n_shots)?;
+                Some(WithinVolume { dropout_rate: 0.0, severity: 0.0, jump_mm: [0.0; 3], jump_deg: [0.0; 3], events_file: Some(file) })
+            } else {
+                let mut rs = [0.0f64; 2];
+                for (k, (name, v)) in [("dropout_rate", w.dropout_rate), ("severity", w.severity)].into_iter().enumerate() {
+                    let v = v.ok_or_else(|| format!("overlay: motion.within_volume needs {name} (or an events file)"))?;
+                    if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+                        return Err(format!("overlay: motion.within_volume.{name} must be in [0, 1], got {v}"));
+                    }
+                    rs[k] = v;
+                }
+                Some(WithinVolume {
+                    dropout_rate: rs[0],
+                    severity: rs[1],
+                    jump_mm: vec3_amplitude(w.jump_mm, "overlay motion.within_volume.jump_mm")?,
+                    jump_deg: vec3_amplitude(w.jump_deg, "overlay motion.within_volume.jump_deg")?,
+                    events_file: None,
+                })
             }
-            Some(WithinVolume {
-                dropout_rate: w.dropout_rate,
-                severity: w.severity,
-                jump_mm: vec3_amplitude(w.jump_mm, "overlay motion.within_volume.jump_mm")?,
-                jump_deg: vec3_amplitude(w.jump_deg, "overlay motion.within_volume.jump_deg")?,
-            })
         }
     };
     if matches!(mode, MotionMode::Off) && within.is_none() {
+        if spin_history {
+            return Err("overlay: motion.spin_history needs motion to have a history of: a mode other than \"off\" \
+                        or within-volume events".to_string());
+        }
         return Ok(None);
     }
-    Ok(Some(MotionSpec { mode, mode_name, within }))
+    Ok(Some(MotionSpec { mode, mode_name, within, sampling, shot_path, spin_history }))
+}
+
+/// P9 part B: spin history needs a series the closed form describes exactly when nothing moves (a
+/// 2D spin-echo readout, only control and label rows with one preparation, one echo, no
+/// Look-Locker, Hadamard or compat). Each refusal names its condition.
+fn check_spin_history(p: &Protocol) -> Result<(), String> {
+    if !p.motion.as_ref().is_some_and(|m| m.spin_history) {
+        return Ok(());
+    }
+    let refuse = |why: String| Err(format!("overlay: motion.spin_history {why}"));
+    if p.contrast != Contrast::SpinEcho {
+        return refuse(format!("needs spin-echo contrast (a 90 degree excitation), not {:?}", p.contrast));
+    }
+    if let Some((i, r)) = p.rows.iter().enumerate().find(|(_, r)| !matches!(r.kind, RowKind::Control | RowKind::Label)) {
+        return refuse(format!("needs control and label rows only; row {i} is {:?}", r.kind));
+    }
+    let r0 = &p.rows[0];
+    let pulses = |v: usize| p.suppression.as_ref().map(|s| s.per_row[v].iter().map(|x| x.to_bits()).collect::<Vec<u64>>());
+    for (i, r) in p.rows.iter().enumerate() {
+        if r.tr.to_bits() != r0.tr.to_bits() || r.t.to_bits() != r0.t.to_bits() || pulses(i) != pulses(0) {
+            return refuse(format!(
+                "needs every row to share one preparation (repetition time, signal time, suppression pulses); row {i} \
+                 differs from row 0, so the closed form is not exact even without motion"));
+        }
+    }
+    if p.echo_times_s.len() > 1 {
+        return refuse("is not available with several echo times".to_string());
+    }
+    if p.look_locker.is_some() {
+        return refuse("is not available with LookLocker: true".to_string());
+    }
+    if p.hadamard.is_some() {
+        return refuse("is not available with Hadamard encoding".to_string());
+    }
+    if p.compat.is_some() {
+        return refuse("is not available with [compat] asldro = true (simasl has no spin history)".to_string());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- the parse
@@ -1735,7 +1944,9 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
     // Readout geometry and timing. In 3D every partition of a shot shares the slab excitation,
     // to which BIDS's PostLabelingDelay runs, so there is no slice timing (BIDS: SliceTiming must
     // not be defined for 3D), no slice offsets, and no multiband.
-    let (slice_offsets, timing, max_offset, mb, mb_interleaved) = if is_3d {
+    // A multiband schedule P3's motion path cannot represent is refused below unless the motion
+    // takes the P9 per-shot path, which represents any (so the error waits for the motion parse).
+    let (slice_offsets, timing, max_offset, mb, mb_schedule) = if is_3d {
         for key in ["SliceTiming", "SliceEncodingDirection"] {
             if sidecar.get(key).is_some_and(|v| !v.is_null()) {
                 return Err(format!(
@@ -1749,7 +1960,7 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
                                     readout excites one slab"));
             }
         }
-        (Vec::new(), Vec::new(), 0.0, 1usize, false)
+        (Vec::new(), Vec::new(), 0.0, 1usize, Ok(false))
     } else {
     let (timing, _) = num_or_array(sidecar, "SliceTiming")?;
     for t in &timing {
@@ -1798,8 +2009,8 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
             i += j;
         }
     }
-    let mb_interleaved = if mb > 1 { multiband_schedule(&slice_offsets, mb)? } else { false };
-    (slice_offsets, timing, max_offset, mb, mb_interleaved)
+    let mb_schedule = if mb > 1 { multiband_schedule(&slice_offsets, mb) } else { Ok(false) };
+    (slice_offsets, timing, max_offset, mb, mb_schedule)
     };
 
     // The 3D readout kind: the overlay's [readout] type over PulseSequenceType (P5 part B).
@@ -2527,7 +2738,19 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
         }
         _ => n,
     };
-    let motion = overlay_motion(overlay.and_then(|o| o.motion.as_ref()), n_motion, mb, readout.as_ref().map(|r| r.number_shots.0))?;
+    let motion = overlay_motion(overlay.and_then(|o| o.motion.as_ref()), n_motion, &ShotContext {
+        shots_3d: readout.as_ref().map(|r| r.number_shots.0),
+        mb,
+        slice_offsets: &slice_offsets,
+        mb_schedule_ok: mb_schedule.is_ok(),
+        look_locker,
+    })?;
+    // P3's refusal of a multiband schedule its motion path cannot represent stands off the shot path
+    let mb_interleaved = match mb_schedule {
+        Ok(interleaved) => interleaved,
+        Err(_) if motion.as_ref().is_some_and(|m| m.shot_path) => false,
+        Err(e) => return Err(e),
+    };
 
     // ---- P4 (addendum; plan Task 4): activation and refusal, in the plan's order ----
     // 1. The arterial compartment: on with [macrovascular] or either map; then each quantity
@@ -3002,14 +3225,16 @@ pub fn parse_echoes(sidecars: &[Value], aslcontext: &str, overlay: Option<&Overl
                     \"epi3d\") or of compat's multi-TE echoes; this protocol has neither".to_string());
     }
 
-    Ok(Protocol {
+    let protocol = Protocol {
         echo_times_s, multi_te, hadamard, look_locker,
         compat, grid_origin, exchange_time, macrovascular, crushing, physio, row_start,
         label_type, rows, m0_type, background_suppression, suppression, ir, ge, readout, motion, mb_interleaved,
         slice_offsets, field_strength, voxel_size_mm, reverse_phase, phase_encoding_direction: ped,
         echo_time_s, total_readout_time_s, accel, mb, alpha, lambda, t1b, t2_blood_s, contrast,
         m0_repetition_time_s, seed, acq, input_sidecar: sidecar.clone(),
-    })
+    };
+    check_spin_history(&protocol)?;
+    Ok(protocol)
 }
 
 /// Read the files and [`parse`]. A relative `motion.trajectory` path is taken relative to the
@@ -3043,12 +3268,20 @@ pub fn load_with(
         ),
     };
     if let (Some(op), Some(o)) = (overlay, ov.as_mut()) {
-        if let Some(t) = o.motion.as_mut().and_then(|m| m.trajectory.as_mut()) {
+        let rebase = |t: &mut String| {
             let p = Path::new(t.as_str());
             if p.is_relative() {
                 if let Some(dir) = op.parent() {
                     *t = dir.join(p).to_string_lossy().to_string();
                 }
+            }
+        };
+        if let Some(m) = o.motion.as_mut() {
+            if let Some(t) = m.trajectory.as_mut() {
+                rebase(t);
+            }
+            if let Some(t) = m.within_volume.as_mut().and_then(|w| w.events.as_mut()) {
+                rebase(t);
             }
         }
     }
@@ -4152,17 +4385,143 @@ mod tests {
         assert!(e.contains("row 3") && e.contains("trans_y"), "{e}");
         assert!(traj(&format!("{ok}{ok}{ok}0\t0\tabc\t0\t0\t0\n")).unwrap_err().contains("trans_z"));
         assert!(traj(&format!("{ok}{ok}{ok}n/a\tn/a\tn/a\tn/a\tn/a\tn/a\n")).is_ok());
-        // within-volume events need multiband
+        // within-volume events: multiband takes P3's path; single band (P9) the per-shot path
         let wv = "[motion.within_volume]\ndropout_rate = 0.2\nseverity = 0.5\n";
-        assert!(parse(&base(), CTX, Some(&mo(wv)), None).unwrap_err().contains("MultibandAccelerationFactor"));
+        let single = parse(&base(), CTX, Some(&mo(wv)), None).unwrap();
+        assert!(single.motion.as_ref().unwrap().shot_path);
         let mut s = base();
         s["MultibandAccelerationFactor"] = json!(2);
         s["SliceTiming"] = json!([0.0, 0.05, 0.0, 0.05]);
         let p = parse(&s, CTX, Some(&mo(wv)), None).unwrap();
         let m = p.motion.as_ref().unwrap();
         assert!(matches!(m.mode, MotionMode::Off) && m.mode_name == "off");
-        assert_eq!(m.within.as_ref().unwrap(), &WithinVolume { dropout_rate: 0.2, severity: 0.5, jump_mm: [0.0; 3], jump_deg: [0.0; 3] });
+        assert!(!m.shot_path && m.sampling == WithinVolumeSampling::Volume);
+        assert_eq!(m.within.as_ref().unwrap(),
+                   &WithinVolume { dropout_rate: 0.2, severity: 0.5, jump_mm: [0.0; 3], jump_deg: [0.0; 3], events_file: None });
         assert!(parse(&s, CTX, Some(&mo("[motion.within_volume]\ndropout_rate = 1.2\nseverity = 0.5\n")), None).unwrap_err().contains("dropout_rate"));
+        assert!(parse(&s, CTX, Some(&mo("[motion.within_volume]\nseverity = 0.5\n")), None).unwrap_err().contains("needs dropout_rate"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------ P9 part A
+
+    #[test]
+    fn per_shot_motion_inputs() {
+        let mo = |extra: &str| overlay(&format!("[motion]\n{extra}[m0]\nrepetition_time = 8.0\n"));
+        let drift = "mode = \"linear\"\ntrans_mm = [0.0, 0.0, 0.5]\n";
+        // the default is P3's path; slice sampling takes the shot path
+        let p = parse(&base(), CTX, Some(&mo(drift)), None).unwrap();
+        assert!(!p.motion.as_ref().unwrap().shot_path);
+        let p = parse(&base(), CTX, Some(&mo(&format!("{drift}within_volume_sampling = \"slice\"\n"))), None).unwrap();
+        let m = p.motion.as_ref().unwrap();
+        assert!(m.shot_path && m.sampling == WithinVolumeSampling::Slice);
+        let e = parse(&base(), CTX, Some(&mo(&format!("{drift}within_volume_sampling = \"shot\"\n"))), None).unwrap_err();
+        assert!(e.contains("\"shot\""), "{e}");
+        let e = parse(&base(), CTX, Some(&mo("mode = \"random\"\ntrans_mm = [1, 0, 0]\nwithin_volume_sampling = \"slice\"\n")), None)
+            .unwrap_err();
+        assert!(e.contains("random") && e.contains("impulses"), "{e}");
+        // single band with a repeated slice time is refused on the shot path only
+        let mut dup = base();
+        dup["SliceTiming"] = json!([0.0, 0.0, 0.10]);
+        assert!(parse(&dup, CTX, Some(&mo(drift)), None).is_ok());
+        let e = parse(&dup, CTX, Some(&mo(&format!("{drift}within_volume_sampling = \"slice\"\n"))), None).unwrap_err();
+        assert!(e.contains("repeats the time 0"), "{e}");
+        // a multiband schedule P3 cannot represent: refused without motion, accepted on the shot path
+        let mut odd = base();
+        odd["MultibandAccelerationFactor"] = json!(2);
+        odd["SliceTiming"] = json!([0.0, 0.0, 0.05, 0.05]);
+        assert!(parse(&odd, CTX, Some(&m0_overlay()), None).unwrap_err().contains("g + 2"));
+        for extra in ["", "within_volume_sampling = \"slice\"\n"] {
+            let p = parse(&odd, CTX, Some(&mo(&format!("{drift}{extra}"))), None).unwrap();
+            assert!(p.motion.as_ref().unwrap().shot_path && !p.mb_interleaved, "{extra:?}");
+        }
+        // Look-Locker is refused on the shot path, and only there
+        let ov: Overlay = toml::from_str("[motion.within_volume]\ndropout_rate = 0.2\nseverity = 0.5\n").unwrap();
+        let ctx = |mb: usize, look_locker: bool| ShotContext {
+            shots_3d: None, mb, slice_offsets: &[0.0, 0.05, 0.0, 0.05], mb_schedule_ok: true, look_locker,
+        };
+        let e = overlay_motion(ov.motion.as_ref(), 4, &ctx(1, true)).unwrap_err();
+        assert!(e.contains("LookLocker"), "{e}");
+        assert!(!overlay_motion(ov.motion.as_ref(), 4, &ctx(2, true)).unwrap().unwrap().shot_path);
+    }
+
+    // ------------------------------------------------------------------ P9 part B
+
+    #[test]
+    fn spin_history_inputs_and_refusals() {
+        let sh = |extra: &str| overlay(&format!("[motion]\nmode = \"linear\"\ntrans_mm = [0, 0, 0.5]\nspin_history = true\n{extra}\
+                                                 [m0]\nrepetition_time = 8.0\n"));
+        // accepted: multiband, suppression and presaturation; it takes the shot path
+        let mut s = with_suppression(&[2.0, 3.2]);
+        s["MultibandAccelerationFactor"] = json!(2);
+        s["SliceTiming"] = json!([0.0, 0.05, 0.0, 0.05]);
+        let p = parse(&s, CTX, Some(&sh("[background_suppression]\npresaturation = true\n")), None).unwrap();
+        let m = p.motion.as_ref().unwrap();
+        assert!(m.spin_history && m.shot_path);
+        // nothing to have a history of
+        let e = parse(&base(), CTX, Some(&overlay("[motion]\nspin_history = true\n[m0]\nrepetition_time = 8.0\n")), None)
+            .unwrap_err();
+        assert!(e.contains("needs motion"), "{e}");
+        // rows: an m0scan row, or rows whose preparations differ
+        let mut inc = base();
+        inc["M0Type"] = json!("Included");
+        let e = parse(&inc, "volume_type\nm0scan\ncontrol\nlabel\n",
+                      Some(&overlay("[motion]\nmode = \"linear\"\ntrans_mm = [0, 0, 0.5]\nspin_history = true\n")), None).unwrap_err();
+        assert!(e.contains("control and label rows only") && e.contains("M0scan"), "{e}");
+        let mut multi = base();
+        multi["PostLabelingDelay"] = json!([1.5, 1.5, 2.0, 2.0]);
+        let e = parse(&multi, CTX, Some(&sh("")), None).unwrap_err();
+        assert!(e.contains("one preparation") && e.contains("row 2"), "{e}");
+        // contrast
+        let mut ge = base();
+        ge["FlipAngle"] = json!(60);
+        let e = parse(&ge, CTX, Some(&sh("[signal]\nacq_contrast = \"ge\"\n")), None).unwrap_err();
+        assert!(e.contains("spin-echo"), "{e}");
+        // compat
+        let e = parse(&base(), CTX, Some(&sh("[compat]\nasldro = true\n")), None).unwrap_err();
+        assert!(e.contains("spin_history") || e.contains("simasl"), "{e}");
+        // 3D
+        let ov: Overlay = toml::from_str("[motion]\nmode = \"linear\"\ntrans_mm = [0, 0, 0.5]\nspin_history = true\n").unwrap();
+        let e = overlay_motion(ov.motion.as_ref(), 4, &ShotContext {
+            shots_3d: Some(2), mb: 1, slice_offsets: &[], mb_schedule_ok: true, look_locker: false,
+        }).unwrap_err();
+        assert!(e.contains("2D readouts"), "{e}");
+    }
+
+    #[test]
+    fn events_file_is_read_and_validated() {
+        let mo = |extra: &str| overlay(&format!("[motion]\n{extra}[m0]\nrepetition_time = 8.0\n"));
+        let dir = std::env::temp_dir().join(format!("aslscan-events-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tsv = dir.join("events.tsv");
+        let path = tsv.to_string_lossy().replace('\\', "\\\\");
+        let head = "volume\tshot\tslices\tattenuation\tjump_x\tjump_y\tjump_z\tjump_rx\tjump_ry\tjump_rz\n";
+        let with = |body: &str, extra: &str| {
+            std::fs::write(&tsv, format!("{head}{body}")).unwrap();
+            parse(&base(), CTX, Some(&mo(&format!("[motion.within_volume]\nevents = \"{path}\"\n{extra}"))), None)
+        };
+        // three slices single band: three shots; four volumes
+        let p = with("1\t2\t2\t0.75\t0\t0\t0.5\t0\t0\t0.0174533\n3\t0\t0\t1\t0.2\t0\t0\t0\t0\t0\n", "").unwrap();
+        let m = p.motion.as_ref().unwrap();
+        assert!(m.shot_path);
+        let f = m.within.as_ref().unwrap().events_file.as_ref().unwrap();
+        assert_eq!(f.events.len(), 2);
+        assert_eq!((f.events[0].volume, f.events[0].shot), (1, 2));
+        assert!((f.events[0].severity - 0.25).abs() < 1e-7 && f.events[0].jump_mm == [0.0, 0.0, 0.5]);
+        assert!((f.events[0].jump_deg[2] - 1.0).abs() < 1e-4);
+        assert!(with("4\t0\t0\t1\t0\t0\t0\t0\t0\t0\n", "").unwrap_err().contains("volume 4"));
+        assert!(with("0\t3\t0\t1\t0\t0\t0\t0\t0\t0\n", "").unwrap_err().contains("shot 3"));
+        assert!(with("0\t0\t0\t1.5\t0\t0\t0\t0\t0\t0\n", "").unwrap_err().contains("attenuation"));
+        assert!(with("0\t0\t0\t1\t0\tNaN\t0\t0\t0\t0\n", "").unwrap_err().contains("jump_y"));
+        assert!(with("0\t0\t0\t1\t0\t0\t0\n", "").unwrap_err().contains("missing"));
+        let e = with("0\t1\t1\t1\t0\t0\t0\t0\t0\t0\n0\t1\t1\t0.5\t0\t0\t0\t0\t0\t0\n", "").unwrap_err();
+        assert!(e.contains("second event") && e.contains("shot 1"), "{e}");
+        let e = with("0\t1\t1\t1\t0\t0\t0\t0\t0\t0\n", "dropout_rate = 0.1\n").unwrap_err();
+        assert!(e.contains("replaces the random draw"), "{e}");
+        // every column of the format, `slices` included, though its value is not used
+        std::fs::write(&tsv, "volume\tshot\tattenuation\tjump_x\tjump_y\tjump_z\tjump_rx\tjump_ry\tjump_rz\n0\t1\t1\t0\t0\t0\t0\t0\t0\n").unwrap();
+        let e = parse(&base(), CTX, Some(&mo(&format!("[motion.within_volume]\nevents = \"{path}\"\n"))), None).unwrap_err();
+        assert!(e.contains("\"slices\""), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4927,7 +5286,12 @@ mod tests {
         one["NumberShots"] = json!(1);
         let wv = "[motion]\nwithin_volume = { dropout_rate = 0.1, severity = 0.5, jump_mm = [0.5, 0.0, 0.0], jump_deg = [0.0, 0.0, 0.0] }\n";
         assert!(err(&one, wv).contains("NumberShots > 1"));
-        assert!(ok(&grase(), wv).unwrap().motion.unwrap().within.is_some());
+        let m = ok(&grase(), wv).unwrap().motion.unwrap();
+        assert!(m.within.is_some() && !m.shot_path, "segmented 3D events keep P5's path");
+        // P9's keys are 2D only
+        assert!(err(&grase(), "[motion]\nmode = \"linear\"\ntrans_mm = [0.5, 0, 0]\nwithin_volume_sampling = \"slice\"\n")
+            .contains("2D readouts"));
+        assert!(err(&grase(), "[motion.within_volume]\nevents = \"x.tsv\"\n").contains("2D readouts"));
     }
 
     #[test]

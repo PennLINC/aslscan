@@ -99,7 +99,15 @@ fn run() -> Result<(), String> {
             "{} pulse(s) on row 0 at efficiency {}{}", s.per_row[0].len(), s.epsilon.0,
             if s.presaturation.0 { " with presaturation" } else { "" })),
         p.motion.as_ref().map_or("off".to_string(), |m| format!(
-            "{}{}", m.mode_name, if m.within.is_some() { " + within-volume events" } else { "" })),
+            "{}{}{}", m.mode_name,
+            match m.within.as_ref() {
+                Some(w) if w.events_file.is_some() => " + within-volume events from a file",
+                Some(_) => " + within-volume events",
+                None => "",
+            },
+            if !m.shot_path { "" }
+            else if m.sampling == aslscan::protocol::WithinVolumeSampling::Slice { " (per shot, poses sampled per slice)" }
+            else { " (per shot)" })),
     );
 
     let mut p4 = Vec::new();
@@ -129,6 +137,13 @@ fn run() -> Result<(), String> {
         "simulated: acquisition {:?}, simulation {:?}, T2 mode {}, {} compartments, {:.1?}",
         out.acq_grid.dims, out.sim_grid.dims, out.mode.as_str(), out.n_compartments, t1.elapsed(),
     );
+    if let Some(sh) = &out.ground_truth.spin_history {
+        // relative to the largest M0 on the acquisition grid (the tissue signal's scale)
+        let m0 = out.ground_truth.m0.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let worst = sh.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        println!("spin history: largest correction {:.3e} of the largest M0, {} merges",
+                 if m0 > 0.0 { worst / m0 } else { 0.0 }, out.spin_history_merges.unwrap_or(0));
+    }
     if let (Some(r), Some(sp)) = (&out.readout, out.readout.as_ref().and_then(|r| r.spiral.as_ref())) {
         let segs = out.spiral_segmentation.as_deref().unwrap_or(&[]);
         println!(

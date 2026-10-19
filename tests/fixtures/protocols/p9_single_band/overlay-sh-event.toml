@@ -1,0 +1,13 @@
+# P9 acceptance, criterion 3: one event (events-sh.tsv): volume 1, shot 10 (mid-stack), attenuation
+# 1, a 0.5 mm jump along the slice axis in the direction the slices are acquired, with spin
+# history: slice 10's tissue dips to 0.903 of the static (a tenth excited 40 ms earlier).
+seed = 20260923
+[acquisition]
+oversample = 2
+matrix = [64, 68]
+[m0]
+repetition_time = 8.0
+[motion]
+spin_history = true
+[motion.within_volume]
+events = "events-sh.tsv"

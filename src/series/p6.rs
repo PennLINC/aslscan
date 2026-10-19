@@ -221,6 +221,7 @@ struct Built {
     n_shots: usize,
     events: Vec<MotionEvent>,
     dropped: Vec<DroppedShot>,
+    shot_plan: Option<super::shots::ShotPlan>,
     poses: Vec<Pose>,
     motion_seed: Option<u64>,
     res3d: Option<ReadoutResolution>,
@@ -1179,13 +1180,28 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
     let mut poses = vec![Pose::IDENTITY; n];
     let mut events = Vec::new();
     let mut dropped = Vec::new();
+    let mut shot_plan: Option<super::shots::ShotPlan> = None;
     let mut gt_moved: Option<Vec<f32>> = None;
     if let (Some(m), Some(seed)) = (&p.motion, motion_seed) {
         let v2w = sim_grid.voxel_to_world;
         poses = resolve_poses(&m.mode, n, seed);
-        apply_motion(&mut images, sim_grid.dims, n, v2w, &poses);
-        if let Some(to) = tissue_only.as_mut() {
-            apply_motion(to, sim_grid.dims, n, v2w, &poses);
+        if m.shot_path {
+            // P9 part A, on the raw volumes and their own clock
+            let starts: Vec<f64> = (0..n).map(|v| first_prep(v).start_s).collect();
+            let row_t: Vec<f64> = rows.iter().map(|r| r.t).collect();
+            let plan = super::shots::shot_plan(m, &poses, &starts, &row_t, &slice_offsets, &sim_grid,
+                                               |n_shots| draw_events(m.within.as_ref(), n, n_shots, seed));
+            dropped = super::shots::apply(&plan, &mut images, &sim_grid, n);
+            if let Some(to) = tissue_only.as_mut() {
+                super::shots::apply(&plan, to, &sim_grid, n);
+            }
+            events = plan.events.clone();
+            shot_plan = Some(plan);
+        } else {
+            apply_motion(&mut images, sim_grid.dims, n, v2w, &poses);
+            if let Some(to) = tissue_only.as_mut() {
+                apply_motion(to, sim_grid.dims, n, v2w, &poses);
+            }
         }
         let mut gt_arr = [std::mem::take(&mut gt_sim)];
         apply_motion(&mut gt_arr, sim_grid.dims, n, v2w, &poses);
@@ -1204,7 +1220,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
             // P5 part D: a shot is a readout segment; the events are drawn per shot as in 2D, but
             // act through per-shot images and shot gains below, not on slice groups
             events = draw_events(m.within.as_ref(), n, n_shots, seed);
-        } else {
+        } else if !m.shot_path {
             let n_shots = slice_schedule(nz, p.mb, p.mb_interleaved).len();
             events = draw_events(m.within.as_ref(), n, n_shots, seed);
             if !events.is_empty() {
@@ -1317,7 +1333,7 @@ fn build(p: &Protocol, ph: &Phantom, mode: T2Mode, ov: RowOverride, echo_time_s:
     };
     let ge_propagated_some = ge_propagated.is_some();
     Ok(Built {
-        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art,
+        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, shot_plan, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art,
     })
 }
 
@@ -1352,7 +1368,7 @@ pub(super) fn simulate_p6(
         }
     }
     let Built {
-        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art,
+        acq_grid, sim_grid, n, nvox_sim, images, gt_static, gt_moved, gt_iv, gt_sup, gt_art, physio_lines, shot_physio, shot_gain, shot_sets, n_shots, events, dropped, shot_plan, poses, motion_seed, res3d, acq, fmap_sim, relax, mode_used, k, ncomp, ev_group, macro_on, t2_arterial_ms, t2_blood_ms, acq_t2_ms, acq_t2p_ms, acq_t1_ms, needs_t1, r_acq, m0_acq, compat_facts, p4, label_factors, ge_flip, ge_propagated_some, m0_images, slice_offsets, tissue_only, tissue_shot_sets, m0_ref_images, gt_read, ll_lines, gt_read_iv, gt_read_ev, gt_read_art,
     } = build(p, ph, mode, ov, tes[0], &sched)?;
     // P6 part C: every echo's readout block on explicit intervals, on the acquired grid
     if tes.len() > 1 || p.look_locker.is_some() {
@@ -1678,13 +1694,14 @@ pub(super) fn simulate_p6(
             }
             _ => None,
         },
+        spin_history: None,
     };
 
     Ok(SeriesOutput {
         acq_grid, sim_grid, n_volumes: n_out, mag, phase: phase_out, m0, mode: mode_used,
         labels: ph.labels.clone(), n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(),
         seeds: (p.seed, m0_seed), acquisition: acq, ground_truth, label_factors, poses, motion_seed,
-        events, dropped, compat: compat_facts,
+        events, dropped, shots: shot_plan, spin_history_merges: None, compat: compat_facts,
         crush_survival: p4.crush.clone(), physio: p4.physio.as_ref().map(|_| physio_lines),
         readout: res3d.clone(),
         echo_amplitudes,
@@ -2264,6 +2281,39 @@ mod tests {
             assert!(abs > 1e-4 * l.reference_norm, "sub-bolus {j}: no leakage");
             assert!((norm - abs).abs() <= 1e-4 * abs, "sub-bolus {j}: {norm} vs {abs}");
         }
+    }
+
+    /// P9 part A on a Hadamard series: single-band shot events take the per-shot path on the raw
+    /// volumes, each shot timed on the raw volume's own clock, one slice per dropped shot.
+    #[test]
+    fn hadamard_shot_events_use_the_raw_volumes_and_their_clock() {
+        let ph = crop();
+        let order = 4;
+        let n_sub = order - 1;
+        let (mut ld, mut pld, mut tr) = (vec![0.0], vec![0.0], vec![6.0]);
+        for j in 0..n_sub {
+            ld.push(TAU);
+            pld.push(PLD + TAU * (n_sub - 1 - j) as f64);
+            tr.push(4.0);
+        }
+        let mut s = sidecar(ld, pld, tr, "Included", true);
+        s["SliceTiming"] = json!([0.0, 0.05]);
+        let ctx = format!("volume_type\nm0scan\n{}", "deltam\n".repeat(n_sub));
+        let ov = overlay(&format!("[hadamard]\norder = {order}\n[motion]\nwithin_volume = {{ dropout_rate = 1.0, severity = 0.4 }}\n"), true);
+        let p = parse_echoes(&[s], &ctx, Some(&ov), None).unwrap();
+        assert!(p.motion.as_ref().unwrap().shot_path);
+        let out = simulate_p6(&p, &ph, T2Mode::Class, &zero_phase(), RowOverride::None, None).unwrap();
+        let sched = Schedule::new(&p);
+        let n = sched.raw_rows.len();
+        assert_eq!(n, 1 + order, "an m0scan and one encoding cycle of raw volumes");
+        let plan = out.shots.as_ref().unwrap();
+        assert_eq!((plan.times.len(), plan.schedule.len()), (n, 2));
+        for v in 0..n {
+            let want = sched.preps[sched.raws[v].prep].start_s + sched.raw_rows[v].t;
+            assert!((plan.times[v][0] - want).abs() < 1e-12 && (plan.times[v][1] - want - 0.05).abs() < 1e-12, "raw volume {v}");
+        }
+        assert_eq!(out.dropped.len(), 2 * n);
+        assert!(out.dropped.iter().all(|d| d.slices.len() == 1 && d.volume < n));
     }
 
     /// Review fixes: a 3D Hadamard raw volume's kinetic truth is static under volume motion (its

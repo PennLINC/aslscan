@@ -1024,6 +1024,7 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
             }
             _ => None,
         },
+        spin_history: None,
     };
 
     let ge3d = Ge3dSeries {
@@ -1063,7 +1064,7 @@ pub(super) fn simulate_ge3d(p: &Protocol, ph: &Phantom, mode: T2Mode, phase: &Ph
     Ok(SeriesOutput {
         acq_grid, sim_grid, n_volumes: n_out, mag, phase: phase_out, m0, mode: mode_used, labels: ph.labels.clone(),
         n_compartments: ncomp, fieldmap_present: ph.fieldmap.is_some(), seeds: (p.seed, m0_seed), acquisition: acq,
-        ground_truth, label_factors, poses: b.poses.clone(), motion_seed, events, dropped, compat: None, crush_survival: b.p4.crush.clone(),
+        ground_truth, label_factors, poses: b.poses.clone(), motion_seed, events, dropped, shots: None, spin_history_merges: None, compat: None, crush_survival: b.p4.crush.clone(),
         physio: b.p4.physio.as_ref().map(|_| physio_lines), ge_rule: Some(
             "every excitation of the train an event on the tissue's timeline (spoiled): the first preparation at its \
              steady state, each later one from the end of the one before"),
