@@ -11,14 +11,16 @@ something it does not model, and never silently ignores the request.
 ## What it does
 
 ASL measures blood flow by magnetically "labeling" the water in arterial blood and imaging the
-brain after the labeled blood arrives. A scan alternates *label* and *control* images. The small
-difference between them is proportional to perfusion.
+brain after the labeled blood arrives. A scan alternates *labeled* and *control* images. The small
+difference between them, the ASL difference image ΔM (control minus labeled), is proportional to
+perfusion.
 
 aslscan simulates this in three stages.
 
-1. **Kinetics.** For each phantom voxel, the Buxton general kinetic model gives the size of the
-   label-control difference at each image's timing. It uses the phantom's perfusion and
-   arrival-time maps and the protocol's labeling duration and post-labeling delay. Optional
+1. **Kinetics.** For each phantom voxel, the Buxton general kinetic model gives ΔM at each image's
+   timing. It uses the phantom's cerebral blood flow (CBF) and arterial transit time (ATT) maps and
+   the protocol's labeling duration (LD) and post-labeling delay (PLD), or for PASL its inversion
+   time (TI) and bolus duration (BD). Optional
    extensions add the following:
    - water exchange between blood and tissue;
    - a separate arterial (macrovascular) compartment, which vascular crushing can remove;
@@ -50,6 +52,35 @@ The first spec covers the core. The later addenda cover ASLDRO compatibility (P2
 background suppression and inversion recovery (P3); the vascular and physiological extensions
 (P4); 3D readouts and gradient echo (P5); Hadamard, Look-Locker and multi-echo (P6); and QUASAR, the
 Look-Locker combinations and the 3D gradient-echo EPI train (P7).
+
+### Terminology
+
+aslscan uses the terms of the OSIPI ASL lexicon ([Suzuki et al. 2024](https://pmc.ncbi.nlm.nih.gov/articles/PMC10950547/)),
+and in code the same name for the same model term throughout:
+
+| Term | In aslscan |
+|---|---|
+| Labeling duration (LD, τ), (P)CASL | `tau`; BIDS `LabelingDuration` |
+| Bolus duration (BD), PASL | `tau`; BIDS `BolusCutOffDelayTime` (its first value, TI1, for Q2TIPS) |
+| Post-labeling delay (PLD), (P)CASL; inversion time (TI), PASL | BIDS `PostLabelingDelay` (BIDS uses it for both) |
+| Inflow time: PLD + LD for (P)CASL, TI for PASL | `t`, the general kinetic model's clock |
+| Arterial transit time (ATT) | `att`; phantom `att.nii.gz` |
+| Labeling efficiency (α) | `alpha`; overlay `labeling_efficiency` |
+| Blood-brain partition coefficient (λ), mL/g | `lambda`; overlay `lambda_blood_brain` |
+| T1 of arterial blood (T1b) | `t1b`; overlay `t1_arterial_blood` |
+| Equilibrium magnetization of tissue (M0t) and of blood (M0b = M0t / λ) | `m0`, `m0b`; phantom `M0map.nii.gz` |
+| ASL difference image (ΔM), control minus labeled | `delta_m`; `aslcontext.tsv` `deltam` |
+| Cerebral blood flow (CBF), mL/100 g/min | phantom `perfusion.nii.gz` |
+
+Two departures from the lexicon:
+- **Labeling efficiency.** OSIPI's α includes the label lost to background suppression. aslscan's `alpha`
+  is the labeling pulse's efficiency alone, because the background-suppression pulses are simulated
+  one by one.
+- **The arterial compartment's ATT.** The lexicon has no term for the macrovascular extension, and
+  its ATT (with the aliases AAT and BAT) is the arrival in the tissue. The arrival of label in a
+  voxel's arterial compartment is therefore called the arterial compartment's ATT: overlay
+  `arterial_compartment_att`, phantom `att_arterial.nii.gz`, code `att_arterial`. Its partner is
+  the arterial blood volume (aBV, `abv`).
 
 ### Supported protocols
 
@@ -156,7 +187,7 @@ Run `aslscan --help` for the full list.
 The protocol is read from a standard BIDS ASL sidecar and `aslcontext.tsv`, as found in a real
 BIDS dataset. In practice, you can take these two files from a dataset whose acquisition you
 want to reproduce. aslscan reads, among others:
-- labeling: type, duration, post-labeling delay, bolus cut-off, M0 type;
+- labeling: type, labeling duration, post-labeling delay (for PASL, the TI), bolus cut-off, M0 type;
 - timing: repetition time, echo time, total readout time, slice timing;
 - geometry: voxel size, phase-encoding direction, flip angle;
 - background suppression and its pulse times;
@@ -184,9 +215,9 @@ than ignored.
 seed = 20260923                # random seed
 
 [kinetic]
-label_efficiency = 0.85        # default 0.85 (PCASL/CASL), 0.98 (PASL); BIDS LabelingEfficiency is used if present
-lambda_blood_brain = 0.9       # ml/g; default 0.9
-t1_arterial_blood = 1.65       # s; default 1.65 at 3 T, 1.35 at 1.5 T
+labeling_efficiency = 0.85     # alpha; else BIDS LabelingEfficiency, else 0.85 (PCASL), 0.68 (CASL), 0.98 (PASL)
+lambda_blood_brain = 0.9       # lambda, mL/g; default 0.9
+t1_arterial_blood = 1.65       # T1b, s; default 1.65 at 3 T, 1.35 at 1.5 T
 exchange_time = 0.5            # s; turns on blood-to-tissue water exchange (off by default)
 
 [signal]
@@ -258,9 +289,9 @@ jump_deg = [0.0, 0.0, 1.0]
 **Vascular and physiological extensions:**
 
 ```toml
-[macrovascular]                # an arterial compartment; per label, or the phantom's abv/aatt maps
-arterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }
-arterial_transit_time = { grey_matter = 1.5, white_matter = 1.7, csf = 0.0 }
+[macrovascular]                # an arterial compartment; per label, or the phantom's abv/att_arterial maps
+arterial_blood_volume = { grey_matter = 0.03, white_matter = 0.015, csf = 0.0 }       # aBV, fraction
+arterial_compartment_att = { grey_matter = 1.5, white_matter = 1.7, csf = 0.0 }      # s; the arterial compartment's ATT
 
 [vascular_crushing]            # with VascularCrushing: true in the sidecar
 arterial_velocity = { grey_matter = 10.0, white_matter = 6.0, csf = 3.0 }  # cm/s
@@ -458,7 +489,7 @@ or one ky segment of it in a segmented acquisition. aslscan simulates every exci
   it reaches its voxel. `slab_entry_time` is when the label enters the slab, in seconds after
   labeling, with one value for all arteries. `"arrival"` turns off depletion before the voxel.
 - The label is read at each excitation, interpolated between node excitations chosen to meet
-  `node_tolerance`. All voxels share the same nodes. On a realistic phantom, whose arrival times vary
+  `node_tolerance`. All voxels share the same nodes. On a realistic phantom, whose ATTs vary
   from voxel to voxel, nearly every excitation becomes a node. The result is then exact, but memory
   and run time grow with the length of the train.
 - **Memory.** The sidecar records the estimated size of the images held at once, and a series over
@@ -483,15 +514,15 @@ The phantom is a directory of NIfTI images on a common grid, each with a JSON si
 
 | File | Contents | Units |
 |---|---|---|
-| `perfusion.nii.gz` | cerebral blood flow | `ml/100g/min` |
-| `att.nii.gz` | arterial transit time | `s` |
+| `perfusion.nii.gz` | cerebral blood flow (CBF), mL/100 g/min | `ml/100g/min` |
+| `att.nii.gz` | arterial transit time (ATT) | `s` |
 | `T1map.nii.gz` | tissue T1 | `s` |
 | `T2map.nii.gz` | tissue T2 | `s` |
 | `T2starmap.nii.gz` | tissue T2* | `s` |
-| `M0map.nii.gz` | equilibrium magnetization | `arbitrary` |
+| `M0map.nii.gz` | equilibrium magnetization of tissue (M0t) | `arbitrary` |
 | `dseg.nii.gz` | tissue labels; `dseg.json` names them in a `LabelMap` | `label indices` |
 | `fieldmap.nii.gz` | B0 fieldmap (optional) | `Hz` |
-| `abv.nii.gz`, `aatt.nii.gz` | arterial blood volume and transit time (optional, for `[macrovascular]`) | `fraction`, `s` |
+| `abv.nii.gz`, `att_arterial.nii.gz` | arterial blood volume (aBV) and the arterial compartment's ATT (optional, for `[macrovascular]`) | `fraction`, `s` |
 
 An optional `phantom.json` can supply `LambdaBloodBrain`, `T1ArterialBlood`, and
 `MagneticFieldStrength`. The field strength must match the protocol's. Without a fieldmap, no EPI
@@ -531,7 +562,7 @@ smaller region.
       sub-01_desc-att_gt.nii.gz
       sub-01_desc-T1map_gt.nii.gz, _desc-T2map_gt, _desc-M0map_gt
       sub-01_desc-dseg_gt.nii.gz             tissue labels
-      sub-01_desc-deltam_gt.nii.gz           noise-free label-control difference, per volume
+      sub-01_desc-deltam_gt.nii.gz           noise-free ΔM (control minus labeled), per volume
 ```
 
 Optional features add files:
@@ -539,7 +570,7 @@ Optional features add files:
 | Feature | Adds |
 |---|---|
 | Motion | `ground-truth/sub-01_desc-motion_gt.tsv` and `_desc-motionEvents_gt.tsv`, plus `_desc-deltamStatic_gt` (the unmoved truth). |
-| Vascular extensions | `ground-truth/sub-01_desc-deltamIntravascular_gt`, `_desc-deltamArterial_gt`, `_desc-deltamSuppressed_gt`, `_desc-aBV_gt`, `_desc-aATT_gt`. |
+| Vascular extensions | `ground-truth/sub-01_desc-deltamIntravascular_gt`, `_desc-deltamArterial_gt`, `_desc-deltamSuppressed_gt`, `_desc-aBV_gt`, `_desc-attArterial_gt`. |
 | Physiology | `ground-truth/sub-01_desc-physio_gt.tsv`, with the factors applied per volume and slice (or shot). |
 | Several echo times | One series per echo: `sub-01_echo-<n>_part-{mag,phase}_asl.nii.gz` with its own sidecar, and a separate M0 per echo. The one `aslcontext.tsv` and the ground truth are shared by all echoes. |
 | Hadamard | The main series is the *decoded* data. `sourcedata/sub-01/perf/` holds the raw encoded series, a table of the raw volumes, the raw truth, and `desc-preparations_gt.tsv` (the factors applied to each labeling). `TotalAcquiredPairs` is the number of encoding cycles. |

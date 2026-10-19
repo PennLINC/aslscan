@@ -559,7 +559,7 @@ mod writer {
             };
             block["Macrovascular"] = json!({
                 "ArterialBloodVolume": q(&m.abv, "abv.nii.gz"),
-                "ArterialTransitTime": q(&m.aatt, "aatt.nii.gz"),
+                "ArterialCompartmentATT": q(&m.att_arterial, "att_arterial.nii.gz"),
                 "T2Arterial": resolved(m.t2_arterial),
                 "Model": "plug flow, no dispersion (Chappell et al. 2010, the macrovascular term)",
             });
@@ -1045,8 +1045,8 @@ mod writer {
         if let Some(a) = &gt.abv {
             wgt("aBV", a, "fraction", mean)?;
         }
-        if let Some(a) = &gt.aatt {
-            wgt("aATT", a, "s", "volume-weighted mean over phantom voxels with aBV > 0; 0 where none")?;
+        if let Some(a) = &gt.att_arterial {
+            wgt("attArterial", a, "s", "volume-weighted mean over phantom voxels with aBV > 0; 0 where none")?;
         }
         if out.hadamard.is_none() {
             write_volume_tables(&gt_prefix, p, out)?;

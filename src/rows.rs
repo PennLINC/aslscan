@@ -27,11 +27,12 @@ impl RowKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub kind: RowKind,
-    /// Kinetic signal time `t` (s) before the per-slice offset: PLD + tau for (P)CASL, PLD for
-    /// PASL (BIDS measures the PASL PLD from the middle of the labeling pulse, which is already
-    /// the GKM's clock). Zero for m0scan rows.
+    /// Inflow time `t` (s) before the per-slice offset: PLD + LD for (P)CASL, TI for PASL (BIDS
+    /// records the PASL TI as `PostLabelingDelay`, from the middle of the labeling pulse, which
+    /// is already the GKM's clock). Zero for m0scan rows.
     pub t: f64,
-    /// Bolus duration `tau` (s) for this row. Zero for m0scan rows.
+    /// `tau` (s) for this row: the labeling duration (LD) for (P)CASL, the bolus duration (BD)
+    /// for PASL. Zero for m0scan rows.
     pub tau: f64,
     /// Repetition time the tissue steady state is evaluated at (s).
     pub tr: f64,

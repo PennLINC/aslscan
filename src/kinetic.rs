@@ -19,14 +19,15 @@ pub enum LabelType {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Kinetic {
     pub label_type: LabelType,
-    /// Bolus duration `tau` (s): `LabelingDuration` for (P)CASL, `BolusCutOffDelayTime[0]` for
-    /// PASL.
+    /// `tau` (s): the labeling duration (LD) for (P)CASL, from `LabelingDuration`; the bolus
+    /// duration (BD, the QUIPSS II/Q2TIPS TI1) for PASL, from `BolusCutOffDelayTime[0]`.
     pub tau: f64,
-    /// Label efficiency `alpha`.
+    /// Labeling efficiency `alpha` (fraction). Background suppression's loss of label is not
+    /// folded in here, as OSIPI's alpha does: it is applied separately, per pulse.
     pub alpha: f64,
-    /// Blood-brain partition coefficient (ml/g).
+    /// Blood-brain partition coefficient `lambda` (mL/g).
     pub lambda: f64,
-    /// Arterial blood T1 (s).
+    /// T1 of arterial blood, `T1b` (s).
     pub t1b: f64,
 }
 
@@ -40,18 +41,18 @@ fn div0(n: f64, d: f64) -> f64 {
     }
 }
 
-/// `delta_m` for one voxel at signal time `t` (s), the difference in longitudinal magnetization
-/// the label delivers.
+/// `delta_m` (ΔM, control minus labeled) for one voxel at inflow time `t` (s), the difference in
+/// longitudinal magnetization the label delivers.
 ///
 /// `f_ml_100g_min` is the perfusion rate exactly as the phantom stores it; the `/ 6000` to
-/// per-second happens here (`gkm_filter.py:105`). `dt` is the arterial transit time, `t1t` the
-/// tissue T1, `m0` the tissue equilibrium magnetization. The result is what simasl's masked
-/// array holds for this voxel: `0` where the bolus has not arrived (`0 < t <= dt`), and also `0`
+/// per-second happens here (`gkm_filter.py:105`). `att` is the arterial transit time (ATT), `t1t`
+/// the tissue T1, `m0` the tissue equilibrium magnetization (M0t). The result is what simasl's masked
+/// array holds for this voxel: `0` where the bolus has not arrived (`0 < t <= att`), and also `0`
 /// for `t <= 0`, where simasl's chained comparison makes every mask false and the zero-initialised
 /// output is never written.
-pub fn delta_m(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t: f64) -> f64 {
+pub fn delta_m(k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, t: f64) -> f64 {
     let (f, m0b, t1p) = gkm_constants(k, f_ml_100g_min, t1t, m0);
-    gkm_body(k, f, m0b, dt, t1p, t)
+    gkm_body(k, f, m0b, att, t1p, t)
 }
 
 /// `f` (per second), `M0b` and `T1'`, with simasl's guards.
@@ -70,18 +71,18 @@ fn gkm_constants(k: &Kinetic, f_ml_100g_min: f64, t1t: f64, m0: f64) -> (f64, f6
 /// [`delta_m`] with `T1'` given rather than derived from the tissue `T1` (P4 addendum, part A:
 /// the intravascular part is the GKM with `T1'` replaced by `T1''`). The same delivery masks,
 /// branches and guards; the arithmetic of [`delta_m`] is this function's.
-pub fn delta_m_with_t1p(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1p: f64, m0: f64, t: f64) -> f64 {
+pub fn delta_m_with_t1p(k: &Kinetic, f_ml_100g_min: f64, att: f64, t1p: f64, m0: f64, t: f64) -> f64 {
     let f = f_ml_100g_min / 6000.0;
     let m0b = if k.lambda != 0.0 { m0 / k.lambda } else { 0.0 };
-    gkm_body(k, f, m0b, dt, t1p, t)
+    gkm_body(k, f, m0b, att, t1p, t)
 }
 
 #[inline]
-fn gkm_body(k: &Kinetic, f: f64, m0b: f64, dt: f64, t1p: f64, t: f64) -> f64 {
+fn gkm_body(k: &Kinetic, f: f64, m0b: f64, att: f64, t1p: f64, t: f64) -> f64 {
     // Delivery state. simasl builds three masks and writes the arriving and arrived results
     // into a zero-initialised array; the not-arrived mask only ever writes zero.
-    let arriving = dt < t && t < dt + k.tau;
-    let arrived = t >= dt + k.tau;
+    let arriving = att < t && t < att + k.tau;
+    let arrived = t >= att + k.tau;
     if !(arriving || arrived) {
         return 0.0;
     }
@@ -95,25 +96,25 @@ fn gkm_body(k: &Kinetic, f: f64, m0b: f64, dt: f64, t1p: f64, t: f64) -> f64 {
             let decay = if k.t1b > 0.0 { (-t / k.t1b).exp() } else { 0.0 };
             if arriving {
                 // q_pasl_arriving, numerator and denominator computed separately so that
-                // t == dt cannot divide by zero (it is masked out anyway) (gkm_filter.py:173-185).
-                let num = (kk * t).exp() * ((-kk * dt).exp() - (-kk * t).exp());
-                let q = div0(num, kk * (t - dt));
-                2.0 * m0b * f * (t - dt) * k.alpha * decay * q
+                // t == att cannot divide by zero (it is masked out anyway) (gkm_filter.py:173-185).
+                let num = (kk * t).exp() * ((-kk * att).exp() - (-kk * t).exp());
+                let q = div0(num, kk * (t - att));
+                2.0 * m0b * f * (t - att) * k.alpha * decay * q
             } else {
-                let num = (kk * t).exp() * ((-kk * dt).exp() - (-kk * (dt + k.tau)).exp());
+                let num = (kk * t).exp() * ((-kk * att).exp() - (-kk * (att + k.tau)).exp());
                 let q = div0(num, kk * k.tau);
                 2.0 * m0b * f * k.alpha * k.tau * decay * q
             }
         }
         LabelType::Casl | LabelType::Pcasl => {
             // Here the T1b test is `!= 0`, not `> 0` (gkm_filter.py:252, :265).
-            let decay = if k.t1b != 0.0 { (-dt / k.t1b).exp() } else { 0.0 };
+            let decay = if k.t1b != 0.0 { (-att / k.t1b).exp() } else { 0.0 };
             if arriving {
-                let q = 1.0 - (-div0(t - dt, t1p)).exp();
+                let q = 1.0 - (-div0(t - att, t1p)).exp();
                 2.0 * m0b * f * t1p * k.alpha * decay * q
             } else {
                 let q = 1.0 - (-div0(k.tau, t1p)).exp();
-                2.0 * m0b * f * t1p * k.alpha * decay * (-div0(t - k.tau - dt, t1p)).exp() * q
+                2.0 * m0b * f * t1p * k.alpha * decay * (-div0(t - k.tau - att, t1p)).exp() * q
             }
         }
     }
@@ -125,14 +126,14 @@ fn gkm_body(k: &Kinetic, f: f64, m0b: f64, dt: f64, t1p: f64, t: f64) -> f64 {
 /// are a GKM bolus with `ATT' = ATT + a` and no shift. The uncut sub-bolus (`a = 0`,
 /// `b = tau`) calls [`delta_m`] with the original arguments, so the P1 path is the P1 code.
 #[allow(clippy::too_many_arguments)]
-pub fn delta_m_sub(k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, t: f64, a: f64, b: f64) -> f64 {
+pub fn delta_m_sub(k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, t: f64, a: f64, b: f64) -> f64 {
     if a == 0.0 && b == k.tau {
-        return delta_m(k, f, dt, t1t, m0, t);
+        return delta_m(k, f_ml_100g_min, att, t1t, m0, t);
     }
     let ks = Kinetic { tau: b - a, ..*k };
     match k.label_type {
-        LabelType::Pasl => delta_m(&ks, f, dt + a, t1t, m0, t),
-        LabelType::Casl | LabelType::Pcasl => delta_m(&ks, f, dt, t1t, m0, t - a),
+        LabelType::Pasl => delta_m(&ks, f_ml_100g_min, att + a, t1t, m0, t),
+        LabelType::Casl | LabelType::Pcasl => delta_m(&ks, f_ml_100g_min, att, t1t, m0, t - a),
     }
 }
 
@@ -150,35 +151,35 @@ fn t1pp(k: &Kinetic, f_ml_100g_min: f64, t1t: f64, m0: f64, tau_ex: f64) -> Opti
 /// The intravascular part of [`delta_m`] (P4 addendum, part A): each parcel resident for `s`
 /// has not yet exchanged with probability `exp(-s/tau_ex)`, which makes it the GKM with `T1'`
 /// replaced by `T1''`. (P)CASL is [`delta_m_with_t1p`]'s arithmetic. PASL is not: its branch
-/// forms `exp(kk t)` and `exp(-kk dt)` separately, and with `T1''` short `kk` is large and
+/// forms `exp(kk t)` and `exp(-kk att)` separately, and with `T1''` short `kk` is large and
 /// negative, so those overflow to `0 * (inf - inf)`; here the exponents are combined, which is
 /// the same quantity and finite for every `tau_ex`.
-pub fn delta_m_iv(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t: f64, tau_ex: f64) -> f64 {
+pub fn delta_m_iv(k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, t: f64, tau_ex: f64) -> f64 {
     let Some((f, m0b, t1pp)) = t1pp(k, f_ml_100g_min, t1t, m0, tau_ex) else { return 0.0 };
     match k.label_type {
-        LabelType::Casl | LabelType::Pcasl => gkm_body(k, f, m0b, dt, t1pp, t),
+        LabelType::Casl | LabelType::Pcasl => gkm_body(k, f, m0b, att, t1pp, t),
         LabelType::Pasl => {
             // The part never exceeds the whole delta_m computes. Where delta_m's own
             // kk = 1/T1b - 1/T1' is zero (its quotient guard) or within rounding of it (its
             // difference of exponentials cancels), delta_m is zero or noise; it stays as simasl
             // computes it, and T1'' moves kk off zero, so unclamped the part would be a positive
             // share of a zero whole and the extravascular rest negative.
-            let iv = pasl_stable(k, f, m0b, dt, t1pp, t);
-            iv.min(delta_m(k, f_ml_100g_min, dt, t1t, m0, t)).max(0.0)
+            let iv = pasl_stable(k, f, m0b, att, t1pp, t);
+            iv.min(delta_m(k, f_ml_100g_min, att, t1t, m0, t)).max(0.0)
         }
     }
 }
 
 /// [`delta_m_iv`] of the sub-bolus `a..b`, by the shifts of [`delta_m_sub`].
 #[allow(clippy::too_many_arguments)]
-pub fn delta_m_iv_sub(k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, t: f64, a: f64, b: f64, tau_ex: f64) -> f64 {
+pub fn delta_m_iv_sub(k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, t: f64, a: f64, b: f64, tau_ex: f64) -> f64 {
     if a == 0.0 && b == k.tau {
-        return delta_m_iv(k, f, dt, t1t, m0, t, tau_ex);
+        return delta_m_iv(k, f_ml_100g_min, att, t1t, m0, t, tau_ex);
     }
     let ks = Kinetic { tau: b - a, ..*k };
     match k.label_type {
-        LabelType::Pasl => delta_m_iv(&ks, f, dt + a, t1t, m0, t, tau_ex),
-        LabelType::Casl | LabelType::Pcasl => delta_m_iv(&ks, f, dt, t1t, m0, t - a, tau_ex),
+        LabelType::Pasl => delta_m_iv(&ks, f_ml_100g_min, att + a, t1t, m0, t, tau_ex),
+        LabelType::Casl | LabelType::Pcasl => delta_m_iv(&ks, f_ml_100g_min, att, t1t, m0, t - a, tau_ex),
     }
 }
 
@@ -186,40 +187,40 @@ pub fn delta_m_iv_sub(k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, t: f64, a
 /// `exp(kk (t - y)) expm1(kk (y - x))`: the same masks and guards. Combining the exponents keeps
 /// it finite at large `|kk|`; `expm1` keeps it accurate at small `|kk|`, where `tau_ex` makes
 /// `T1''` nearly `T1b` and the difference of two exponentials would cancel to noise.
-fn pasl_stable(k: &Kinetic, f: f64, m0b: f64, dt: f64, t1p: f64, t: f64) -> f64 {
-    let arriving = dt < t && t < dt + k.tau;
-    let arrived = t >= dt + k.tau;
+fn pasl_stable(k: &Kinetic, f: f64, m0b: f64, att: f64, t1p: f64, t: f64) -> f64 {
+    let arriving = att < t && t < att + k.tau;
+    let arrived = t >= att + k.tau;
     if !(arriving || arrived) {
         return 0.0;
     }
     let kk = (if k.t1b != 0.0 { 1.0 / k.t1b } else { 0.0 }) - div0(1.0, t1p);
     let decay = if k.t1b > 0.0 { (-t / k.t1b).exp() } else { 0.0 };
     if arriving {
-        let num = (kk * (t - dt)).exp_m1();
-        let q = div0(num, kk * (t - dt));
-        2.0 * m0b * f * (t - dt) * k.alpha * decay * q
+        let num = (kk * (t - att)).exp_m1();
+        let q = div0(num, kk * (t - att));
+        2.0 * m0b * f * (t - att) * k.alpha * decay * q
     } else {
-        let num = (kk * (t - dt - k.tau)).exp() * (kk * k.tau).exp_m1();
+        let num = (kk * (t - att - k.tau)).exp() * (kk * k.tau).exp_m1();
         let q = div0(num, kk * k.tau);
         2.0 * m0b * f * k.alpha * k.tau * decay * q
     }
 }
 
 /// The arterial (macrovascular) difference magnetization (P4 addendum, part B), with the
-/// parcel factor `g = 1`: `2 alpha M0b aBV exp(-aATT/T1b)` for (P)CASL and
-/// `2 alpha M0b aBV exp(-t/T1b)` for PASL, inside `aATT <= t < aATT + tau`, zero outside, with
+/// parcel factor `g = 1`: `2 alpha M0b aBV exp(-ATT_arterial/T1b)` for (P)CASL and
+/// `2 alpha M0b aBV exp(-t/T1b)` for PASL, inside `ATT_arterial <= t < ATT_arterial + tau`, zero outside, with
 /// the GKM's `lambda` and `T1b` guards. Returns the value and the sub-bolus coordinate of the
-/// parcel the voxel's arteries hold (`t - aATT` for both labeling types), `None` outside.
-pub fn arterial_dm(k: &Kinetic, abv: f64, aatt: f64, m0: f64, t: f64) -> (f64, Option<f64>) {
-    if !(aatt <= t && t < aatt + k.tau) {
+/// parcel the voxel's arteries hold (`t - ATT_arterial` for both labeling types), `None` outside.
+pub fn arterial_dm(k: &Kinetic, abv: f64, att_arterial: f64, m0: f64, t: f64) -> (f64, Option<f64>) {
+    if !(att_arterial <= t && t < att_arterial + k.tau) {
         return (0.0, None);
     }
     let m0b = if k.lambda != 0.0 { m0 / k.lambda } else { 0.0 };
     let decay = match k.label_type {
         LabelType::Pasl => if k.t1b > 0.0 { (-t / k.t1b).exp() } else { 0.0 },
-        LabelType::Casl | LabelType::Pcasl => if k.t1b != 0.0 { (-aatt / k.t1b).exp() } else { 0.0 },
+        LabelType::Casl | LabelType::Pcasl => if k.t1b != 0.0 { (-att_arterial / k.t1b).exp() } else { 0.0 },
     };
-    (2.0 * k.alpha * m0b * abv * decay, Some(t - aatt))
+    (2.0 * k.alpha * m0b * abv * decay, Some(t - att_arterial))
 }
 
 /// The delta-M at `t` of the label that arrived in the voxel during `[u1, u2)` (P6 addendum,
@@ -228,16 +229,16 @@ pub fn arterial_dm(k: &Kinetic, abv: f64, aatt: f64, m0: f64, t: f64) -> (f64, O
 /// `exp(-(t - u)/T1')` after it; the windows partition `[0, t)`, and over them the sum is
 /// [`delta_m`] at `t`.
 ///
-/// (P)CASL delivers `2 alpha M0b f exp(-dt/T1b)` on `[dt, dt + tau]`:
-/// `2 alpha M0b f exp(-dt/T1b) T1' (exp(-(t - u_hi)/T1') - exp(-(t - u_lo)/T1'))`. PASL delivers
-/// `2 alpha M0b f exp(-u/T1b)` on `[dt, dt + tau]`: with `q = 1/T1b - 1/T1'`,
+/// (P)CASL delivers `2 alpha M0b f exp(-att/T1b)` on `[att, att + tau]`:
+/// `2 alpha M0b f exp(-att/T1b) T1' (exp(-(t - u_hi)/T1') - exp(-(t - u_lo)/T1'))`. PASL delivers
+/// `2 alpha M0b f exp(-u/T1b)` on `[att, att + tau]`: with `q = 1/T1b - 1/T1'`,
 /// `2 alpha M0b f exp(-t/T1b) exp(q t) (exp(-q u_lo) - exp(-q u_hi)) / q`, zero at `q = 0` as the
-/// GKM's guard makes it. `u_lo = max(u1, dt)`, `u_hi = min(u2, dt + tau, t)`, zero when
+/// GKM's guard makes it. `u_lo = max(u1, att)`, `u_hi = min(u2, att + tau, t)`, zero when
 /// `u_hi <= u_lo`; the GKM's guards on `lambda`, `T1'` and `T1b` hold.
 #[allow(clippy::too_many_arguments)]
-pub fn delta_m_arrival(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t: f64, u1: f64, u2: f64) -> f64 {
+pub fn delta_m_arrival(k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, t: f64, u1: f64, u2: f64) -> f64 {
     let (f, m0b, t1p) = gkm_constants(k, f_ml_100g_min, t1t, m0);
-    let (u_lo, u_hi) = (u1.max(dt), u2.min(dt + k.tau).min(t));
+    let (u_lo, u_hi) = (u1.max(att), u2.min(att + k.tau).min(t));
     if u_hi <= u_lo || t1p == 0.0 {
         return 0.0;
     }
@@ -249,7 +250,7 @@ pub fn delta_m_arrival(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f
             2.0 * m0b * f * k.alpha * decay * div0(num, kk)
         }
         LabelType::Casl | LabelType::Pcasl => {
-            let decay = if k.t1b != 0.0 { (-dt / k.t1b).exp() } else { 0.0 };
+            let decay = if k.t1b != 0.0 { (-att / k.t1b).exp() } else { 0.0 };
             2.0 * m0b * f * t1p * k.alpha * decay * ((-(t - u_hi) / t1p).exp() - (-(t - u_lo) / t1p).exp())
         }
     }
@@ -262,7 +263,7 @@ pub fn delta_m_arrival(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f
 /// one, each leaving `cos(a)` of it:
 /// `sum_k prod_{m > k, m < n} cos(a_m) * delta_m_arrival(e_n; e_k, e_k+1)`.
 #[allow(clippy::too_many_arguments)]
-pub fn delta_m_read(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, e: &[f64], flips_deg: &[f64]) -> f64 {
+pub fn delta_m_read(k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, e: &[f64], flips_deg: &[f64]) -> f64 {
     let n = e.len();
     assert!(n >= 1 && flips_deg.len() + 1 == n, "{n} excitations need {} earlier flips, got {}", n.saturating_sub(1), flips_deg.len());
     let t = e[n - 1];
@@ -270,7 +271,7 @@ pub fn delta_m_read(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64,
         .map(|w| {
             let lo = if w == 0 { 0.0 } else { e[w - 1] };
             let depletion: f64 = flips_deg[w..].iter().map(|a| a.to_radians().cos()).product();
-            depletion * delta_m_arrival(k, f_ml_100g_min, dt, t1t, m0, t, lo, e[w])
+            depletion * delta_m_arrival(k, f_ml_100g_min, att, t1t, m0, t, lo, e[w])
         })
         .sum()
 }
@@ -286,10 +287,10 @@ pub fn delta_m_read(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64,
 /// difference with `T1''`, which never exceeds the whole.
 #[allow(clippy::too_many_arguments)]
 pub fn delta_m_arrival_iv(
-    k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t: f64, u1: f64, u2: f64, tau_ex: f64,
+    k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, t: f64, u1: f64, u2: f64, tau_ex: f64,
 ) -> f64 {
     let Some((f, m0b, t1pp)) = t1pp(k, f_ml_100g_min, t1t, m0, tau_ex) else { return 0.0 };
-    let (u_lo, u_hi) = (u1.max(dt), u2.min(dt + k.tau).min(t));
+    let (u_lo, u_hi) = (u1.max(att), u2.min(att + k.tau).min(t));
     if u_hi <= u_lo || t1pp == 0.0 {
         return 0.0;
     }
@@ -299,10 +300,10 @@ pub fn delta_m_arrival_iv(
             let decay = if k.t1b > 0.0 { (-t / k.t1b).exp() } else { 0.0 };
             let num = (kk * (t - u_hi)).exp() * (kk * (u_hi - u_lo)).exp_m1();
             let iv = 2.0 * m0b * f * k.alpha * decay * div0(num, kk);
-            iv.min(delta_m_arrival(k, f_ml_100g_min, dt, t1t, m0, t, u1, u2)).max(0.0)
+            iv.min(delta_m_arrival(k, f_ml_100g_min, att, t1t, m0, t, u1, u2)).max(0.0)
         }
         LabelType::Casl | LabelType::Pcasl => {
-            let decay = if k.t1b != 0.0 { (-dt / k.t1b).exp() } else { 0.0 };
+            let decay = if k.t1b != 0.0 { (-att / k.t1b).exp() } else { 0.0 };
             2.0 * m0b * f * t1pp * k.alpha * decay * ((-(t - u_hi) / t1pp).exp() - (-(t - u_lo) / t1pp).exp())
         }
     }
@@ -310,34 +311,34 @@ pub fn delta_m_arrival_iv(
 
 /// [`delta_m_arrival`] of the sub-bolus `a..b` of `[0, tau]`, by [`delta_m_sub`]'s shifts:
 /// (P)CASL a bolus of length `b - a` read at `t - a`, its arrival window shifted by `-a` (a parcel
-/// labeled at `l` arrives at `l + dt`); PASL the arrival delay `dt + a`, the window unshifted. The
+/// labeled at `l` arrives at `l + att`); PASL the arrival delay `att + a`, the window unshifted. The
 /// uncut sub-bolus calls [`delta_m_arrival`] itself.
 #[allow(clippy::too_many_arguments)]
 pub fn delta_m_arrival_sub(
-    k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, t: f64, u1: f64, u2: f64, a: f64, b: f64,
+    k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, t: f64, u1: f64, u2: f64, a: f64, b: f64,
 ) -> f64 {
     if a == 0.0 && b == k.tau {
-        return delta_m_arrival(k, f, dt, t1t, m0, t, u1, u2);
+        return delta_m_arrival(k, f_ml_100g_min, att, t1t, m0, t, u1, u2);
     }
     let ks = Kinetic { tau: b - a, ..*k };
     match k.label_type {
-        LabelType::Pasl => delta_m_arrival(&ks, f, dt + a, t1t, m0, t, u1, u2),
-        LabelType::Casl | LabelType::Pcasl => delta_m_arrival(&ks, f, dt, t1t, m0, t - a, u1 - a, u2 - a),
+        LabelType::Pasl => delta_m_arrival(&ks, f_ml_100g_min, att + a, t1t, m0, t, u1, u2),
+        LabelType::Casl | LabelType::Pcasl => delta_m_arrival(&ks, f_ml_100g_min, att, t1t, m0, t - a, u1 - a, u2 - a),
     }
 }
 
 /// [`delta_m_arrival_iv`] of the sub-bolus `a..b`, by the same shifts as [`delta_m_arrival_sub`].
 #[allow(clippy::too_many_arguments)]
 pub fn delta_m_arrival_iv_sub(
-    k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, t: f64, u1: f64, u2: f64, a: f64, b: f64, tau_ex: f64,
+    k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, t: f64, u1: f64, u2: f64, a: f64, b: f64, tau_ex: f64,
 ) -> f64 {
     if a == 0.0 && b == k.tau {
-        return delta_m_arrival_iv(k, f, dt, t1t, m0, t, u1, u2, tau_ex);
+        return delta_m_arrival_iv(k, f_ml_100g_min, att, t1t, m0, t, u1, u2, tau_ex);
     }
     let ks = Kinetic { tau: b - a, ..*k };
     match k.label_type {
-        LabelType::Pasl => delta_m_arrival_iv(&ks, f, dt + a, t1t, m0, t, u1, u2, tau_ex),
-        LabelType::Casl | LabelType::Pcasl => delta_m_arrival_iv(&ks, f, dt, t1t, m0, t - a, u1 - a, u2 - a, tau_ex),
+        LabelType::Pasl => delta_m_arrival_iv(&ks, f_ml_100g_min, att + a, t1t, m0, t, u1, u2, tau_ex),
+        LabelType::Casl | LabelType::Pcasl => delta_m_arrival_iv(&ks, f_ml_100g_min, att, t1t, m0, t - a, u1 - a, u2 - a, tau_ex),
     }
 }
 
@@ -359,15 +360,15 @@ impl ReadParts {
 /// One window's contribution, every sub-bolus with its factor: `(iv, whole)`.
 #[allow(clippy::too_many_arguments)]
 fn window_parts(
-    k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, t: f64, lo: f64, hi: f64, subs: &[(f64, f64, f64)],
+    k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, t: f64, lo: f64, hi: f64, subs: &[(f64, f64, f64)],
     tau_ex: Option<f64>,
 ) -> (f64, f64) {
     let (mut iv, mut whole) = (0.0, 0.0);
     for &(a, b, fac) in subs {
-        let w = delta_m_arrival_sub(k, f, dt, t1t, m0, t, lo, hi, a, b);
+        let w = delta_m_arrival_sub(k, f_ml_100g_min, att, t1t, m0, t, lo, hi, a, b);
         whole += fac * w;
         iv += fac * match tau_ex {
-            Some(te) => delta_m_arrival_iv_sub(k, f, dt, t1t, m0, t, lo, hi, a, b, te),
+            Some(te) => delta_m_arrival_iv_sub(k, f_ml_100g_min, att, t1t, m0, t, lo, hi, a, b, te),
             None => w,
         };
     }
@@ -391,7 +392,7 @@ fn window(e: &[f64], w: usize, delta: f64) -> (f64, f64) {
 /// Direct: O(n) per read. [`delta_m_read_all`] gives every read of a train in O(n) in all.
 #[allow(clippy::too_many_arguments)]
 pub fn delta_m_read_parts(
-    k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, e: &[f64], flips_deg: &[f64], subs: &[(f64, f64, f64)],
+    k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, e: &[f64], flips_deg: &[f64], subs: &[(f64, f64, f64)],
     tau_ex: Option<f64>, delta: f64,
 ) -> ReadParts {
     let n = e.len();
@@ -401,7 +402,7 @@ pub fn delta_m_read_parts(
     for w in 0..n {
         let (lo, hi) = window(e, w, delta);
         let depletion: f64 = flips_deg[w..].iter().map(|a| a.to_radians().cos()).product();
-        let (i, h) = window_parts(k, f, dt, t1t, m0, t, lo, hi, subs, tau_ex);
+        let (i, h) = window_parts(k, f_ml_100g_min, att, t1t, m0, t, lo, hi, subs, tau_ex);
         iv += depletion * i;
         whole += depletion * h;
     }
@@ -453,7 +454,7 @@ fn read_all_component(e: &[f64], lp: &[f64], delta: f64, t1x: f64, term: impl Fn
 /// the previous excitation, so no exponent spans more than one step.
 #[allow(clippy::too_many_arguments)]
 pub fn delta_m_read_all(
-    k: &Kinetic, f: f64, dt: f64, t1t: f64, m0: f64, e: &[f64], flips_deg: &[f64], subs: &[(f64, f64, f64)],
+    k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, e: &[f64], flips_deg: &[f64], subs: &[(f64, f64, f64)],
     tau_ex: Option<f64>, delta: f64,
 ) -> Vec<ReadParts> {
     let n = e.len();
@@ -462,17 +463,17 @@ pub fn delta_m_read_all(
     for (m, a) in flips_deg.iter().enumerate() {
         lp[m + 1] = lp[m] + a.to_radians().cos().ln();
     }
-    let (_, _, t1p) = gkm_constants(k, f, t1t, m0);
+    let (_, _, t1p) = gkm_constants(k, f_ml_100g_min, t1t, m0);
     let whole = read_all_component(e, &lp, delta, t1p, |t, lo, hi| {
-        subs.iter().map(|&(a, b, fac)| fac * delta_m_arrival_sub(k, f, dt, t1t, m0, t, lo, hi, a, b)).sum()
+        subs.iter().map(|&(a, b, fac)| fac * delta_m_arrival_sub(k, f_ml_100g_min, att, t1t, m0, t, lo, hi, a, b)).sum()
     });
     match tau_ex {
         None => whole.into_iter().map(|w| ReadParts { iv: w, ev: 0.0 }).collect(),
         Some(te) => {
-            let t1x = t1pp(k, f, t1t, m0, te).map_or(0.0, |(_, _, x)| x);
+            let t1x = t1pp(k, f_ml_100g_min, t1t, m0, te).map_or(0.0, |(_, _, x)| x);
             let iv = read_all_component(e, &lp, delta, t1x, |t, lo, hi| {
                 subs.iter()
-                    .map(|&(a, b, fac)| fac * delta_m_arrival_iv_sub(k, f, dt, t1t, m0, t, lo, hi, a, b, te))
+                    .map(|&(a, b, fac)| fac * delta_m_arrival_iv_sub(k, f_ml_100g_min, att, t1t, m0, t, lo, hi, a, b, te))
                     .sum()
             });
             iv.into_iter().zip(whole).map(|(i, w)| ReadParts { iv: i, ev: w - i }).collect()
@@ -482,14 +483,14 @@ pub fn delta_m_read_all(
 
 /// The arterial read at excitation `e_n` before its `sin(a)` (P7 addendum, parts A and C):
 /// [`arterial_dm`] times `factor` (the crushing survival and the parcel's bolus-position factor,
-/// which the caller evaluates at the parcel `e_n - aATT`), times `cos(a_m)` of every earlier
-/// excitation in `[e_n - delta_a, e_n)`: the parcel entered the slab `delta_a = aATT - d` before
+/// which the caller evaluates at the parcel `e_n - ATT_arterial`), times `cos(a_m)` of every earlier
+/// excitation in `[e_n - delta_a, e_n)`: the parcel entered the slab `delta_a = ATT_arterial - d` before
 /// it is read. `delta_a = 0` is part A's fresh arterial blood.
 #[allow(clippy::too_many_arguments)]
 pub fn arterial_read(
-    k: &Kinetic, abv: f64, aatt: f64, m0: f64, e_n: f64, earlier: &[(f64, f64)], delta_a: f64, factor: f64,
+    k: &Kinetic, abv: f64, att_arterial: f64, m0: f64, e_n: f64, earlier: &[(f64, f64)], delta_a: f64, factor: f64,
 ) -> f64 {
-    let (v, _) = arterial_dm(k, abv, aatt, m0, e_n);
+    let (v, _) = arterial_dm(k, abv, att_arterial, m0, e_n);
     if v == 0.0 {
         return 0.0;
     }
@@ -514,12 +515,12 @@ mod tests {
         Kinetic { label_type: LabelType::Pasl, tau: 0.7, alpha: 0.98, lambda: 0.9, t1b: 1.65 };
     // GM in the ASLDRO 3T phantom.
     const F: f64 = 60.0;
-    const DT: f64 = 0.8;
+    const ATT: f64 = 0.8;
     const T1T: f64 = 1.33;
     const M0: f64 = 74.622;
 
-    fn t1_prime(f_ml: f64, t1t: f64, lambda: f64) -> f64 {
-        1.0 / (1.0 / t1t + (f_ml / 6000.0) / lambda)
+    fn t1_prime(f_ml_100g_min: f64, t1t: f64, lambda: f64) -> f64 {
+        1.0 / (1.0 / t1t + (f_ml_100g_min / 6000.0) / lambda)
     }
 
     fn close(a: f64, b: f64, rel: f64) -> bool {
@@ -528,9 +529,9 @@ mod tests {
 
     #[test]
     fn not_arrived_is_exactly_zero() {
-        for t in [0.5, DT, 0.0, -1.0] {
-            assert_eq!(delta_m(&K_PCASL, F, DT, T1T, M0, t), 0.0, "t = {t}");
-            assert_eq!(delta_m(&K_PASL, F, DT, T1T, M0, t), 0.0, "t = {t}");
+        for t in [0.5, ATT, 0.0, -1.0] {
+            assert_eq!(delta_m(&K_PCASL, F, ATT, T1T, M0, t), 0.0, "t = {t}");
+            assert_eq!(delta_m(&K_PASL, F, ATT, T1T, M0, t), 0.0, "t = {t}");
         }
     }
 
@@ -541,21 +542,21 @@ mod tests {
         let t1p = t1_prime(F, T1T, 0.9);
         let m0b = M0 / 0.9;
         let f = F / 6000.0;
-        let want = 2.0 * m0b * f * t1p * 0.85 * (-DT / 1.65).exp()
-            * (-(t - 1.8 - DT) / t1p).exp()
+        let want = 2.0 * m0b * f * t1p * 0.85 * (-ATT / 1.65).exp()
+            * (-(t - 1.8 - ATT) / t1p).exp()
             * (1.0 - (-1.8 / t1p).exp());
-        let got = delta_m(&K_PCASL, F, DT, T1T, M0, t);
+        let got = delta_m(&K_PCASL, F, ATT, T1T, M0, t);
         assert!(close(got, want, 1e-12), "{got} vs {want}");
         assert!(got > 0.0);
     }
 
     #[test]
     fn pcasl_arriving_at_the_bolus_midpoint() {
-        let t = DT + 0.9;
+        let t = ATT + 0.9;
         let t1p = t1_prime(F, T1T, 0.9);
-        let want = 2.0 * (M0 / 0.9) * (F / 6000.0) * t1p * 0.85 * (-DT / 1.65).exp()
-            * (1.0 - (-(t - DT) / t1p).exp());
-        assert!(close(delta_m(&K_PCASL, F, DT, T1T, M0, t), want, 1e-12));
+        let want = 2.0 * (M0 / 0.9) * (F / 6000.0) * t1p * 0.85 * (-ATT / 1.65).exp()
+            * (1.0 - (-(t - ATT) / t1p).exp());
+        assert!(close(delta_m(&K_PCASL, F, ATT, T1T, M0, t), want, 1e-12));
     }
 
     #[test]
@@ -564,23 +565,23 @@ mod tests {
         let kk = 1.0 / 1.65 - 1.0 / t1p;
         let m0b = M0 / 0.9;
         let f = F / 6000.0;
-        // arriving: dt < 1.2 < dt + 0.7
+        // arriving: att < 1.2 < att + 0.7
         let t = 1.2;
-        let q = (kk * t).exp() * ((-kk * DT).exp() - (-kk * t).exp()) / (kk * (t - DT));
-        let want = 2.0 * m0b * f * (t - DT) * 0.98 * (-t / 1.65).exp() * q;
-        assert!(close(delta_m(&K_PASL, F, DT, T1T, M0, t), want, 1e-12));
-        // arrived: 2.0 >= dt + 0.7
+        let q = (kk * t).exp() * ((-kk * ATT).exp() - (-kk * t).exp()) / (kk * (t - ATT));
+        let want = 2.0 * m0b * f * (t - ATT) * 0.98 * (-t / 1.65).exp() * q;
+        assert!(close(delta_m(&K_PASL, F, ATT, T1T, M0, t), want, 1e-12));
+        // arrived: 2.0 >= att + 0.7
         let t = 2.0;
-        let q = (kk * t).exp() * ((-kk * DT).exp() - (-kk * (DT + 0.7)).exp()) / (kk * 0.7);
+        let q = (kk * t).exp() * ((-kk * ATT).exp() - (-kk * (ATT + 0.7)).exp()) / (kk * 0.7);
         let want = 2.0 * m0b * f * 0.98 * 0.7 * (-t / 1.65).exp() * q;
-        assert!(close(delta_m(&K_PASL, F, DT, T1T, M0, t), want, 1e-12));
+        assert!(close(delta_m(&K_PASL, F, ATT, T1T, M0, t), want, 1e-12));
     }
 
     #[test]
     fn zero_perfusion_is_zero_everywhere() {
         for t in [0.5, 1.2, 2.0, 3.6, 10.0] {
-            assert_eq!(delta_m(&K_PCASL, 0.0, DT, T1T, M0, t), 0.0);
-            assert_eq!(delta_m(&K_PASL, 0.0, DT, T1T, M0, t), 0.0);
+            assert_eq!(delta_m(&K_PCASL, 0.0, ATT, T1T, M0, t), 0.0);
+            assert_eq!(delta_m(&K_PASL, 0.0, ATT, T1T, M0, t), 0.0);
         }
     }
 
@@ -590,9 +591,9 @@ mod tests {
         // (gkm_filter.py:205, :252), so this is 0, not the exp(0) = 1 a guarded division gives.
         let pc = Kinetic { t1b: 0.0, ..K_PCASL };
         let pa = Kinetic { t1b: 0.0, ..K_PASL };
-        assert_eq!(delta_m(&pc, F, DT, T1T, M0, 3.6), 0.0);
-        assert_eq!(delta_m(&pa, F, DT, T1T, M0, 2.0), 0.0);
-        assert_eq!(delta_m(&pa, F, DT, T1T, M0, 1.2), 0.0);
+        assert_eq!(delta_m(&pc, F, ATT, T1T, M0, 3.6), 0.0);
+        assert_eq!(delta_m(&pa, F, ATT, T1T, M0, 2.0), 0.0);
+        assert_eq!(delta_m(&pa, F, ATT, T1T, M0, 1.2), 0.0);
     }
 
     #[test]
@@ -604,14 +605,14 @@ mod tests {
         let k = Kinetic { t1b: 1.0 / (1.0 / t1p), ..K_PASL };
         let kk = 1.0 / k.t1b - 1.0 / t1p;
         assert_eq!(kk, 0.0, "the test premise: k must be exactly zero");
-        assert_eq!(delta_m(&k, F, DT, T1T, M0, 1.2), 0.0);
-        assert_eq!(delta_m(&k, F, DT, T1T, M0, 2.0), 0.0);
+        assert_eq!(delta_m(&k, F, ATT, T1T, M0, 1.2), 0.0);
+        assert_eq!(delta_m(&k, F, ATT, T1T, M0, 2.0), 0.0);
         // and the intravascular part follows the whole: zero, not a positive part of a zero
         // (final review: 0.00098 at exchange_time 0.5, every sub-bolus too)
         for tau_ex in [0.5, 3.0] {
             for t in [1.2, 2.0] {
-                assert_eq!(delta_m_iv(&k, F, DT, T1T, M0, t, tau_ex), 0.0, "tau_ex {tau_ex} t {t}");
-                assert_eq!(delta_m_iv_sub(&k, F, DT, T1T, M0, t, 0.1, 0.4, tau_ex), 0.0);
+                assert_eq!(delta_m_iv(&k, F, ATT, T1T, M0, t, tau_ex), 0.0, "tau_ex {tau_ex} t {t}");
+                assert_eq!(delta_m_iv_sub(&k, F, ATT, T1T, M0, t, 0.1, 0.4, tau_ex), 0.0);
             }
         }
     }
@@ -624,20 +625,20 @@ mod tests {
         // for the whole and every sub-bolus, a few ULPs and a little further either side.
         let (t1t, m0, t1b0) = (3.0, 1.0, 2.9032258064516134);
         let k0 = Kinetic { label_type: LabelType::Pasl, tau: 0.7, alpha: 0.85, lambda: 0.9, t1b: t1b0 };
-        assert_eq!(delta_m(&k0, F, DT, t1t, m0, 2.0), 0.0, "the test premise: the whole cancels to zero");
-        assert_eq!(delta_m_iv(&k0, F, DT, t1t, m0, 2.0, 0.5), 0.0);
+        assert_eq!(delta_m(&k0, F, ATT, t1t, m0, 2.0), 0.0, "the test premise: the whole cancels to zero");
+        assert_eq!(delta_m_iv(&k0, F, ATT, t1t, m0, 2.0, 0.5), 0.0);
         let mut steps: Vec<f64> = (-20..=20).map(|j| j as f64).collect();
         steps.extend([-1e6, -1e3, 1e3, 1e6]);
         for s in steps {
             let k = Kinetic { t1b: f64::from_bits((t1b0.to_bits() as i64 + s as i64) as u64), ..k0 };
             for tau_ex in [0.05, 0.5, 3.0] {
                 for t in [1.0, 1.4, 2.0, 3.0] {
-                    let dm = delta_m(&k, F, DT, t1t, m0, t);
-                    let iv = delta_m_iv(&k, F, DT, t1t, m0, t, tau_ex);
+                    let dm = delta_m(&k, F, ATT, t1t, m0, t);
+                    let iv = delta_m_iv(&k, F, ATT, t1t, m0, t, tau_ex);
                     assert!(iv >= 0.0 && iv <= dm.max(0.0), "t1b {} tau_ex {tau_ex} t {t}: iv {iv} dm {dm}", k.t1b);
                     for (a, b) in [(0.0, 0.3), (0.3, 0.7), (0.1, 0.4)] {
-                        let dm = delta_m_sub(&k, F, DT, t1t, m0, t, a, b);
-                        let iv = delta_m_iv_sub(&k, F, DT, t1t, m0, t, a, b, tau_ex);
+                        let dm = delta_m_sub(&k, F, ATT, t1t, m0, t, a, b);
+                        let iv = delta_m_iv_sub(&k, F, ATT, t1t, m0, t, a, b, tau_ex);
                         assert!(iv >= 0.0 && iv <= dm.max(0.0), "sub {a}..{b} t {t}: iv {iv} dm {dm}");
                     }
                 }
@@ -648,17 +649,17 @@ mod tests {
     #[test]
     fn zero_tissue_t1_with_zero_flow_gives_zero_not_nan() {
         // t1p becomes 0 (guarded 1/0), every /t1p is guarded to 0, exp(-0) = 1, q = 0.
-        let got = delta_m(&K_PCASL, 0.0, DT, 0.0, M0, 3.6);
+        let got = delta_m(&K_PCASL, 0.0, ATT, 0.0, M0, 3.6);
         assert_eq!(got, 0.0);
-        assert!(!delta_m(&K_PCASL, F, DT, 0.0, M0, 3.6).is_nan());
+        assert!(!delta_m(&K_PCASL, F, ATT, 0.0, M0, 3.6).is_nan());
     }
 
     /// Fixture cases from simasl's GkmFilter (tools/gen_gkm_fixtures.py). Plain text, pure std.
     struct Case {
         k: Kinetic,
         t: f64,
-        f: Vec<f64>,
-        dt: Vec<f64>,
+        f_ml_100g_min: Vec<f64>,
+        att: Vec<f64>,
         t1t: Vec<f64>,
         m0: Vec<f64>,
         want: Vec<f64>,
@@ -690,12 +691,12 @@ mod tests {
                 assert!(l.starts_with(name), "expected {name}, got {l}");
                 floats(l)
             };
-            let f = take("perfusion_rate");
-            let dt = take("transit_time");
+            let f_ml_100g_min = take("perfusion_rate");
+            let att = take("transit_time");
             let t1t = take("t1_tissue");
             let m0 = take("m0");
             let want = take("delta_m");
-            cases.push(Case { k, t, f, dt, t1t, m0, want });
+            cases.push(Case { k, t, f_ml_100g_min, att, t1t, m0, want });
         }
         cases
     }
@@ -708,7 +709,7 @@ mod tests {
         assert!(cases.len() >= 8, "too few cases: {}", cases.len());
         for (ci, c) in cases.iter().enumerate() {
             for i in 0..c.want.len() {
-                let got = delta_m(&c.k, c.f[i], c.dt[i], c.t1t[i], c.m0[i], c.t);
+                let got = delta_m(&c.k, c.f_ml_100g_min[i], c.att[i], c.t1t[i], c.m0[i], c.t);
                 let want = c.want[i];
                 if want == 0.0 {
                     assert_eq!(got, 0.0, "case {ci} voxel {i}: expected an exact zero, got {got:e}");
@@ -725,7 +726,7 @@ mod tests {
     // ------------------------------------------------------------------ P4
 
     /// `delta_m` exactly as it was before the P4 refactor (`p2-complete`): the bit-identity reference.
-    fn delta_m_ref(k: &Kinetic, f_ml_100g_min: f64, dt: f64, t1t: f64, m0: f64, t: f64) -> f64 {
+    fn delta_m_ref(k: &Kinetic, f_ml_100g_min: f64, att: f64, t1t: f64, m0: f64, t: f64) -> f64 {
         let f = f_ml_100g_min / 6000.0;
         // M0b and f/lambda, with simasl's scalar guard on lambda (gkm_filter.py:135-147).
         let (m0b, flow_over_lambda) =
@@ -736,8 +737,8 @@ mod tests {
 
         // Delivery state. simasl builds three masks and writes the arriving and arrived results
         // into a zero-initialised array; the not-arrived mask only ever writes zero.
-        let arriving = dt < t && t < dt + k.tau;
-        let arrived = t >= dt + k.tau;
+        let arriving = att < t && t < att + k.tau;
+        let arrived = t >= att + k.tau;
         if !(arriving || arrived) {
             return 0.0;
         }
@@ -751,25 +752,25 @@ mod tests {
                 let decay = if k.t1b > 0.0 { (-t / k.t1b).exp() } else { 0.0 };
                 if arriving {
                     // q_pasl_arriving, numerator and denominator computed separately so that
-                    // t == dt cannot divide by zero (it is masked out anyway) (gkm_filter.py:173-185).
-                    let num = (kk * t).exp() * ((-kk * dt).exp() - (-kk * t).exp());
-                    let q = div0(num, kk * (t - dt));
-                    2.0 * m0b * f * (t - dt) * k.alpha * decay * q
+                    // t == att cannot divide by zero (it is masked out anyway) (gkm_filter.py:173-185).
+                    let num = (kk * t).exp() * ((-kk * att).exp() - (-kk * t).exp());
+                    let q = div0(num, kk * (t - att));
+                    2.0 * m0b * f * (t - att) * k.alpha * decay * q
                 } else {
-                    let num = (kk * t).exp() * ((-kk * dt).exp() - (-kk * (dt + k.tau)).exp());
+                    let num = (kk * t).exp() * ((-kk * att).exp() - (-kk * (att + k.tau)).exp());
                     let q = div0(num, kk * k.tau);
                     2.0 * m0b * f * k.alpha * k.tau * decay * q
                 }
             }
             LabelType::Casl | LabelType::Pcasl => {
                 // Here the T1b test is `!= 0`, not `> 0` (gkm_filter.py:252, :265).
-                let decay = if k.t1b != 0.0 { (-dt / k.t1b).exp() } else { 0.0 };
+                let decay = if k.t1b != 0.0 { (-att / k.t1b).exp() } else { 0.0 };
                 if arriving {
-                    let q = 1.0 - (-div0(t - dt, t1p)).exp();
+                    let q = 1.0 - (-div0(t - att, t1p)).exp();
                     2.0 * m0b * f * t1p * k.alpha * decay * q
                 } else {
                     let q = 1.0 - (-div0(k.tau, t1p)).exp();
-                    2.0 * m0b * f * t1p * k.alpha * decay * (-div0(t - k.tau - dt, t1p)).exp() * q
+                    2.0 * m0b * f * t1p * k.alpha * decay * (-div0(t - k.tau - att, t1p)).exp() * q
                 }
             }
         }
@@ -791,11 +792,11 @@ mod tests {
     fn delta_m_keeps_its_bits_after_the_refactor() {
         let mut n = 0;
         for k in kinds() {
-            for &(f, dt, t1t, m0) in &KS {
+            for &(f_ml_100g_min, att, t1t, m0) in &KS {
                 for i in 0..=6000 {
                     let t = i as f64 * 1e-3;
-                    let (a, b) = (delta_m(&k, f, dt, t1t, m0, t), delta_m_ref(&k, f, dt, t1t, m0, t));
-                    assert_eq!(a.to_bits(), b.to_bits(), "{k:?} f {f} dt {dt} t {t}: {a:e} vs {b:e}");
+                    let (a, b) = (delta_m(&k, f_ml_100g_min, att, t1t, m0, t), delta_m_ref(&k, f_ml_100g_min, att, t1t, m0, t));
+                    assert_eq!(a.to_bits(), b.to_bits(), "{k:?} f_ml_100g_min {f_ml_100g_min} att {att} t {t}: {a:e} vs {b:e}");
                     n += 1;
                 }
             }
@@ -838,27 +839,27 @@ mod tests {
     fn sub_boluses_sum_to_the_whole_bolus() {
         let mut worst = 0.0f64;
         for k in [K_PCASL, K_PASL, Kinetic { label_type: LabelType::Casl, ..K_PCASL }] {
-            for &(f, dt, t1t, m0) in &KS[..2] {
-                let peak = (0..=6000).map(|i| delta_m(&k, f, dt, t1t, m0, i as f64 * 1e-3).abs()).fold(0.0f64, f64::max);
+            for &(f_ml_100g_min, att, t1t, m0) in &KS[..2] {
+                let peak = (0..=6000).map(|i| delta_m(&k, f_ml_100g_min, att, t1t, m0, i as f64 * 1e-3).abs()).fold(0.0f64, f64::max);
                 let mut times: Vec<f64> = (0..=600).map(|i| i as f64 * 1e-2).collect();
-                for e in [dt, dt + k.tau] {
+                for e in [att, att + k.tau] {
                     times.extend(around(e));
                 }
                 for (pi, &t) in times.iter().enumerate() {
                     // cuts at the representable neighbours of the delivery edges in the
                     // sub-bolus coordinate, as well as random ones
-                    let edge = t - dt;
+                    let edge = t - att;
                     let extra: Vec<f64> = around(edge).iter().chain(around(edge - k.tau).iter()).copied().collect();
                     let cuts = partition(pi as u64 + 17, k.tau, &extra);
-                    let sum: f64 = cuts.windows(2).map(|w| delta_m_sub(&k, f, dt, t1t, m0, t, w[0], w[1])).sum();
-                    let whole = delta_m(&k, f, dt, t1t, m0, t);
-                    if t <= dt {
+                    let sum: f64 = cuts.windows(2).map(|w| delta_m_sub(&k, f_ml_100g_min, att, t1t, m0, t, w[0], w[1])).sum();
+                    let whole = delta_m(&k, f_ml_100g_min, att, t1t, m0, t);
+                    if t <= att {
                         assert_eq!(whole, 0.0);
                         assert_eq!(sum, 0.0, "{k:?} t {t}: not arrived must stay an exact zero");
                     }
                     let e = (sum - whole).abs() / peak;
                     worst = worst.max(e);
-                    assert!(e <= 1e-12, "{k:?} f {f} t {t}: {sum:e} vs {whole:e} ({e:e} of peak)");
+                    assert!(e <= 1e-12, "{k:?} f_ml_100g_min {f_ml_100g_min} t {t}: {sum:e} vs {whole:e} ({e:e} of peak)");
                 }
             }
         }
@@ -876,17 +877,17 @@ mod tests {
     fn intravascular_part_is_partition_invariant_and_bounded() {
         for k in [K_PCASL, K_PASL] {
             for tau_ex in [0.05, 0.5, 3.0] {
-                let peak = (0..=600).map(|i| delta_m(&k, F, DT, T1T, M0, i as f64 * 1e-2)).fold(0.0f64, f64::max);
+                let peak = (0..=600).map(|i| delta_m(&k, F, ATT, T1T, M0, i as f64 * 1e-2)).fold(0.0f64, f64::max);
                 for i in 0..=600 {
                     let t = i as f64 * 1e-2;
-                    let dm = delta_m(&k, F, DT, T1T, M0, t);
-                    let iv = delta_m_iv(&k, F, DT, T1T, M0, t, tau_ex);
+                    let dm = delta_m(&k, F, ATT, T1T, M0, t);
+                    let iv = delta_m_iv(&k, F, ATT, T1T, M0, t, tau_ex);
                     assert!(iv.is_finite() && iv >= 0.0 && iv <= dm * (1.0 + 1e-12),
                             "{k:?} tau_ex {tau_ex} t {t}: iv {iv} dm {dm}");
                     let cuts = partition(i as u64 + 5, k.tau, &[]);
-                    let sum: f64 = cuts.windows(2).map(|w| delta_m_iv_sub(&k, F, DT, T1T, M0, t, w[0], w[1], tau_ex)).sum();
+                    let sum: f64 = cuts.windows(2).map(|w| delta_m_iv_sub(&k, F, ATT, T1T, M0, t, w[0], w[1], tau_ex)).sum();
                     assert!((sum - iv).abs() <= 1e-12 * peak, "{k:?} tau_ex {tau_ex} t {t}: {sum:e} vs {iv:e}");
-                    if t <= DT {
+                    if t <= ATT {
                         assert_eq!(iv, 0.0);
                     }
                 }
@@ -899,20 +900,20 @@ mod tests {
         for k in [K_PCASL, K_PASL] {
             // slow exchange: everything stays intravascular
             for t in [1.0, 1.4, 2.0, 3.6] {
-                let dm = delta_m(&k, F, DT, T1T, M0, t);
-                let iv = delta_m_iv(&k, F, DT, T1T, M0, t, 1e9);
+                let dm = delta_m(&k, F, ATT, T1T, M0, t);
+                let iv = delta_m_iv(&k, F, ATT, T1T, M0, t, 1e9);
                 assert!((iv - dm).abs() <= 1e-8 * dm, "{k:?} t {t}: {iv} vs {dm}");
             }
             // fast exchange: just-arrived label has not exchanged yet; a second later it has
-            let t = DT + 1e-7;
-            let share = delta_m_iv(&k, F, DT, T1T, M0, t, 1e-6) / delta_m(&k, F, DT, T1T, M0, t);
+            let t = ATT + 1e-7;
+            let share = delta_m_iv(&k, F, ATT, T1T, M0, t, 1e-6) / delta_m(&k, F, ATT, T1T, M0, t);
             assert!((share - 0.95).abs() < 0.01, "{k:?}: share {share} at ATT + 1e-7");
             // both delivery branches at tau_ex = 1e-6 are finite (the shared PASL form gives NaN)
-            for t in [DT + 0.3, DT + k.tau + 0.5, DT + 1.0] {
-                let iv = delta_m_iv(&k, F, DT, T1T, M0, t, 1e-6);
-                let dm = delta_m(&k, F, DT, T1T, M0, t);
+            for t in [ATT + 0.3, ATT + k.tau + 0.5, ATT + 1.0] {
+                let iv = delta_m_iv(&k, F, ATT, T1T, M0, t, 1e-6);
+                let dm = delta_m(&k, F, ATT, T1T, M0, t);
                 assert!(iv.is_finite(), "{k:?} t {t}: {iv}");
-                if t >= DT + 1.0 {
+                if t >= ATT + 1.0 {
                     assert!(iv / dm < 2e-6, "{k:?} t {t}: share {}", iv / dm);
                 }
             }
@@ -920,7 +921,7 @@ mod tests {
         // the PASL shared form really is the trap the stable form avoids
         let t1p = t1_prime(F, T1T, 0.9);
         let t1pp = 1.0 / (1.0 / t1p + 1e6);
-        assert!(delta_m_with_t1p(&K_PASL, F, DT, t1pp, M0, DT + 1e-7).is_nan());
+        assert!(delta_m_with_t1p(&K_PASL, F, ATT, t1pp, M0, ATT + 1e-7).is_nan());
     }
 
     #[test]
@@ -930,14 +931,14 @@ mod tests {
             let t1pp = 1.0 / (1.0 / t1p + 1.0 / tau_ex);
             for i in 0..=400 {
                 let t = i as f64 * 1e-2;
-                let a = delta_m_iv(&K_PASL, F, DT, T1T, M0, t, tau_ex);
-                let b = delta_m_with_t1p(&K_PASL, F, DT, t1pp, M0, t);
+                let a = delta_m_iv(&K_PASL, F, ATT, T1T, M0, t, tau_ex);
+                let b = delta_m_with_t1p(&K_PASL, F, ATT, t1pp, M0, t);
                 assert!(a == b || (a - b).abs() <= 1e-12 * b.abs(), "t {t}: {a:e} vs {b:e}");
             }
         }
         // and delta_m_with_t1p at the GKM's own T1' is delta_m
         for t in [1.2, 2.0, 3.6] {
-            assert_eq!(delta_m_with_t1p(&K_PCASL, F, DT, t1p, M0, t).to_bits(), delta_m(&K_PCASL, F, DT, T1T, M0, t).to_bits());
+            assert_eq!(delta_m_with_t1p(&K_PCASL, F, ATT, t1p, M0, t).to_bits(), delta_m(&K_PCASL, F, ATT, T1T, M0, t).to_bits());
         }
     }
 
@@ -949,23 +950,23 @@ mod tests {
         let (t1t, m0, t) = (3.0, 1.0, 2.0);
         let t1p = t1_prime(F, t1t, 0.9);
         let tau_star = 1.0 / (1.0 / K_PASL.t1b - 1.0 / t1p);
-        let dm = delta_m(&K_PASL, F, DT, t1t, m0, t);
-        let iv = delta_m_iv(&K_PASL, F, DT, t1t, m0, t, 3.8223938223938227);
+        let dm = delta_m(&K_PASL, F, ATT, t1t, m0, t);
+        let iv = delta_m_iv(&K_PASL, F, ATT, t1t, m0, t, 3.8223938223938227);
         assert!((iv - 0.004536224).abs() < 1e-8, "{iv} (delta_m {dm})");
         // the limit kk -> 0: q -> 1, so iv -> 2 M0b f alpha tau exp(-t/T1b)
         let limit = 2.0 * (m0 / 0.9) * (F / 6000.0) * K_PASL.alpha * K_PASL.tau * (-t / K_PASL.t1b).exp();
-        let near = delta_m_iv(&K_PASL, F, DT, t1t, m0, t, tau_star * (1.0 + 1e-13));
+        let near = delta_m_iv(&K_PASL, F, ATT, t1t, m0, t, tau_star * (1.0 + 1e-13));
         assert!((near - limit).abs() <= 1e-9 * limit, "{near} vs {limit}");
         // across the crossing, in both branches: bounded, and nondecreasing in tau_ex (slower
         // exchange keeps more label intravascular), which cancellation noise would break. A kk
         // of exactly zero takes the GKM's quotient guard (zero, which the spec keeps for every
         // P4 formula); it is skipped, and can happen at most once in the sweep.
-        for t in [DT + 0.3, t, 3.0] {
-            let dm = delta_m(&K_PASL, F, DT, t1t, m0, t);
+        for t in [ATT + 0.3, t, 3.0] {
+            let dm = delta_m(&K_PASL, F, ATT, t1t, m0, t);
             let (mut prev, mut zeros) = (0.0f64, 0);
             for j in -200..=200 {
                 let tau_ex = tau_star * (1.0 + j as f64 * 1e-12);
-                let iv = delta_m_iv(&K_PASL, F, DT, t1t, m0, t, tau_ex);
+                let iv = delta_m_iv(&K_PASL, F, ATT, t1t, m0, t, tau_ex);
                 assert!(iv >= 0.0 && iv <= dm * (1.0 + 1e-12), "t {t} tau_ex {tau_ex}: iv {iv} dm {dm}");
                 if iv == 0.0 {
                     zeros += 1;
@@ -983,38 +984,38 @@ mod tests {
         for k in [Kinetic { lambda: 0.0, ..K_PCASL }, Kinetic { lambda: 0.0, ..K_PASL }, Kinetic { t1b: 0.0, ..K_PCASL },
                   Kinetic { t1b: 0.0, ..K_PASL }, Kinetic { t1b: -1.0, ..K_PASL }] {
             for t in [1.2, 2.0, 3.6] {
-                assert_eq!(delta_m(&k, F, DT, T1T, M0, t), 0.0);
-                assert_eq!(delta_m_iv(&k, F, DT, T1T, M0, t, 0.5), 0.0, "{k:?} t {t}");
+                assert_eq!(delta_m(&k, F, ATT, T1T, M0, t), 0.0);
+                assert_eq!(delta_m_iv(&k, F, ATT, T1T, M0, t, 0.5), 0.0, "{k:?} t {t}");
             }
         }
         // zero flow and zero tissue T1: T1' is the guarded zero
-        assert_eq!(delta_m_iv(&K_PCASL, 0.0, DT, 0.0, M0, 3.6, 0.5), 0.0);
+        assert_eq!(delta_m_iv(&K_PCASL, 0.0, ATT, 0.0, M0, 3.6, 0.5), 0.0);
     }
 
     #[test]
     fn arterial_term_follows_its_closed_forms() {
-        let (abv, aatt) = (0.02, 0.5);
+        let (abv, att_arterial) = (0.02, 0.5);
         for t in [0.5, 1.0, 2.29] {
-            let (v, a) = arterial_dm(&K_PCASL, abv, aatt, M0, t);
-            let want = 2.0 * 0.85 * (M0 / 0.9) * abv * (-aatt / 1.65f64).exp();
+            let (v, a) = arterial_dm(&K_PCASL, abv, att_arterial, M0, t);
+            let want = 2.0 * 0.85 * (M0 / 0.9) * abv * (-att_arterial / 1.65f64).exp();
             assert!(close(v, want, 1e-14), "t {t}");
-            assert_eq!(a, Some(t - aatt));
+            assert_eq!(a, Some(t - att_arterial));
         }
         for t in [0.5, 0.9, 1.19] {
-            let (v, a) = arterial_dm(&K_PASL, abv, aatt, M0, t);
+            let (v, a) = arterial_dm(&K_PASL, abv, att_arterial, M0, t);
             let want = 2.0 * 0.98 * (M0 / 0.9) * abv * (-t / 1.65f64).exp();
             assert!(close(v, want, 1e-14), "t {t}");
-            assert_eq!(a, Some(t - aatt));
+            assert_eq!(a, Some(t - att_arterial));
         }
-        // the window: [aatt, aatt + tau)
-        assert_eq!(arterial_dm(&K_PCASL, abv, aatt, M0, aatt - 1e-12), (0.0, None));
-        assert_eq!(arterial_dm(&K_PCASL, abv, aatt, M0, aatt + 1.8), (0.0, None));
-        assert!(arterial_dm(&K_PCASL, abv, aatt, M0, aatt).0 > 0.0);
+        // the window: [att_arterial, att_arterial + tau)
+        assert_eq!(arterial_dm(&K_PCASL, abv, att_arterial, M0, att_arterial - 1e-12), (0.0, None));
+        assert_eq!(arterial_dm(&K_PCASL, abv, att_arterial, M0, att_arterial + 1.8), (0.0, None));
+        assert!(arterial_dm(&K_PCASL, abv, att_arterial, M0, att_arterial).0 > 0.0);
         // guards
-        assert_eq!(arterial_dm(&Kinetic { lambda: 0.0, ..K_PCASL }, abv, aatt, M0, 1.0).0, 0.0);
-        assert_eq!(arterial_dm(&Kinetic { t1b: 0.0, ..K_PCASL }, abv, aatt, M0, 1.0).0, 0.0);
-        assert_eq!(arterial_dm(&Kinetic { t1b: -1.0, ..K_PASL }, abv, aatt, M0, 1.0).0, 0.0);
-        assert!(arterial_dm(&Kinetic { t1b: -1.0, ..K_PCASL }, abv, aatt, M0, 1.0).0 > 0.0,
+        assert_eq!(arterial_dm(&Kinetic { lambda: 0.0, ..K_PCASL }, abv, att_arterial, M0, 1.0).0, 0.0);
+        assert_eq!(arterial_dm(&Kinetic { t1b: 0.0, ..K_PCASL }, abv, att_arterial, M0, 1.0).0, 0.0);
+        assert_eq!(arterial_dm(&Kinetic { t1b: -1.0, ..K_PASL }, abv, att_arterial, M0, 1.0).0, 0.0);
+        assert!(arterial_dm(&Kinetic { t1b: -1.0, ..K_PCASL }, abv, att_arterial, M0, 1.0).0 > 0.0,
                 "(P)CASL tests != 0, as the GKM does");
     }
 
@@ -1025,16 +1026,16 @@ mod tests {
     #[test]
     fn arrival_windows_partition_the_gkm() {
         for k in [K_PCASL, K_PASL] {
-            for &(f, dt, t1t, m0) in &[(F, DT, T1T, M0), (20.0, 1.4, 0.83, 60.0), (60.0, 0.1, 1.33, 74.6)] {
+            for &(f_ml_100g_min, att, t1t, m0) in &[(F, ATT, T1T, M0), (20.0, 1.4, 0.83, 60.0), (60.0, 0.1, 1.33, 74.6)] {
                 for t in [0.5, 0.9, 1.2, 1.9, 2.6, 3.4, 4.5] {
-                    let whole = delta_m(&k, f, dt, t1t, m0, t);
+                    let whole = delta_m(&k, f_ml_100g_min, att, t1t, m0, t);
                     for cuts in [vec![0.6], vec![0.3, 0.95, 1.7], vec![0.2, 0.4, 0.8, 1.1, 1.5, 2.1, 2.9]] {
                         let mut edges = vec![0.0];
                         edges.extend(cuts.iter().copied().filter(|&c| c < t));
                         edges.push(t);
-                        let sum: f64 = edges.windows(2).map(|w| delta_m_arrival(&k, f, dt, t1t, m0, t, w[0], w[1])).sum();
+                        let sum: f64 = edges.windows(2).map(|w| delta_m_arrival(&k, f_ml_100g_min, att, t1t, m0, t, w[0], w[1])).sum();
                         assert!((sum - whole).abs() <= 1e-12 * whole.abs().max(1e-300) + 1e-15,
-                                "{:?} t {t} dt {dt} cuts {cuts:?}: {sum} vs {whole}", k.label_type);
+                                "{:?} t {t} att {att} cuts {cuts:?}: {sum} vs {whole}", k.label_type);
                     }
                 }
             }
@@ -1046,21 +1047,21 @@ mod tests {
     #[test]
     fn arrival_windows_match_quadrature() {
         for k in [K_PCASL, K_PASL] {
-            let (f, dt, t1t, m0) = (F, DT, T1T, M0);
-            let (fs, m0b, t1p) = gkm_constants(&k, f, t1t, m0);
+            let (f_ml_100g_min, att, t1t, m0) = (F, ATT, T1T, M0);
+            let (fs, m0b, t1p) = gkm_constants(&k, f_ml_100g_min, t1t, m0);
             let rate = |u: f64| -> f64 {
-                if u < dt || u > dt + k.tau {
+                if u < att || u > att + k.tau {
                     return 0.0;
                 }
                 let decay = match k.label_type {
                     LabelType::Pasl => (-u / k.t1b).exp(),
-                    _ => (-dt / k.t1b).exp(),
+                    _ => (-att / k.t1b).exp(),
                 };
                 2.0 * k.alpha * m0b * fs * decay
             };
             for (t, u1, u2) in [(2.0f64, 0.0f64, 1.0f64), (2.0, 0.9, 1.3), (3.0, 1.1, 2.6), (2.4, 1.6, 2.4), (1.0, 0.5, 0.9)] {
                 let n = 200_000;
-                let (lo, hi) = (u1.max(dt), u2.min(dt + k.tau).min(t));
+                let (lo, hi) = (u1.max(att), u2.min(att + k.tau).min(t));
                 let quad = if hi > lo {
                     let h = (hi - lo) / n as f64;
                     (0..n).map(|i| {
@@ -1070,7 +1071,7 @@ mod tests {
                 } else {
                     0.0
                 };
-                let got = delta_m_arrival(&k, f, dt, t1t, m0, t, u1, u2);
+                let got = delta_m_arrival(&k, f_ml_100g_min, att, t1t, m0, t, u1, u2);
                 assert!((got - quad).abs() <= 1e-10 * quad.abs().max(1e-12) + 1e-14, "{:?} {t} [{u1}, {u2}): {got} vs {quad}", k.label_type);
             }
         }
@@ -1080,16 +1081,16 @@ mod tests {
     /// delta_m is; no label before the arrival; T1b = 0 zeroes the PASL delivery.
     #[test]
     fn arrival_windows_keep_the_gkm_guards() {
-        let (f, t1t, m0) = (F, T1T, M0);
-        let (_, _, t1p) = gkm_constants(&K_PASL, f, t1t, m0);
+        let (f_ml_100g_min, t1t, m0) = (F, T1T, M0);
+        let (_, _, t1p) = gkm_constants(&K_PASL, f_ml_100g_min, t1t, m0);
         let k = Kinetic { t1b: t1p, ..K_PASL };
-        assert_eq!(delta_m(&k, f, DT, t1t, m0, 1.2), 0.0);
-        assert_eq!(delta_m_arrival(&k, f, DT, t1t, m0, 1.2, 0.0, 1.2), 0.0);
-        assert_eq!(delta_m_arrival(&K_PCASL, f, DT, t1t, m0, 2.0, 0.0, DT), 0.0);
-        assert_eq!(delta_m_arrival(&K_PCASL, f, DT, t1t, m0, 0.5, 0.0, 0.5), 0.0);
+        assert_eq!(delta_m(&k, f_ml_100g_min, ATT, t1t, m0, 1.2), 0.0);
+        assert_eq!(delta_m_arrival(&k, f_ml_100g_min, ATT, t1t, m0, 1.2, 0.0, 1.2), 0.0);
+        assert_eq!(delta_m_arrival(&K_PCASL, f_ml_100g_min, ATT, t1t, m0, 2.0, 0.0, ATT), 0.0);
+        assert_eq!(delta_m_arrival(&K_PCASL, f_ml_100g_min, ATT, t1t, m0, 0.5, 0.0, 0.5), 0.0);
         let k0 = Kinetic { t1b: 0.0, ..K_PASL };
-        assert_eq!(delta_m_arrival(&k0, f, DT, t1t, m0, 1.2, 0.0, 1.2), 0.0);
-        assert!(delta_m_arrival(&K_PASL, f, DT, t1t, m0, 1.2, 0.0, 1.2) > 0.0);
+        assert_eq!(delta_m_arrival(&k0, f_ml_100g_min, ATT, t1t, m0, 1.2, 0.0, 1.2), 0.0);
+        assert!(delta_m_arrival(&K_PASL, f_ml_100g_min, ATT, t1t, m0, 1.2, 0.0, 1.2) > 0.0);
     }
 
     /// The depleted read against a brute-force count: the label arriving in a small interval
@@ -1098,12 +1099,12 @@ mod tests {
     #[test]
     fn the_read_is_the_label_depleted_by_the_later_readouts() {
         for k in [K_PCASL, K_PASL] {
-            for (dt, offset) in [(DT, 0.0), (1.05, 0.2), (0.3, 0.1)] {
+            for (att, offset) in [(ATT, 0.0), (1.05, 0.2), (0.3, 0.1)] {
                 let t_n: Vec<f64> = (0..8).map(|n| 0.9 + 0.3 * n as f64).collect();
                 let e: Vec<f64> = t_n.iter().map(|t| t + offset).collect();
                 let flips: Vec<f64> = (0..8).map(|n| 25.0 + 5.0 * n as f64).collect();
                 for n in 1..=8 {
-                    let got = delta_m_read(&k, F, dt, T1T, M0, &e[..n], &flips[..n - 1]);
+                    let got = delta_m_read(&k, F, att, T1T, M0, &e[..n], &flips[..n - 1]);
                     let t = e[n - 1];
                     let steps = 20_000;
                     let h = t / steps as f64;
@@ -1111,13 +1112,13 @@ mod tests {
                         let (u0, u1) = (i as f64 * h, (i + 1) as f64 * h);
                         let u = 0.5 * (u0 + u1);
                         let w: f64 = (0..n - 1).filter(|&m| e[m] > u).map(|m| flips[m].to_radians().cos()).product();
-                        w * delta_m_arrival(&k, F, dt, T1T, M0, t, u0, u1)
+                        w * delta_m_arrival(&k, F, att, T1T, M0, t, u0, u1)
                     }).sum();
                     // the midpoint weight is exact except in the steps that straddle an excitation
-                    assert!((got - brute).abs() <= 2e-4 * brute.abs().max(1e-9), "{:?} dt {dt} offset {offset} n {n}: {got} vs {brute}", k.label_type);
+                    assert!((got - brute).abs() <= 2e-4 * brute.abs().max(1e-9), "{:?} att {att} offset {offset} n {n}: {got} vs {brute}", k.label_type);
                     // with no earlier readouts (or zero flips) it is the undepleted delta_m
-                    let zero = delta_m_read(&k, F, dt, T1T, M0, &e[..n], &vec![0.0; n - 1]);
-                    let whole = delta_m(&k, F, dt, T1T, M0, t);
+                    let zero = delta_m_read(&k, F, att, T1T, M0, &e[..n], &vec![0.0; n - 1]);
+                    let whole = delta_m(&k, F, att, T1T, M0, t);
                     assert!((zero - whole).abs() <= 1e-12 * whole.abs().max(1e-300));
                 }
             }
@@ -1145,8 +1146,8 @@ mod tests {
         for k in [K_PCASL, K_PASL] {
             for t in [1.0, 1.6, 2.5, 3.6, 5.0] {
                 for w in edges(t).windows(2) {
-                    let whole = delta_m_arrival(&k, F, DT, T1T, M0, t, w[0], w[1]);
-                    let iv = delta_m_arrival_iv(&k, F, DT, T1T, M0, t, w[0], w[1], 1e15);
+                    let whole = delta_m_arrival(&k, F, ATT, T1T, M0, t, w[0], w[1]);
+                    let iv = delta_m_arrival_iv(&k, F, ATT, T1T, M0, t, w[0], w[1], 1e15);
                     assert!(rel_close(iv, whole, 1e-12), "{:?} t {t} {w:?}: {iv} vs {whole}", k.label_type);
                 }
             }
@@ -1161,8 +1162,8 @@ mod tests {
             for tau_ex in [0.5, 1.5, 0.001] {
                 for t in [1.0, 1.4, 2.5, 3.6, 5.0] {
                     let sum: f64 = edges(t).windows(2)
-                        .map(|w| delta_m_arrival_iv(&k, F, DT, T1T, M0, t, w[0], w[1], tau_ex)).sum();
-                    let want = delta_m_iv(&k, F, DT, T1T, M0, t, tau_ex);
+                        .map(|w| delta_m_arrival_iv(&k, F, ATT, T1T, M0, t, w[0], w[1], tau_ex)).sum();
+                    let want = delta_m_iv(&k, F, ATT, T1T, M0, t, tau_ex);
                     assert!(sum.is_finite() && rel_close(sum, want, 1e-12),
                         "{:?} tau_ex {tau_ex} t {t}: {sum} vs {want}", k.label_type);
                 }
@@ -1183,8 +1184,8 @@ mod tests {
             for tau_ex in [0.01, 0.3, 2.0] {
                 for t in [1.0, 2.0, 3.6] {
                     for w in edges(t).windows(2) {
-                        let whole = delta_m_arrival(&k, F, DT, T1T, M0, t, w[0], w[1]);
-                        let iv = delta_m_arrival_iv(&k, F, DT, T1T, M0, t, w[0], w[1], tau_ex);
+                        let whole = delta_m_arrival(&k, F, ATT, T1T, M0, t, w[0], w[1]);
+                        let iv = delta_m_arrival_iv(&k, F, ATT, T1T, M0, t, w[0], w[1], tau_ex);
                         assert!(iv >= 0.0 && iv <= whole * (1.0 + 1e-14), "{:?}: {iv} of {whole}", k.label_type);
                     }
                 }
@@ -1201,17 +1202,17 @@ mod tests {
             for t in [1.0, 1.6, 2.5, 3.6, 5.0] {
                 let mut total = 0.0;
                 for w in edges(t).windows(2) {
-                    let whole = delta_m_arrival(&k, F, DT, T1T, M0, t, w[0], w[1]);
+                    let whole = delta_m_arrival(&k, F, ATT, T1T, M0, t, w[0], w[1]);
                     let parts: f64 = cuts.windows(2)
-                        .map(|c| delta_m_arrival_sub(&k, F, DT, T1T, M0, t, w[0], w[1], c[0], c[1])).sum();
+                        .map(|c| delta_m_arrival_sub(&k, F, ATT, T1T, M0, t, w[0], w[1], c[0], c[1])).sum();
                     assert!((parts - whole).abs() <= 1e-12 * whole.abs().max(1e-12), "{:?} t {t} {w:?}: {parts} vs {whole}", k.label_type);
                     let iv_parts: f64 = cuts.windows(2)
-                        .map(|c| delta_m_arrival_iv_sub(&k, F, DT, T1T, M0, t, w[0], w[1], c[0], c[1], 0.7)).sum();
-                    let iv = delta_m_arrival_iv(&k, F, DT, T1T, M0, t, w[0], w[1], 0.7);
+                        .map(|c| delta_m_arrival_iv_sub(&k, F, ATT, T1T, M0, t, w[0], w[1], c[0], c[1], 0.7)).sum();
+                    let iv = delta_m_arrival_iv(&k, F, ATT, T1T, M0, t, w[0], w[1], 0.7);
                     assert!((iv_parts - iv).abs() <= 1e-12 * iv.abs().max(1e-12), "iv {:?} t {t}: {iv_parts} vs {iv}", k.label_type);
                     total += parts;
                 }
-                let want = delta_m(&k, F, DT, T1T, M0, t);
+                let want = delta_m(&k, F, ATT, T1T, M0, t);
                 assert!((total - want).abs() <= 1e-12 * want.abs().max(1e-12), "{:?} t {t}: {total} vs {want}", k.label_type);
             }
         }
@@ -1227,8 +1228,8 @@ mod tests {
         for k in [K_PCASL, K_PASL] {
             let (e, flips) = train(10, 0.6, 0.3);
             for n in 1..=10 {
-                let p = delta_m_read_parts(&k, F, DT, T1T, M0, &e[..n], &flips[..n - 1], &[(0.0, k.tau, 1.0)], None, 0.0);
-                let want = delta_m_read(&k, F, DT, T1T, M0, &e[..n], &flips[..n - 1]);
+                let p = delta_m_read_parts(&k, F, ATT, T1T, M0, &e[..n], &flips[..n - 1], &[(0.0, k.tau, 1.0)], None, 0.0);
+                let want = delta_m_read(&k, F, ATT, T1T, M0, &e[..n], &flips[..n - 1]);
                 assert_eq!(p.ev, 0.0);
                 assert!(rel_close(p.iv, want, 1e-12), "{:?} n {n}: {} vs {want}", k.label_type, p.iv);
             }
@@ -1262,13 +1263,13 @@ mod tests {
             let subs_cut = [(0.0, 0.3 * k.tau, -1.0), (0.3 * k.tau, k.tau, 0.8)];
             let subs_one = [(0.0, k.tau, 1.0)];
             for (e, flips) in [train(12, 0.6, 0.3), train(48, 1.0, 0.04), train(64, 30.0, 0.05)] {
-                let dt = if e[0] > 10.0 { 29.5 } else { DT };
+                let att = if e[0] > 10.0 { 29.5 } else { ATT };
                 for subs in [&subs_one[..], &subs_cut[..]] {
                     for tau_ex in [None, Some(0.6), Some(0.001)] {
                         for delta in [0.0, 0.17, 0.8] {
-                            let all = delta_m_read_all(&k, F, dt, T1T, M0, &e, &flips, subs, tau_ex, delta);
+                            let all = delta_m_read_all(&k, F, att, T1T, M0, &e, &flips, subs, tau_ex, delta);
                             for n in 1..=e.len() {
-                                let p = delta_m_read_parts(&k, F, dt, T1T, M0, &e[..n], &flips[..n - 1], subs, tau_ex, delta);
+                                let p = delta_m_read_parts(&k, F, att, T1T, M0, &e[..n], &flips[..n - 1], subs, tau_ex, delta);
                                 let peak = p.iv.abs().max(p.ev.abs()).max(1e-12);
                                 assert!(all[n - 1].iv.is_finite() && all[n - 1].ev.is_finite());
                                 assert!((all[n - 1].iv - p.iv).abs() <= 1e-12 * peak && (all[n - 1].ev - p.ev).abs() <= 1e-12 * peak,
@@ -1293,8 +1294,8 @@ mod tests {
             let start = std::time::Instant::now();
             let mut acc = 0.0;
             for v in 0..100_000 {
-                let f = 40.0 + (v % 50) as f64;
-                acc += delta_m_read_all(&K_PCASL, f, DT, T1T, M0, &e, &flips, &subs, Some(0.6), 0.3)[n - 1].iv;
+                let f_ml_100g_min = 40.0 + (v % 50) as f64;
+                acc += delta_m_read_all(&K_PCASL, f_ml_100g_min, ATT, T1T, M0, &e, &flips, &subs, Some(0.6), 0.3)[n - 1].iv;
             }
             let s = start.elapsed().as_secs_f64();
             println!("1e5 voxels x {n} excitations: {s:.2} s ({acc:.3e})");
@@ -1307,20 +1308,20 @@ mod tests {
     /// `[e_n - delta_a, e_n)`, the left end included and `e_n` itself not.
     #[test]
     fn arterial_read_depletes_from_slab_entry() {
-        let (abv, aatt) = (0.02, 0.5);
+        let (abv, att_arterial) = (0.02, 0.5);
         let e_n = 1.0;
-        let (fresh, _) = arterial_dm(&K_PCASL, abv, aatt, M0, e_n);
+        let (fresh, _) = arterial_dm(&K_PCASL, abv, att_arterial, M0, e_n);
         assert!(fresh > 0.0);
         let earlier = [(0.55, 30.0), (0.7, 40.0), (0.9, 20.0), (1.0, 50.0)];
-        assert_eq!(arterial_read(&K_PCASL, abv, aatt, M0, e_n, &earlier, 0.0, 1.0), fresh);
+        assert_eq!(arterial_read(&K_PCASL, abv, att_arterial, M0, e_n, &earlier, 0.0, 1.0), fresh);
         let c = |a: f64| a.to_radians().cos();
-        let two = arterial_read(&K_PCASL, abv, aatt, M0, e_n, &earlier, 0.3, 1.0);
+        let two = arterial_read(&K_PCASL, abv, att_arterial, M0, e_n, &earlier, 0.3, 1.0);
         assert!(rel_close(two, fresh * c(40.0) * c(20.0), 1e-15), "{two}");
-        let edge = arterial_read(&K_PCASL, abv, aatt, M0, e_n, &earlier, 0.45, 1.0);
+        let edge = arterial_read(&K_PCASL, abv, att_arterial, M0, e_n, &earlier, 0.45, 1.0);
         assert!(rel_close(edge, fresh * c(30.0) * c(40.0) * c(20.0), 1e-15), "{edge}");
-        assert_eq!(arterial_read(&K_PCASL, abv, aatt, M0, e_n, &earlier, 0.3, 0.25), two * 0.25);
+        assert_eq!(arterial_read(&K_PCASL, abv, att_arterial, M0, e_n, &earlier, 0.3, 0.25), two * 0.25);
         // outside the arterial window there is nothing to read
-        assert_eq!(arterial_read(&K_PCASL, abv, aatt, M0, 0.4, &earlier, 0.3, 1.0), 0.0);
+        assert_eq!(arterial_read(&K_PCASL, abv, att_arterial, M0, 0.4, &earlier, 0.3, 1.0), 0.0);
     }
 
     // ---- P7 Task 2: the parcel reference ----
@@ -1329,7 +1330,7 @@ mod tests {
 
     fn case(k: Kinetic, att: f64, t: f64) -> PCase {
         PCase {
-            k, f: F, att, t1t: T1T, m0: M0, t, excitations: vec![], entry_lead: 0.0, pulses: vec![], epsilon: 0.0,
+            k, f_ml_100g_min: F, att, t1t: T1T, m0: M0, t, excitations: vec![], entry_lead: 0.0, pulses: vec![], epsilon: 0.0,
             region: PRegion::Global, tau_ex: None, span: (0.0, k.tau),
         }
     }
@@ -1341,13 +1342,13 @@ mod tests {
     fn the_parcel_reference_reproduces_the_closed_forms() {
         for k in [K_PCASL, K_PASL] {
             for t in [1.0, 1.4, 2.5, 3.6] {
-                let c = case(k, DT, t);
+                let c = case(k, ATT, t);
                 let (iv, total) = c.read(4);
-                let want = delta_m(&k, F, DT, T1T, M0, t);
+                let want = delta_m(&k, F, ATT, T1T, M0, t);
                 assert!(rel_close(total, want, 1e-12), "{:?} t {t}: {total} vs {want}", k.label_type);
                 assert_eq!(iv, total);
                 let ex = PCase { tau_ex: Some(0.6), ..c.clone() }.read(4).0;
-                let want_iv = delta_m_iv(&k, F, DT, T1T, M0, t, 0.6);
+                let want_iv = delta_m_iv(&k, F, ATT, T1T, M0, t, 0.6);
                 assert!(rel_close(ex, want_iv, 1e-12), "{:?} t {t}: iv {ex} vs {want_iv}", k.label_type);
             }
         }
@@ -1414,16 +1415,16 @@ mod tests {
         let excitations: Vec<(f64, f64)> = (0..8).map(|n| (0.6 + 0.15 * n as f64, 30.0 + 5.0 * n as f64)).collect();
         let pulses = [0.2, 0.5];
         for k in [K_PCASL, K_PASL] {
-            let aatt = 0.4;
+            let att_arterial = 0.4;
             for (region, pregion) in [(Region::Slab(0.1), PRegion::Slab(0.1)), (Region::Global, PRegion::Global)] {
                 for lead in [0.0, 0.3] {
                     for n in 0..excitations.len() {
                         let t = excitations[n].0;
-                        let fac = arterial_factor(&pulses, 0.9, t - aatt, entry_offset(k.label_type, region, aatt));
-                        let got = arterial_read(&k, 0.02, aatt, M0, t, &excitations[..n], lead, fac);
+                        let fac = arterial_factor(&pulses, 0.9, t - att_arterial, entry_offset(k.label_type, region, att_arterial));
+                        let got = arterial_read(&k, 0.02, att_arterial, M0, t, &excitations[..n], lead, fac);
                         let c = PCase { excitations: excitations[..n].to_vec(), pulses: pulses.to_vec(), epsilon: 0.9,
-                                       region: pregion, ..case(k, DT, t) };
-                        let want = c.arterial(0.02, aatt, lead);
+                                       region: pregion, ..case(k, ATT, t) };
+                        let want = c.arterial(0.02, att_arterial, lead);
                         assert!(rel_close(got, want, 1e-12), "{:?} {region:?} lead {lead} n {n}: {got} vs {want}", k.label_type);
                     }
                 }
